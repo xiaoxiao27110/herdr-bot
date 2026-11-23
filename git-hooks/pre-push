@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+HQ_BIN="$REPO_ROOT/bin/hq"
+
+if [[ ! -x "$HQ_BIN" ]]; then
+  echo "[pre-push] ERROR: $HQ_BIN not found or not executable" >&2
+  exit 1
+fi
+
+echo "[pre-push] Running hq oss-check on $REPO_ROOT ..."
+"$HQ_BIN" oss-check --repo "$REPO_ROOT"

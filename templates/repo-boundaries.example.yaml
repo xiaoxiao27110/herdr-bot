@@ -1,0 +1,23 @@
+version: 1
+repos:
+  gateway-svc:
+    default_branch: main
+    watch_paths:
+      - api/**
+      - proto/**
+      - config/routes.yaml
+    ignore_paths:
+      - "**/*.md"
+      - tests/**
+    downstream:
+      - repo: worker-svc
+        contract: memory/contracts/gateway-worker.md
+        impact: "API schema or queue payload changes affect worker-svc consumers"
+  worker-svc:
+    default_branch: main
+    watch_paths:
+      - jobs/**
+      - consumer/**
+    ignore_paths:
+      - tests/**
+    downstream: []

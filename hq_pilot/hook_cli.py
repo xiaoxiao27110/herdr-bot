@@ -1,0 +1,162 @@
+"""`hq-agent-hook` fast (<10ms) lifecycle hook entrypoint for coding agents."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any, Dict, List, Optional
+
+from hq_pilot.agents.registry import get_agent_adapter
+from hq_pilot.channels.base import MessagingChannel
+from hq_pilot.channels.registry import get_channel
+from hq_pilot.config import load_config, load_secrets_env
+from hq_pilot.db import HQDatabase
+from hq_pilot.gatekeeper import detect_manual_touch
+
+
+def _discover_hq_dir(explicit: Optional[str], payload: Dict[str, Any]) -> Optional[Path]:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    env_dir = os.environ.get("HQ_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    cwd_str = payload.get("cwd") or payload.get("workspace")
+    if cwd_str:
+        cur = Path(str(cwd_str)).resolve()
+        for parent in [cur, *cur.parents]:
+            if (parent / "hq.yaml").exists():
+                return parent
+    return None
+
+
+def handle_hook_event(
+    agent_name: str,
+    payload: Dict[str, Any],
+    hq_dir: Optional[str | Path] = None,
+    channel: Optional[MessagingChannel] = None,
+    now: Optional[int] = None,
+) -> Dict[str, Any]:
+    ts = int(now if now is not None else time.time())
+    root = _discover_hq_dir(str(hq_dir) if hq_dir else None, payload)
+    if root is None or not (root / "hq.yaml").exists():
+        return {"status": "ignored", "reason": "no_hq_dir"}
+
+    cfg = load_config(root)
+    db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
+    adapter = get_agent_adapter(agent_name)
+    try:
+        event_type = str(
+            payload.get("hook_event_name")
+            or payload.get("event")
+            or payload.get("type")
+            or ""
+        )
+        agent_sid = str(
+            payload.get("conversation_id")
+            or payload.get("conversationId")
+            or payload.get("session_id")
+            or ""
+        )
+        transcript_path = str(payload.get("transcript_path") or "")
+        user_prompt = payload.get("prompt") or payload.get("user_prompt") or payload.get("input")
+
+        sess = db.get_session_by_agent_id(agent_sid) if agent_sid else None
+        if sess is None and agent_sid:
+            # Local direct session started outside daemon -> default pinned!
+            sess = db.create_session(
+                session_key=f"local:{agent_sid}",
+                track="LOCAL",
+                agent_backend=agent_name,
+                status="pinned",
+                pinned=True,
+                pinned_reason="local_direct",
+                agent_session_id=agent_sid,
+                transcript_path=transcript_path or None,
+                now=ts,
+            )
+
+        if sess is None:
+            return {"status": "ignored", "reason": "no_session"}
+
+        skey = str(sess["session_key"])
+        updates: Dict[str, Any] = {"last_active_at": ts}
+        if transcript_path and not sess.get("transcript_path"):
+            updates["transcript_path"] = transcript_path
+        db.update_session(skey, **updates)
+
+        pinned_reason = None
+        if event_type in {"PreInvocation", "UserPromptSubmit", "SessionStart"} and user_prompt:
+            pinned_reason = detect_manual_touch(
+                db,
+                sess,
+                input_text=str(user_prompt),
+                now=ts,
+            )
+
+        if event_type == "Stop":
+            tpath = transcript_path or sess.get("transcript_path")
+            reply_pushed = False
+            if tpath and Path(str(tpath)).exists():
+                offset = int(sess.get("reply_line_offset") or 0)
+                turns, total_lines = adapter.read_transcript_slice(str(tpath), from_line=offset)
+                assistant_msgs = [t.text for t in turns if t.role == "assistant"]
+                new_turns = int(sess.get("turn_count") or 0) + sum(
+                    1 for t in turns if t.role == "user"
+                )
+                db.update_session(
+                    skey,
+                    reply_line_offset=total_lines,
+                    turn_count=new_turns,
+                    last_active_at=ts,
+                )
+                thread_id = sess.get("channel_thread_id")
+                if assistant_msgs and thread_id:
+                    ch = channel
+                    if ch is None:
+                        secrets = load_secrets_env(cfg.hq_dir)
+                        ch = get_channel(
+                            cfg.channel.backend,
+                            secrets=secrets,
+                            allowed_chat_id=cfg.channel.allowed_chat_id,
+                        )
+                    if ch is not None:
+                        ch.send_message(assistant_msgs[-1], thread_id=str(thread_id))
+                        reply_pushed = True
+            return {"status": "ok", "event": "Stop", "session_key": skey, "reply_pushed": reply_pushed}
+
+        return {
+            "status": "ok",
+            "event": event_type,
+            "session_key": skey,
+            "pinned_reason": pinned_reason,
+        }
+    finally:
+        db.close()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="hq-agent-hook")
+    p.add_argument("--agent", default="agy")
+    p.add_argument("--hq-dir", default=None)
+    args = p.parse_args(argv)
+
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    payload: Dict[str, Any] = {}
+    if raw.strip():
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                payload = obj
+        except json.JSONDecodeError:
+            payload = {}
+
+    handle_hook_event(args.agent, payload, hq_dir=args.hq_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

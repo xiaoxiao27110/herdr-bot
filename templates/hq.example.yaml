@@ -1,0 +1,45 @@
+version: 1
+project_name: acme-cloud
+
+agent:
+  backend: agy
+  index_file: AGENTS.md
+  default_effort: high
+  light_effort: low
+
+terminal:
+  backend: auto
+
+channel:
+  backend: telegram
+  allowed_chat_id: ""
+
+repos:
+  gateway-svc:
+    git_url: https://git.example.com/acme/gateway-svc.git
+    default_branch: main
+  worker-svc:
+    git_url: https://git.example.com/acme/worker-svc.git
+    default_branch: main
+
+tuning:
+  index_max_lines: 200
+  index_max_bytes: 25600
+  today_wal_max_lines: 60
+  dream_cron: "23:30"
+  dream_min_interval_hours: 24
+  dream_min_sessions: 5
+  dream_force_nightly: true
+  digest_cron: "09:30"
+  inbox_lease_ttl_sec: 900
+  inbox_max_attempts: 3
+  commit_debounce_sec: 300
+  active_repo_quiet_minutes: 15
+  pane_blocked_notify_sec: 60
+  deferred_approval_ttl_hours: 24
+  general_idle_seal_minutes: 60
+  general_max_turns: 20
+  distill_idle_minutes: 20
+  distill_min_new_turns: 3
+  dirty_worktree_warn_hours: 48
+  git_sync_debounce_minutes: 120

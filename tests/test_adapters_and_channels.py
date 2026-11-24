@@ -107,12 +107,12 @@ class TestAdaptersAndChannels(unittest.TestCase):
         self.assertEqual(
             cmd,
             [
-                "agy", "-p", "--output-format", "json",
+                "agy", "--output-format", "json",
                 "--conversation", "s-1",
                 "--model", "glm-test",
                 "--effort", "low",
                 "--add-dir", "/tmp/r1",
-                "hello",
+                "-p", "hello",
             ],
         )
         icmd = adapter.build_interactive_cmd(initial_prompt="start", session_id="s-2")

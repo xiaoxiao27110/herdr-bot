@@ -14,6 +14,8 @@ from typing import List, Optional
 
 from hq_pilot.agents.registry import get_agent_adapter
 from hq_pilot.archiver import archive_eligible_sessions
+from hq_pilot.channels.telegram import detect_telegram_chats
+from hq_pilot.chat_cli import run_chat_loop
 from hq_pilot.config import (
     TUNING_DESCRIPTIONS,
     TuningConfig,
@@ -309,6 +311,32 @@ def cmd_oss_check(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_chat(args: argparse.Namespace) -> int:
+    return run_chat_loop(args.hq_dir, standalone=bool(args.standalone))
+
+
+def cmd_telegram_detect_chat(args: argparse.Namespace) -> int:
+    cfg = load_config(args.hq_dir)
+    secrets = load_secrets_env(cfg.hq_dir)
+    token = secrets.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        print(
+            "TELEGRAM_BOT_TOKEN is not set in .hq/secrets.env",
+            file=sys.stderr,
+        )
+        return 1
+    chats = detect_telegram_chats(token)
+    if not chats:
+        print("No recent Telegram updates found. Send a message in your target group/chat and retry.")
+        return 0
+    for c in chats:
+        print(
+            f"chat_id={c['chat_id']} | type={c['type']} "
+            f"| is_forum={c['is_forum']} | title={c['title']}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="hq", description="hq-pilot multi-repo orchestrator CLI")
     sub = p.add_subparsers(dest="command", required=True)
@@ -396,6 +424,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp_task_spawn.add_argument("--prompt", required=True)
     sp_task_spawn.add_argument("--hq-dir", default=".")
     sp_task_spawn.set_defaults(func=cmd_task_spawn)
+
+    sp_chat = sub.add_parser("chat", help="Open interactive local terminal chat")
+    sp_chat.add_argument("--hq-dir", default=".")
+    sp_chat.add_argument(
+        "--standalone",
+        action="store_true",
+        help="Run embedded hq-daemon loop in background thread",
+    )
+    sp_chat.set_defaults(func=cmd_chat)
+
+    sp_tg = sub.add_parser("telegram", help="Telegram helper utilities")
+    tg_sub = sp_tg.add_subparsers(dest="telegram_action", required=True)
+    sp_tg_detect = tg_sub.add_parser(
+        "detect-chat",
+        help="Detect Telegram chat IDs from recent bot updates",
+    )
+    sp_tg_detect.add_argument("--hq-dir", default=".")
+    sp_tg_detect.set_defaults(func=cmd_telegram_detect_chat)
 
     return p
 

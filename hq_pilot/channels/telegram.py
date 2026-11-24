@@ -193,3 +193,61 @@ class TelegramChannel(MessagingChannel):
             payload["text"] = text
         resp = self._call_api("answerCallbackQuery", payload)
         return bool(resp.get("ok"))
+
+
+def detect_telegram_chats(
+    bot_token: str,
+    api_base: str = "https://api.telegram.org",
+    timeout: int = 10,
+    request_fn: Optional[Callable[[str, Dict[str, Any], int], Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch recent Telegram updates and return unique chats seen by the bot."""
+    probe = TelegramChannel(
+        bot_token=bot_token,
+        allowed_chat_id=None,
+        api_base=api_base,
+        request_fn=request_fn,
+    )
+    resp = probe._call_api(
+        "getUpdates",
+        {
+            "timeout": 0,
+            "allowed_updates": ["message", "edited_message", "my_chat_member", "channel_post", "callback_query"],
+        },
+        timeout=timeout,
+    )
+    if not resp.get("ok"):
+        return []
+
+    seen: Dict[str, Dict[str, Any]] = {}
+    for upd in resp.get("result") or []:
+        if not isinstance(upd, dict):
+            continue
+        chat_obj: Optional[Dict[str, Any]] = None
+        for key in ("message", "edited_message", "my_chat_member", "channel_post"):
+            cand = upd.get(key)
+            if isinstance(cand, dict) and isinstance(cand.get("chat"), dict):
+                chat_obj = cand["chat"]
+                break
+        if chat_obj is None and isinstance(upd.get("callback_query"), dict):
+            msg = upd["callback_query"].get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("chat"), dict):
+                chat_obj = msg["chat"]
+        if chat_obj is None:
+            continue
+        cid = str(chat_obj.get("id", "")).strip()
+        if not cid or cid in seen:
+            continue
+        title = (
+            chat_obj.get("title")
+            or chat_obj.get("username")
+            or f"{chat_obj.get('first_name', '')} {chat_obj.get('last_name', '')}".strip()
+            or "(unknown)"
+        )
+        seen[cid] = {
+            "chat_id": cid,
+            "type": str(chat_obj.get("type") or "unknown"),
+            "is_forum": bool(chat_obj.get("is_forum", False)),
+            "title": str(title),
+        }
+    return list(seen.values())

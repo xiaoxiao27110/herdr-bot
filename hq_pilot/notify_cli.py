@@ -38,6 +38,7 @@ def deliver_notification(
                 cfg.channel.backend,
                 secrets=secrets,
                 allowed_chat_id=cfg.channel.allowed_chat_id,
+                db=db,
             )
 
         thread_id = None

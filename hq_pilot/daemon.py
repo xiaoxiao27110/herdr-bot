@@ -85,6 +85,7 @@ class HQDaemon:
                 self.config.channel.backend,
                 secrets=self.secrets,
                 allowed_chat_id=self.config.channel.allowed_chat_id,
+                db=self.db,
             )
         )
         self.cmd_runner: CmdRunner = cmd_runner or default_cmd_runner
@@ -172,7 +173,7 @@ class HQDaemon:
 
         self.db.enqueue_event(
             source="channel",
-            dedupe_key=f"channel:{msg.update_id}",
+            dedupe_key=f"channel:{msg.chat_id}:{msg.update_id}",
             priority=10,
             available_at=now,
             payload={

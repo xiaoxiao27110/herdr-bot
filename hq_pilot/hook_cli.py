@@ -147,6 +147,7 @@ def handle_hook_event(
                             cfg.channel.backend,
                             secrets=secrets,
                             allowed_chat_id=cfg.channel.allowed_chat_id,
+                            db=db,
                         )
                     if ch is not None:
                         ch.send_message(assistant_msgs[-1], thread_id=str(thread_id))

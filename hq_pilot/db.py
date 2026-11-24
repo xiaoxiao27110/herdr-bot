@@ -87,6 +87,29 @@ CREATE TABLE IF NOT EXISTS meta_state (
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS local_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction TEXT NOT NULL,
+    thread_id TEXT,
+    text TEXT NOT NULL,
+    buttons_json TEXT,
+    is_callback INTEGER DEFAULT 0,
+    callback_data TEXT,
+    reply_to_msg_id TEXT,
+    consumed INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_messages_poll
+    ON local_messages (direction, consumed, id);
+
+CREATE TABLE IF NOT EXISTS local_threads (
+    thread_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    closed INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -604,3 +627,153 @@ class HQDatabase:
             """,
             (key, str(value), ts),
         )
+
+    # ------------------------------------------------------------------
+    # Local Channel Storage (local_messages & local_threads)
+    # ------------------------------------------------------------------
+    def add_local_message(
+        self,
+        direction: str,
+        text: str,
+        thread_id: Optional[str] = None,
+        buttons_json: Optional[str] = None,
+        is_callback: bool = False,
+        callback_data: Optional[str] = None,
+        reply_to_msg_id: Optional[str] = None,
+        consumed: int = 0,
+        now: Optional[int] = None,
+    ) -> int:
+        ts = int(now if now is not None else time.time())
+        cur = self.conn.execute(
+            """
+            INSERT INTO local_messages (
+                direction, thread_id, text, buttons_json,
+                is_callback, callback_data, reply_to_msg_id, consumed, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                direction,
+                thread_id,
+                text,
+                buttons_json,
+                1 if is_callback else 0,
+                callback_data,
+                reply_to_msg_id,
+                int(consumed),
+                ts,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def consume_local_inbound(self, limit: int = 50) -> List[Dict[str, Any]]:
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM local_messages
+                WHERE direction = 'inbound' AND consumed = 0
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            if rows:
+                ids = [int(r["id"]) for r in rows]
+                placeholders = ",".join("?" for _ in ids)
+                self.conn.execute(
+                    f"UPDATE local_messages SET consumed = 1 WHERE id IN ({placeholders})",
+                    ids,
+                )
+            self.conn.execute("COMMIT")
+            return [dict(r) for r in rows]
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def list_local_outbound(
+        self, after_id: int = 0, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM local_messages
+            WHERE direction = 'outbound' AND id > ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (int(after_id), int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_recent_local_outbound(self, limit: int = 15) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM (
+                SELECT * FROM local_messages
+                WHERE direction = 'outbound'
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            ORDER BY id ASC
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_local_message(self, msg_id: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM local_messages WHERE id = ?",
+            (int(msg_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def create_local_thread(
+        self,
+        title: str,
+        thread_id: Optional[str] = None,
+        now: Optional[int] = None,
+    ) -> str:
+        ts = int(now if now is not None else time.time())
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            tid = thread_id
+            if not tid:
+                count_row = self.conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM local_threads"
+                ).fetchone()
+                idx = int(count_row["cnt"]) + 1 if count_row else 1
+                while True:
+                    candidate = f"topic-{idx}"
+                    exists = self.conn.execute(
+                        "SELECT 1 FROM local_threads WHERE thread_id = ?",
+                        (candidate,),
+                    ).fetchone()
+                    if not exists:
+                        tid = candidate
+                        break
+                    idx += 1
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO local_threads (thread_id, title, closed, created_at)
+                VALUES (?, ?, 0, ?)
+                """,
+                (tid, title, ts),
+            )
+            self.conn.execute("COMMIT")
+            return str(tid)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def close_local_thread(self, thread_id: str) -> bool:
+        cur = self.conn.execute(
+            "UPDATE local_threads SET closed = 1 WHERE thread_id = ?",
+            (str(thread_id),),
+        )
+        return cur.rowcount > 0
+
+    def list_local_threads(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM local_threads ORDER BY created_at ASC, thread_id ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]

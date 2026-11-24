@@ -166,10 +166,16 @@ class TelegramChannel(MessagingChannel):
     def create_thread(self, title: str) -> Optional[str]:
         if not self.allowed_chat_id:
             raise RuntimeError("Telegram allowed_chat_id is not configured (fail-closed)")
-        resp = self._call_api(
-            "createForumTopic",
-            {"chat_id": self.allowed_chat_id, "name": title[:128]},
-        )
+        # 1v1 private DM chats (positive chat_id) do not support Forum Topics; degrade gracefully.
+        if not self.allowed_chat_id.startswith("-"):
+            return None
+        try:
+            resp = self._call_api(
+                "createForumTopic",
+                {"chat_id": self.allowed_chat_id, "name": title[:128]},
+            )
+        except urllib.error.HTTPError:
+            return None
         if not resp.get("ok"):
             return None
         result = resp.get("result") or {}
@@ -177,14 +183,17 @@ class TelegramChannel(MessagingChannel):
         return str(tid) if tid is not None else None
 
     def close_thread(self, thread_id: str) -> bool:
-        if not self.allowed_chat_id:
+        if not self.allowed_chat_id or not self.allowed_chat_id.startswith("-"):
             return False
         payload: Dict[str, Any] = {"chat_id": self.allowed_chat_id}
         try:
             payload["message_thread_id"] = int(thread_id)
         except ValueError:
             payload["message_thread_id"] = str(thread_id)
-        resp = self._call_api("closeForumTopic", payload)
+        try:
+            resp = self._call_api("closeForumTopic", payload)
+        except urllib.error.HTTPError:
+            return False
         return bool(resp.get("ok"))
 
     def answer_callback(self, callback_id: str, text: str = "") -> bool:

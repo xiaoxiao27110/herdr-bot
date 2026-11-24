@@ -325,7 +325,8 @@ def cmd_telegram_detect_chat(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    chats = detect_telegram_chats(token)
+    api_base = secrets.get("TELEGRAM_API_BASE", "").strip() or "https://api.telegram.org"
+    chats = detect_telegram_chats(token, api_base=api_base)
     if not chats:
         print("No recent Telegram updates found. Send a message in your target group/chat and retry.")
         return 0

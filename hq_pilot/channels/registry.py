@@ -88,7 +88,8 @@ def get_channel(
             if db is not None:
                 return LocalChannel(db)
             return None
-        tg = TelegramChannel(bot_token=token, allowed_chat_id=chat_id)
+        api_base = sec.get("TELEGRAM_API_BASE", "").strip() or "https://api.telegram.org"
+        tg = TelegramChannel(bot_token=token, allowed_chat_id=chat_id, api_base=api_base)
         if db is not None:
             return CompositeChannel([tg, LocalChannel(db)])
         return tg

@@ -16,7 +16,10 @@ GENERAL_ORCHESTRATION_GUIDE = """## 0. #General & Auto-Topic Orchestration Guide
   自动创建独立 Git worktree、Herdr 交互面板与频道话题卡片，并在 `#General` 简短告知已拉起的话题。
 - **完成自主封口**：`#Topic` 完成开发并验收通过后，Agent 可调用：
   `herdr-bot seal "$HQ_SESSION_KEY" --hq-dir "$HQ_DIR"`
-  自主封口（保留 worktree 至夜间安全归档；未主动封口的非 `pinned` Topic 在空闲超时后也会自动封口）。"""
+  自主封口（保留 worktree 至夜间安全归档；未主动封口的非 `pinned` Topic 在空闲超时后也会自动封口）。
+- **自主定时唤醒**：需稍后跟进或定期巡检时，可设定一次性或周期性闹钟：
+  `herdr-bot timer set --in 15m --reason "<跟进原因>" --hq-dir "$HQ_DIR"`
+  （支持 `--at` / `--every`，以及 `timer list` / `timer cancel <id>`）。"""
 
 
 def _read_optional(path: Path) -> str:

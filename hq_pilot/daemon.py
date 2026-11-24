@@ -131,6 +131,7 @@ class TickSummary:
     events_failed: int = 0
     distill_enqueued: int = 0
     commits_enqueued: int = 0
+    timers_fired: int = 0
     nightly_ran: bool = False
     digest_sent: bool = False
     outbox_sent: int = 0
@@ -838,6 +839,46 @@ class HQDaemon:
                 self.channel.send_message(reply, thread_id=thread_id)
             return
 
+        if ev.source == "timer_wake":
+            payload = ev.payload
+            target_key = payload.get("session_key")
+            target_sess = self.db.get_session(str(target_key)) if target_key else None
+            if target_sess and target_sess.get("status") in {"active", "pinned"}:
+                sess = target_sess
+            else:
+                sess = self._ensure_general_session(now)
+
+            recent_outbound = self._get_recent_outbound()
+            topic_slug = (
+                str(sess["topic_slug"])
+                if (sess.get("track") in TOPIC_TRACKS and sess.get("topic_slug"))
+                else None
+            )
+            prompt = build_prompt(
+                self.hq_dir,
+                self.config,
+                payload,
+                recent_outbound=recent_outbound,
+                topic_slug=topic_slug,
+            )
+            target_cwd = (
+                Path(sess["worktree_path"])
+                if sess.get("worktree_path")
+                else self.hq_dir
+            )
+            reply = self._dispatch_interactive(
+                sess,
+                prompt,
+                effort=self.config.agent.default_effort,
+                now=now,
+                cwd=target_cwd,
+                wait=True,
+            )
+            thread_id = sess.get("channel_thread_id")
+            if self.channel and reply and reply.strip():
+                self.channel.send_message(reply, thread_id=thread_id)
+            return
+
         if ev.source == "pane_blocked":
             skey = str(ev.payload.get("session_key", ""))
             thread_id = ev.payload.get("channel_thread_id")
@@ -1008,6 +1049,7 @@ class HQDaemon:
                 )
         self._seal_idle_general_sessions(ts)
         self._seal_idle_topic_sessions(ts)
+        summary.timers_fired = self._tick_custom_timers(ts)
 
         events = self.db.claim_next_events(
             limit=10,
@@ -1053,6 +1095,34 @@ class HQDaemon:
         summary.outbox_sent = self._drain_outbox(ts)
 
         return summary
+
+    def _tick_custom_timers(self, now: int) -> int:
+        """Fire due self-scheduled timers and enqueue `timer_wake` events into Inbox."""
+        due = self.db.fire_due_timers(now=now)
+        enqueued = 0
+        for t in due:
+            fired_at = int(t.get("fired_at") or t.get("last_fired_at") or now)
+            ev_id = self.db.enqueue_event(
+                source="timer_wake",
+                dedupe_key=f"timer:{t['id']}:{fired_at}",
+                priority=20,
+                available_at=now,
+                payload={
+                    "timer_id": int(t["id"]),
+                    "name": t.get("name"),
+                    "kind": str(t["kind"]),
+                    "session_key": t.get("session_key"),
+                    "reason": str(t["reason"]),
+                    "fired_at": fired_at,
+                    "fired_count": int(t.get("fired_count") or 1),
+                    "every_sec": int(t.get("every_sec") or 0),
+                    "next_fire_at": int(t["next_fire_at"]),
+                },
+                now=now,
+            )
+            if ev_id is not None:
+                enqueued += 1
+        return enqueued
 
     def _drain_outbox(self, now: int) -> int:
         """Retry due durable outbox messages with backoff and per-minute rate protection."""

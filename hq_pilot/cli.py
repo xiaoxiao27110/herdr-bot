@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import fields
+from datetime import datetime, timedelta
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import time
 from typing import List, Optional
 
 from hq_pilot.agents.registry import get_agent_adapter
@@ -161,6 +164,161 @@ def cmd_seal(args: argparse.Namespace) -> int:
         return 0
     finally:
         daemon.close()
+
+
+_DURATION_UNIT_SEC = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+_DURATION_TOKEN_RE = re.compile(r"(\d+)\s*([smhdSMHD])")
+
+
+def parse_duration_seconds(spec: str) -> int:
+    """Parse human duration strings such as '30s', '15m', '2h', '1d', or '1h30m'."""
+    raw = (spec or "").strip()
+    if not raw:
+        raise ValueError("Duration must not be empty")
+    pos = 0
+    total = 0
+    for match in _DURATION_TOKEN_RE.finditer(raw):
+        if match.start() != pos:
+            raise ValueError(f"Invalid duration format: {spec!r}")
+        total += int(match.group(1)) * _DURATION_UNIT_SEC[match.group(2).lower()]
+        pos = match.end()
+    if pos != len(raw) or total <= 0:
+        raise ValueError(f"Invalid duration format: {spec!r}")
+    return total
+
+
+def parse_fire_at(spec: str, now: Optional[int] = None) -> int:
+    """Parse --at time spec: unix_ts, 'YYYY-MM-DD HH:MM[:SS]', or 'HH:MM[:SS]'."""
+    raw = (spec or "").strip()
+    if not raw:
+        raise ValueError("Time specification must not be empty")
+    ts_now = int(now if now is not None else time.time())
+    if raw.isdigit():
+        return int(raw)
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ):
+        try:
+            return int(datetime.strptime(raw, fmt).timestamp())
+        except ValueError:
+            continue
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            parsed_t = datetime.strptime(raw, fmt)
+            base = datetime.fromtimestamp(ts_now)
+            candidate = base.replace(
+                hour=parsed_t.hour,
+                minute=parsed_t.minute,
+                second=parsed_t.second,
+                microsecond=0,
+            )
+            if int(candidate.timestamp()) <= ts_now:
+                candidate += timedelta(days=1)
+            return int(candidate.timestamp())
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported --at time format: {spec!r}")
+
+
+def cmd_timer_set(args: argparse.Namespace) -> int:
+    in_spec = getattr(args, "in_spec", None)
+    at_spec = getattr(args, "at_spec", None)
+    every_spec = getattr(args, "every", None)
+
+    if in_spec and at_spec:
+        print("Cannot specify both --in and --at.", file=sys.stderr)
+        return 2
+
+    now_ts = int(time.time())
+    try:
+        every_sec = parse_duration_seconds(every_spec) if every_spec else 0
+        kind = "recurring" if every_spec else "once"
+        if in_spec:
+            fire_at = now_ts + parse_duration_seconds(in_spec)
+        elif at_spec:
+            fire_at = parse_fire_at(at_spec, now=now_ts)
+        elif every_spec:
+            fire_at = now_ts + every_sec
+        else:
+            print("Must specify --in, --at, or --every.", file=sys.stderr)
+            return 2
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    session_key = (
+        args.session
+        if args.session is not None
+        else (os.environ.get("HQ_SESSION_KEY") or None)
+    )
+    cfg = load_config(args.hq_dir)
+    db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
+    try:
+        timer = db.create_timer(
+            reason=args.reason,
+            fire_at=fire_at,
+            kind=kind,
+            every_sec=every_sec,
+            session_key=session_key,
+            name=args.name,
+            now=now_ts,
+        )
+    finally:
+        db.close()
+
+    next_iso = datetime.fromtimestamp(int(timer["next_fire_at"])).strftime("%Y-%m-%d %H:%M:%S")
+    every_note = f" | every={timer['every_sec']}s" if timer["kind"] == "recurring" else ""
+    name_note = f" | name={timer['name']}" if timer.get("name") else ""
+    print(
+        f"Scheduled timer #{timer['id']} | kind={timer['kind']} "
+        f"| next_fire_at={next_iso} ({timer['next_fire_at']}){every_note} "
+        f"| session={timer.get('session_key') or 'general'}{name_note} "
+        f"| reason={timer['reason']}"
+    )
+    return 0
+
+
+def cmd_timer_list(args: argparse.Namespace) -> int:
+    cfg = load_config(args.hq_dir)
+    db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
+    try:
+        timers = db.list_timers(statuses=None if args.all else ["active"])
+    finally:
+        db.close()
+
+    if not timers:
+        print("No timers found.")
+        return 0
+
+    print(f"Timers ({len(timers)}):")
+    for t in timers:
+        next_iso = datetime.fromtimestamp(int(t["next_fire_at"])).strftime("%Y-%m-%d %H:%M:%S")
+        every_note = f" every={t['every_sec']}s" if t["kind"] == "recurring" else ""
+        name_note = f" name={t['name']}" if t.get("name") else ""
+        print(
+            f"  - #{t['id']} | status={t['status']} | kind={t['kind']}{every_note} "
+            f"| next={next_iso} ({t['next_fire_at']}) | fired={t['fired_count']} "
+            f"| session={t.get('session_key') or 'general'}{name_note} "
+            f"| reason={t['reason']}"
+        )
+    return 0
+
+
+def cmd_timer_cancel(args: argparse.Namespace) -> int:
+    cfg = load_config(args.hq_dir)
+    db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
+    try:
+        ok = db.cancel_timer(int(args.timer_id))
+    finally:
+        db.close()
+    if not ok:
+        print(f"Timer #{args.timer_id} not found or not active.", file=sys.stderr)
+        return 1
+    print(f"Cancelled timer #{args.timer_id}")
+    return 0
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -519,6 +677,29 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     sp_task_spawn.add_argument("--prompt", dest="prompt_opt", default=None, help="Initial task prompt")
     sp_task_spawn.add_argument("--hq-dir", default=".")
     sp_task_spawn.set_defaults(func=cmd_task_spawn)
+
+    sp_timer = sub.add_parser("timer", help="Manage self-scheduled agent follow-up timers")
+    timer_sub = sp_timer.add_subparsers(dest="timer_action", required=True)
+
+    sp_timer_set = timer_sub.add_parser("set", help="Schedule a one-shot or recurring wake timer")
+    sp_timer_set.add_argument("--reason", required=True, help="Follow-up reason injected on wake")
+    sp_timer_set.add_argument("--in", dest="in_spec", default=None, help="Relative delay (e.g. 30s, 15m, 2h, 1d)")
+    sp_timer_set.add_argument("--at", dest="at_spec", default=None, help="Target time (HH:MM, YYYY-MM-DD HH:MM, or unix_ts)")
+    sp_timer_set.add_argument("--every", default=None, help="Recurring interval (e.g. 15m, 1h, 1d)")
+    sp_timer_set.add_argument("--session", default=None, help="Target session_key (defaults to $HQ_SESSION_KEY)")
+    sp_timer_set.add_argument("--name", default=None, help="Optional human-readable label")
+    sp_timer_set.add_argument("--hq-dir", default=".")
+    sp_timer_set.set_defaults(func=cmd_timer_set)
+
+    sp_timer_list = timer_sub.add_parser("list", help="List scheduled timers")
+    sp_timer_list.add_argument("--all", action="store_true", help="Include fired and cancelled timers")
+    sp_timer_list.add_argument("--hq-dir", default=".")
+    sp_timer_list.set_defaults(func=cmd_timer_list)
+
+    sp_timer_cancel = timer_sub.add_parser("cancel", help="Cancel an active timer")
+    sp_timer_cancel.add_argument("timer_id", type=int, help="Numeric timer ID")
+    sp_timer_cancel.add_argument("--hq-dir", default=".")
+    sp_timer_cancel.set_defaults(func=cmd_timer_cancel)
 
     sp_chat = sub.add_parser("chat", help="Open interactive local terminal chat")
     sp_chat.add_argument("--hq-dir", default=".")

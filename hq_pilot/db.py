@@ -128,6 +128,24 @@ CREATE TABLE IF NOT EXISTS outbox_messages (
 
 CREATE INDEX IF NOT EXISTS idx_outbox_due
     ON outbox_messages (status, next_attempt_at, id);
+
+CREATE TABLE IF NOT EXISTS timers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    kind TEXT NOT NULL,
+    session_key TEXT,
+    reason TEXT NOT NULL,
+    fire_at INTEGER NOT NULL,
+    every_sec INTEGER DEFAULT 0,
+    next_fire_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    fired_count INTEGER NOT NULL DEFAULT 0,
+    last_fired_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_timers_due
+    ON timers (status, next_fire_at, id);
 """
 
 
@@ -925,3 +943,141 @@ class HQDatabase:
             (int(since_ts),),
         ).fetchone()
         return int(row["cnt"]) if row else 0
+
+    # ------------------------------------------------------------------
+    # Self-Scheduled Follow-up Timers
+    # ------------------------------------------------------------------
+    def create_timer(
+        self,
+        reason: str,
+        fire_at: int,
+        kind: str = "once",
+        every_sec: int = 0,
+        session_key: Optional[str] = None,
+        name: Optional[str] = None,
+        now: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if kind not in {"once", "recurring"}:
+            raise ValueError(f"Unsupported timer kind: {kind!r}")
+        interval = int(every_sec) if kind == "recurring" else 0
+        if kind == "recurring" and interval <= 0:
+            raise ValueError("Recurring timer requires every_sec > 0")
+        ts = int(now if now is not None else time.time())
+        fire_ts = int(fire_at)
+        cur = self.conn.execute(
+            """
+            INSERT INTO timers (
+                name, kind, session_key, reason, fire_at, every_sec,
+                next_fire_at, status, fired_count, last_fired_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, NULL, ?)
+            """,
+            (
+                name,
+                kind,
+                session_key,
+                reason,
+                fire_ts,
+                interval,
+                fire_ts,
+                ts,
+            ),
+        )
+        return self.get_timer(int(cur.lastrowid))  # type: ignore[return-value]
+
+    def get_timer(self, timer_id: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM timers WHERE id = ?",
+            (int(timer_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_timers(
+        self, statuses: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            rows = self.conn.execute(
+                f"SELECT * FROM timers WHERE status IN ({placeholders}) ORDER BY next_fire_at ASC, id ASC",
+                tuple(statuses),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM timers ORDER BY next_fire_at ASC, id ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def cancel_timer(
+        self, timer_id: int, now: Optional[int] = None
+    ) -> bool:
+        _ = now
+        cur = self.conn.execute(
+            """
+            UPDATE timers
+            SET status = 'cancelled'
+            WHERE id = ? AND status = 'active'
+            """,
+            (int(timer_id),),
+        )
+        return cur.rowcount > 0
+
+    def fire_due_timers(
+        self, now: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Atomically fire due active timers; advance recurring ones on a drift-free grid."""
+        ts = int(now if now is not None else time.time())
+        fired: List[Dict[str, Any]] = []
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM timers
+                WHERE status = 'active' AND next_fire_at <= ?
+                ORDER BY next_fire_at ASC, id ASC
+                """,
+                (ts,),
+            ).fetchall()
+            for r in rows:
+                tid = int(r["id"])
+                kind = str(r["kind"])
+                every_sec = int(r["every_sec"] or 0)
+                new_count = int(r["fired_count"]) + 1
+                item = dict(r)
+                item["scheduled_fire_at"] = int(r["next_fire_at"])
+                item["fired_count"] = new_count
+                item["last_fired_at"] = ts
+                item["fired_at"] = ts
+
+                if kind == "recurring" and every_sec > 0:
+                    anchor = int(r["fire_at"])
+                    if ts < anchor:
+                        next_fire = anchor
+                    else:
+                        k = ((ts - anchor) // every_sec) + 1
+                        next_fire = anchor + k * every_sec
+                    self.conn.execute(
+                        """
+                        UPDATE timers
+                        SET next_fire_at = ?, fired_count = ?, last_fired_at = ?
+                        WHERE id = ?
+                        """,
+                        (next_fire, new_count, ts, tid),
+                    )
+                    item["next_fire_at"] = next_fire
+                    item["status"] = "active"
+                else:
+                    self.conn.execute(
+                        """
+                        UPDATE timers
+                        SET status = 'fired', fired_count = ?, last_fired_at = ?
+                        WHERE id = ?
+                        """,
+                        (new_count, ts, tid),
+                    )
+                    item["status"] = "fired"
+                fired.append(item)
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return fired

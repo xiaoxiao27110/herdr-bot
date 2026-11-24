@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 import json
+import os
 import signal
 import subprocess
 import time
@@ -754,6 +755,13 @@ class HQDaemon:
         pid_file = self.hq_dir / ".hq" / "daemon.pid"
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        chan_name = self.channel.name if self.channel else "none (offline)"
+        print(
+            f"[hq-daemon] running pid={os.getpid()} hq_dir={self.hq_dir} "
+            f"agent={self.agent_adapter.name} terminal={self.terminal_driver.name} "
+            f"channel={chan_name}",
+            flush=True,
+        )
 
         def _handle_sig(_signum: int, _frame: Any) -> None:
             self._stop_requested = True

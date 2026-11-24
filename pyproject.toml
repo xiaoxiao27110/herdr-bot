@@ -13,6 +13,11 @@ dependencies = [
     "PyYAML>=6.0",
 ]
 
+[project.optional-dependencies]
+feishu = [
+    "lark-oapi>=1.4.0",
+]
+
 [project.scripts]
 hq = "hq_pilot.cli:main"
 hq-notify = "hq_pilot.notify_cli:main"

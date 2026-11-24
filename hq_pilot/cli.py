@@ -14,6 +14,7 @@ from typing import List, Optional
 
 from hq_pilot.agents.registry import get_agent_adapter
 from hq_pilot.archiver import archive_eligible_sessions
+from hq_pilot.channels.feishu import detect_feishu_chats
 from hq_pilot.channels.telegram import detect_telegram_chats
 from hq_pilot.chat_cli import run_chat_loop
 from hq_pilot.config import (
@@ -338,6 +339,46 @@ def cmd_telegram_detect_chat(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_feishu_detect_chat(args: argparse.Namespace) -> int:
+    cfg = load_config(args.hq_dir)
+    secrets = load_secrets_env(cfg.hq_dir)
+    app_id = secrets.get("FEISHU_APP_ID", "").strip()
+    app_secret = secrets.get("FEISHU_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        print(
+            "FEISHU_APP_ID and FEISHU_APP_SECRET must be set in .hq/secrets.env",
+            file=sys.stderr,
+        )
+        return 1
+    api_base = secrets.get("FEISHU_API_BASE", "").strip() or "https://open.feishu.cn"
+    res = detect_feishu_chats(
+        app_id,
+        app_secret,
+        api_base=api_base,
+        listen_seconds=max(0, int(args.timeout)),
+    )
+    print("Feishu tenant_access_token: OK")
+    group_chats = res.get("group_chats") or []
+    seen_chats = res.get("seen_chats") or []
+    if group_chats:
+        print(f"Joined group chats ({len(group_chats)}):")
+        for c in group_chats:
+            print(
+                f"  chat_id={c['chat_id']} | mode={c.get('chat_mode', 'group')} "
+                f"| name={c.get('name', '(unnamed)')}"
+            )
+    else:
+        print("Joined group chats: (none)")
+    if seen_chats:
+        print(f"Detected inbound chats ({len(seen_chats)}):")
+        for c in seen_chats:
+            print(
+                f"  chat_id={c['chat_id']} | type={c.get('chat_type', 'unknown')} "
+                f"| sender_id={c.get('sender_id', '')}"
+            )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="hq", description="hq-pilot multi-repo orchestrator CLI")
     sub = p.add_subparsers(dest="command", required=True)
@@ -443,6 +484,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_tg_detect.add_argument("--hq-dir", default=".")
     sp_tg_detect.set_defaults(func=cmd_telegram_detect_chat)
+
+    sp_fs = sub.add_parser("feishu", help="Feishu/Lark helper utilities")
+    fs_sub = sp_fs.add_subparsers(dest="feishu_action", required=True)
+    sp_fs_detect = fs_sub.add_parser(
+        "detect-chat",
+        help="Validate Feishu credentials, list joined chats, and optionally capture DM chat_id",
+    )
+    sp_fs_detect.add_argument("--hq-dir", default=".")
+    sp_fs_detect.add_argument("--timeout", type=int, default=30)
+    sp_fs_detect.set_defaults(func=cmd_feishu_detect_chat)
 
     return p
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from hq_pilot.channels.base import InboundMessage, InlineButton, MessagingChannel
+from hq_pilot.channels.feishu import FeishuChannel
 from hq_pilot.channels.local import LocalChannel
 from hq_pilot.channels.telegram import TelegramChannel
 from hq_pilot.db import HQDatabase
@@ -93,6 +94,24 @@ def get_channel(
         if db is not None:
             return CompositeChannel([tg, LocalChannel(db)])
         return tg
+    if name == "feishu":
+        app_id = sec.get("FEISHU_APP_ID", "").strip()
+        app_secret = sec.get("FEISHU_APP_SECRET", "").strip()
+        chat_id = (allowed_chat_id or sec.get("FEISHU_CHAT_ID", "")).strip()
+        if not app_id or not app_secret or not chat_id:
+            if db is not None:
+                return LocalChannel(db)
+            return None
+        api_base = sec.get("FEISHU_API_BASE", "").strip() or "https://open.feishu.cn"
+        feishu = FeishuChannel(
+            app_id=app_id,
+            app_secret=app_secret,
+            allowed_chat_id=chat_id,
+            api_base=api_base,
+        )
+        if db is not None:
+            return CompositeChannel([feishu, LocalChannel(db)])
+        return feishu
     if name == "none":
         return None
     raise ValueError(f"Unsupported channel backend: {backend!r}")

@@ -13,7 +13,7 @@ A lightweight, general-purpose, 24/7 multi-repository R&D orchestrator engine fo
 - **Pluggable Extension Axes**:
   - `hq_pilot/agents/`: `CodingAgentAdapter` (`agy` included)
   - `hq_pilot/terminals/`: `TerminalDriver` (`herdr` preferred, `tmux` automatic fallback)
-  - `hq_pilot/channels/`: `MessagingChannel` (`telegram` Forum Topics + Inline Keyboard included)
+  - `hq_pilot/channels/`: `MessagingChannel` (`telegram` Forum Topics + Inline Keyboard, `feishu` WebSocket + Interactive Cards + `reply_in_thread`, and `local` terminal chat)
 - **Centralized Tuning & Guards**: 20+ tunable parameters in `hq.yaml` (`hq config list` / `hq config set`) with automatic hot-reload, `hq guard` for memory/path budgets, and `hq oss-check` for open-source hygiene.
 
 ## Quick Start
@@ -52,6 +52,25 @@ Inputs (Telegram Topics / Local TTY / Git Commits / Timers)
    ├─► Track B: #General coordinator session (idle/turn-bounded -> sealed)
    └─► Track C: #Topic-N interactive worktree panes (human touch -> pinned)
 ```
+
+## Feishu / Lark Channel (WebSocket Long-Connection)
+
+`hq-pilot` supports Feishu/Lark via outbound Open API (`open.feishu.cn`) and inbound WebSocket long-connection (`lark-oapi`, no public webhook URL required):
+
+```bash
+# Install optional Feishu dependency
+pip install -e ".[feishu]"   # or: pip install "lark-oapi>=1.4.0"
+
+# Configure .hq/secrets.env
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+FEISHU_CHAT_ID=oc_xxx
+
+# Validate credentials, list joined group chats, or capture first DM chat_id
+hq feishu detect-chat --hq-dir /path/to/my-project-hq --timeout 30
+```
+
+Set `channel.backend: feishu` in `hq.yaml` to enable dual-write with `LocalChannel` (`CompositeChannel`).
 
 ## License
 

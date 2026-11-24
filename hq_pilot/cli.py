@@ -1,4 +1,4 @@
-"""Main `hq` CLI entrypoint."""
+"""Main `herdr-bot` (`hq`) CLI entrypoint."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from hq_pilot.config import (
 from hq_pilot.daemon import HQDaemon
 from hq_pilot.db import HQDatabase
 from hq_pilot.guards import run_memory_guard, run_oss_guard
+from hq_pilot.setup_cli import register_setup_subparser
 from hq_pilot.syncer import sync_hq_repo
 from hq_pilot.terminals.base import git_worktree_add
 from hq_pilot.terminals.herdr import install_herdr_guide
@@ -121,13 +122,41 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_task_spawn(args: argparse.Namespace) -> int:
+    repo = getattr(args, "repo_opt", None) or getattr(args, "repo_pos", None)
+    slug = getattr(args, "slug_opt", None) or getattr(args, "slug_pos", None)
+    prompt = (
+        args.prompt_opt
+        if getattr(args, "prompt_opt", None) is not None
+        else getattr(args, "prompt_pos", None)
+    )
+    if not repo or not slug or prompt is None:
+        print(
+            "Usage: herdr-bot task spawn <repo> <slug> <prompt> [--hq-dir DIR]",
+            file=sys.stderr,
+        )
+        return 2
+
     daemon = HQDaemon(args.hq_dir)
     try:
-        sess = daemon.spawn_task(args.repo, args.slug, args.prompt)
+        sess = daemon.spawn_task(repo, slug, prompt)
         print(
             f"Spawned {sess['session_key']} | pane={sess['pane_name']} "
             f"| branch={sess['branch_name']} | worktree={sess['worktree_path']}"
         )
+        return 0
+    finally:
+        daemon.close()
+
+
+def cmd_seal(args: argparse.Namespace) -> int:
+    daemon = HQDaemon(args.hq_dir)
+    try:
+        try:
+            sess = daemon.seal_session(args.session_key, reason=args.reason)
+        except KeyError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Sealed {sess['session_key']}")
         return 0
     finally:
         daemon.close()
@@ -383,9 +412,16 @@ def cmd_feishu_detect_chat(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="hq", description="hq-pilot multi-repo orchestrator CLI")
+def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
+    invoked = Path(sys.argv[0]).name if sys.argv else ""
+    prog_name = prog or (invoked if invoked in {"herdr-bot", "hq"} else "herdr-bot")
+    p = argparse.ArgumentParser(
+        prog=prog_name,
+        description="herdr-bot (alias: hq) 24/7 multi-repo orchestrator CLI for native coding agents",
+    )
     sub = p.add_subparsers(dest="command", required=True)
+
+    register_setup_subparser(sub)
 
     sp_init = sub.add_parser("init", help="Initialize a new HQ memory repository")
     sp_init.add_argument("dir", nargs="?", default=".")
@@ -443,6 +479,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp_unpin.add_argument("--hq-dir", default=".")
     sp_unpin.set_defaults(func=cmd_unpin)
 
+    sp_seal = sub.add_parser(
+        "seal",
+        help="Seal a session (preserving worktree until nightly safe archive)",
+    )
+    sp_seal.add_argument("session_key", help="Session key, agent session ID, or topic slug")
+    sp_seal.add_argument("--reason", default="", help="Optional reason recorded in seal notice")
+    sp_seal.add_argument("--hq-dir", default=".")
+    sp_seal.set_defaults(func=cmd_seal)
+
     sp_arch = sub.add_parser("archive", help="Archive eligible sealed sessions")
     sp_arch.add_argument("id_or_slug", nargs="?")
     sp_arch.add_argument("--hq-dir", default=".")
@@ -462,12 +507,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp_oss.add_argument("--no-git-history", action="store_true")
     sp_oss.set_defaults(func=cmd_oss_check)
 
-    sp_task = sub.add_parser("task", help="Manage Track C interactive tasks")
+    sp_task = sub.add_parser("task", help="Manage #Topic interactive worktree tasks")
     task_sub = sp_task.add_subparsers(dest="task_action", required=True)
-    sp_task_spawn = task_sub.add_parser("spawn", help="Spawn a Track C worktree + pane")
-    sp_task_spawn.add_argument("--repo", required=True)
-    sp_task_spawn.add_argument("--slug", required=True)
-    sp_task_spawn.add_argument("--prompt", required=True)
+    sp_task_spawn = task_sub.add_parser("spawn", help="Spawn a #Topic worktree + Herdr pane + thread")
+    sp_task_spawn.add_argument("repo_pos", nargs="?", metavar="repo", help="Target repository name")
+    sp_task_spawn.add_argument("slug_pos", nargs="?", metavar="slug", help="Short task slug")
+    sp_task_spawn.add_argument("prompt_pos", nargs="?", metavar="prompt", help="Initial task prompt")
+    sp_task_spawn.add_argument("--repo", dest="repo_opt", default=None, help="Target repository name")
+    sp_task_spawn.add_argument("--slug", dest="slug_opt", default=None, help="Short task slug")
+    sp_task_spawn.add_argument("--prompt", dest="prompt_opt", default=None, help="Initial task prompt")
     sp_task_spawn.add_argument("--hq-dir", default=".")
     sp_task_spawn.set_defaults(func=cmd_task_spawn)
 

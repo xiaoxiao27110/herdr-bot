@@ -28,6 +28,7 @@ class TestConfigAndTuning(unittest.TestCase):
         self.assertEqual(t.deferred_approval_ttl_hours, 24)
         self.assertEqual(t.general_idle_seal_minutes, 60)
         self.assertEqual(t.general_max_turns, 20)
+        self.assertEqual(t.topic_idle_seal_minutes, 120)
         self.assertEqual(t.distill_idle_minutes, 20)
         self.assertEqual(t.distill_min_new_turns, 3)
         self.assertEqual(t.dirty_worktree_warn_hours, 48)

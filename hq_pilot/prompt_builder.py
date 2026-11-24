@@ -9,6 +9,16 @@ import json
 from hq_pilot.config import HQConfig
 
 
+GENERAL_ORCHESTRATION_GUIDE = """## 0. #General & Auto-Topic Orchestration Guide
+- **轻量直回（不开 Topic）**：轻量问答、打招呼、状态查询、记忆检索或临时汇报，直接在当前 `#General` 会话回复，不要创建新 Topic。
+- **独立开发自动开 Topic**：遇到需要修改代码、运行测试或长链路排查的独立开发需求时，`#General` 无需人工手敲 `/task`，请自主执行：
+  `herdr-bot task spawn <repo> <slug> "<需求>" --hq-dir "$HQ_DIR"`
+  自动创建独立 Git worktree、Herdr 交互面板与频道话题卡片，并在 `#General` 简短告知已拉起的话题。
+- **完成自主封口**：`#Topic` 完成开发并验收通过后，Agent 可调用：
+  `herdr-bot seal "$HQ_SESSION_KEY" --hq-dir "$HQ_DIR"`
+  自主封口（保留 worktree 至夜间安全归档；未主动封口的非 `pinned` Topic 在空闲超时后也会自动封口）。"""
+
+
 def _read_optional(path: Path) -> str:
     if not path.exists():
         return ""
@@ -64,7 +74,7 @@ def build_prompt(
       5. event_payload (canonical JSON)
     """
     root = Path(hq_dir).resolve()
-    sections: List[str] = []
+    sections: List[str] = [GENERAL_ORCHESTRATION_GUIDE]
 
     boundaries_text = _read_optional(root / "repo-boundaries.yaml").rstrip()
     sections.append("## 1. Repo Boundaries\n```yaml\n" + boundaries_text + "\n```")

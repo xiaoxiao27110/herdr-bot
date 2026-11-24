@@ -1,77 +1,145 @@
-# hq-pilot
+# herdr-bot
 
-A lightweight, general-purpose, 24/7 multi-repository R&D orchestrator engine for native coding agents.
+> **Disclaimer / 社区声明**：An unofficial, community-built always-on IM bot & memory orchestrator built on top of [Herdr](https://herdr.dev) (`https://github.com/herdrdev/herdr`). Not affiliated with or endorsed by the official Herdr team. 本项目为独立开源社区生态工具，不打包分发 Herdr 二进制，安装脚本仅引导从 Herdr 官方获取。
 
-`hq-pilot` acts as a deterministic **0-LLM control plane** (`hq-daemon`) that coordinates your repositories, memory files, persistent terminal panes, and external chat channels without introducing a second agent framework.
+面向多仓库研发的 **7×24 确定性 0-LLM 编排引擎**，让你的原生 Coding Agent（如 `agy`）100% 常驻在 **[Herdr](https://herdr.dev)** 交互式终端工作区中，无缝打通 **飞书（WebSocket 免公网 IP）/ Telegram（Forum Topics）/ 本地终端对话** 与跨仓库持久记忆。
 
-## Key Features
+> 兼容性说明：命令行同时提供 `herdr-bot` 与短别名 `hq`，内部 Python 包保持 `hq_pilot` 以兼容既有脚本与插件生态。
 
-- **Single Brain, Zero Nested Agents**: Delegates all reasoning and coding to your native coding agent CLI via `CodingAgentAdapter` (V1 ships `AgyAdapter`).
-- **4-State Session Lifecycle**: `active` → `sealed` (logical closeout, workspace preserved until night) → `archived` (safe nightly cleanup), with automatic `pinned` promotion whenever a human touches the session locally or via terminal attach.
-- **In-Place Resurrection (`hq resume <id>`)**: Rebuilds archived Git worktrees on their preserved branch and resumes the original agent conversation.
-- **Decoupled Cursor Distillation & 3-Stage Nightly Closeout**: Incremental transcript slicing (`[last_summarized_line .. EOF]`) across `active`, `pinned`, and `sealed` sessions, followed by `23:30` 4-phase Dreaming (`Orient → Gather → Consolidate → Prune`) and safe archiving.
-- **Pluggable Extension Axes**:
-  - `hq_pilot/agents/`: `CodingAgentAdapter` (`agy` included)
-  - `hq_pilot/terminals/`: `TerminalDriver` (`herdr` preferred, `tmux` automatic fallback)
-  - `hq_pilot/channels/`: `MessagingChannel` (`telegram` Forum Topics + Inline Keyboard, `feishu` WebSocket + Interactive Cards + `reply_in_thread`, and `local` terminal chat)
-- **Centralized Tuning & Guards**: 20+ tunable parameters in `hq.yaml` (`hq config list` / `hq config set`) with automatic hot-reload, `hq guard` for memory/path budgets, and `hq oss-check` for open-source hygiene.
+---
 
-## Quick Start
+## 为什么选择 `herdr-bot`？
+
+1. **零 `-p` 黑盒，100% 原生 Herdr 交互式架构**
+   - 守护进程自身 **0-LLM 开销**，不套壳第二层 Agent 框架，所有推理与编码完全交给原生 Agent CLI。
+   - 彻底告别无状态 `agy -p` 单次调用：每一个会话都是真实的 **Herdr** 持久交互面板（未安装 Herdr 时自动降级 `tmux`），随时可在终端敲 `herdr` 切入现场围观、打断或人工协作。
+   - 通过轻量级生命周期 Hook（`<10ms`）在每轮结束时精准提取干净回复，原位刷新飞书/Telegram「⏳ 正在处理中...」状态卡片。
+
+2. **纯两级会话（`#General` + `#Topic`）与全自动开/关 Topic 闭环**
+   - **`#General`（`hq-general` 协调面板）**：处理日常轻量问答、项目状态查询、跨仓库敏感提交巡检、增量对话蒸馏与夜间记忆整合——轻量沟通直接秒回，绝不乱开窗口。
+   - **`#Topic`（`hq-<slug>` 独立任务面板）**：遇到需要修改代码、跑测试或长链路排查的独立开发需求时，**无需人工手敲 `/task`**，`#General` 会自主执行 `herdr-bot task spawn` 创建独立 Git Worktree + Herdr 专属面板 + 飞书/Telegram 独立话题卡片。
+   - **全自动封口闭环（告别强制 `/done`）**：任务完成并验收通过后，Agent 可调用 `herdr-bot seal` 自主封口；即使忘记手动封口，空闲满 `topic_idle_seal_minutes`（默认 `120` 分钟）后守护进程也会自动将非 `pinned` 活跃话题转为 `sealed`（保留 Worktree 至夜间安全归档）。
+
+3. **人工接管自动保护（`pinned`）与 4 态安全归档**
+   - 会话完整生命周期：`active` → `sealed`（逻辑封口，保留分支与工作树）→ `archived`（每晚 `23:30` 自动蒸馏做梦后清理干净工作树，永久保留 Git 分支与对话记录，支持 `herdr-bot resume <id>` 一键重建工作树原地续聊）。
+   - **四不删铁律与自动 `pinned`**：只要你在本地打开 `herdr` 附着面板或手动输入过任何指令，系统通过 SHA-256 输入指纹与终端附着检测自动将会话升级为 `pinned`——**绝不空闲自动封口、绝不删除存在未提交修改或未推送提交的工作树**。
+
+---
+
+## 2 步极速上手
+
+### 第 1 步：一键安装
 
 ```bash
-# 1. Initialize an HQ memory repository for your project
-./bin/hq init ~/my-project-hq
-cd ~/my-project-hq
-
-# 2. Configure repos in hq.yaml and repo-boundaries.yaml, then clone missing repos
-/path/to/hq-pilot/bin/hq bootstrap --hq-dir .
-
-# 3. Check host dependencies
-/path/to/hq-pilot/bin/hq doctor --hq-dir .
-
-# 4. Inspect or adjust tuning parameters
-/path/to/hq-pilot/bin/hq config list --hq-dir .
-/path/to/hq-pilot/bin/hq config set commit_debounce_sec 180 --hq-dir .
-
-# 5. Validate memory budgets and logical paths (<repo>:<relpath>)
-/path/to/hq-pilot/bin/hq guard --hq-dir .
-
-# 6. Start the 24/7 daemon
-/path/to/hq-pilot/bin/hq up --hq-dir .
+git clone https://github.com/your-org/herdr-bot.git
+cd herdr-bot
+./install.sh
 ```
 
-## Architecture Overview
+> `./install.sh`（支持 `--yes` 非交互模式与 `--python <path>` 指定解释器）会自动检查 `agy` 与 `herdr`（缺失时支持一键调用官方 `curl -fsSL https://herdr.dev/install.sh | sh` 安装）、安装 `pyyaml`（及可选飞书 `lark-oapi`），并将 `herdr-bot` 与 `hq` 软链至 `~/.local/bin/`。
+
+### 第 2 步：运行交互式初始化向导
+
+```bash
+herdr-bot setup
+```
+
+按提示输入工作区目录（默认 `~/herdr-hq`）、要托管的本地 Git 仓库路径以及消息通道（`feishu` / `telegram` / `local`）。向导会自动探测每个仓库的 `origin` 远程地址、默认分支以及本机 `python_bin` / `agy_bin` / `herdr_bin` 路径，一键生成：
+
+- `hq.yaml`（项目、通道、仓库与调优参数配置）
+- `repo-boundaries.yaml`（跨仓库契约监听路径）
+- `AGENTS.md`（精简记忆索引与自动开/关 Topic 协作规范）
+- `.hq/local.yaml`（本机仓库绝对路径与二进制映射）
+- `.hq/secrets.env`（强制 `0600` 权限保存通道密钥）
+
+也支持一条命令全参数非交互初始化（适合脚本自动化）：
+
+```bash
+herdr-bot setup \
+  --non-interactive \
+  --hq-dir ~/herdr-hq \
+  --project-name my-platform \
+  --repo api-svc=~/code/api-svc \
+  --repo web-app=~/code/web-app \
+  --channel feishu \
+  --feishu-app-id cli_xxx \
+  --feishu-app-secret sec_xxx \
+  --feishu-chat-id oc_xxx
+```
+
+### 启动守护进程与随时接管 Herdr
+
+```bash
+# 启动 7x24 编排守护进程（自动预热 hq-general 交互面板）
+herdr-bot up --hq-dir ~/herdr-hq
+
+# 在任意终端打开 Herdr TUI，实时查看或随时接管 hq-general / hq-<slug> 面板
+herdr
+```
+
+---
+
+## 架构总览
 
 ```text
-Inputs (Telegram Topics / Local TTY / Git Commits / Timers)
-   │
-   ▼
-0-LLM Daemon Kernel (gatekeeper + SQLite inbox + cursors.json)
-   │
-   ├─► Track A: Background headless short sessions (event-driven -> sealed)
-   ├─► Track B: #General coordinator session (idle/turn-bounded -> sealed)
-   └─► Track C: #Topic-N interactive worktree panes (human touch -> pinned)
+飞书话题卡片 / Telegram Topics / 本地终端 chat / Git 敏感提交 / 定时任务
+                               │
+                               ▼
+         0-LLM 守护内核 (SQLite 租约队列 + 游标状态 + 安全守卫)
+                               │
+         ┌─────────────────────┴─────────────────────┐
+         ▼                                           ▼
+  #General (hq-general)                      #Topic (hq-<slug>)
+  Herdr 常驻协调面板 (HQ 记忆根)             独立 Git Worktree + Herdr 面板
+  - 轻量问答、状态汇报直接秒回               - 由 #General 自主 task spawn 拉起
+  - 跨仓提交巡检 & 增量记忆蒸馏               - 验收后自主 seal 或空闲 120m 自动封口
+  - 23:30 夜间做梦整合与 09:30 晨报           - 人工切入 Herdr 自动转 pinned 免清理保护
 ```
 
-## Feishu / Lark Channel (WebSocket Long-Connection)
+---
 
-`hq-pilot` supports Feishu/Lark via outbound Open API (`open.feishu.cn`) and inbound WebSocket long-connection (`lark-oapi`, no public webhook URL required):
+## 通道接入说明
 
+### 1. 飞书 / Lark（推荐，WebSocket 长连接免公网 Webhook）
+1. 在飞书开放平台创建企业自建应用，开启**机器人能力**，事件订阅选择**使用长连接接收事件**，添加 `im.message.receive_v1` 与卡片回调 `card.action.trigger`。
+2. 运行 `herdr-bot setup` 填入 `FEISHU_APP_ID` 与 `FEISHU_APP_SECRET`；若尚不清楚群聊 `chat_id`，把机器人拉入目标群后执行：
+   ```bash
+   herdr-bot feishu detect-chat --hq-dir ~/herdr-hq --timeout 30
+   ```
+3. 将探测到的 `oc_xxx` 填入 `hq.yaml` 的 `channel.allowed_chat_id`（或重跑 `herdr-bot setup` 更新）。
+
+### 2. Telegram（Forum Topics 话题群）
+1. 创建一个开启 **Topics（话题）** 功能的 Telegram Supergroup 并将 Bot 设为管理员（授予 Manage Topics 权限）。
+2. 在群内发一条消息后执行自动探测：
+   ```bash
+   herdr-bot telegram detect-chat --hq-dir ~/herdr-hq
+   ```
+
+### 3. 纯本地终端对话（零外部依赖）
+无需配置任何聊天平台密钥，`channel: local` 下直接通过内置终端聊天与守护进程交互：
 ```bash
-# Install optional Feishu dependency
-pip install -e ".[feishu]"   # or: pip install "lark-oapi>=1.4.0"
-
-# Configure .hq/secrets.env
-FEISHU_APP_ID=cli_xxx
-FEISHU_APP_SECRET=xxx
-FEISHU_CHAT_ID=oc_xxx
-
-# Validate credentials, list joined group chats, or capture first DM chat_id
-hq feishu detect-chat --hq-dir /path/to/my-project-hq --timeout 30
+herdr-bot chat --hq-dir ~/herdr-hq --standalone
 ```
 
-Set `channel.backend: feishu` in `hq.yaml` to enable dual-write with `LocalChannel` (`CompositeChannel`).
+---
+
+## 常用命令速查
+
+| 命令 | 说明 |
+| --- | --- |
+| `herdr-bot setup` | 交互式/非交互式配置向导（生成 `hq.yaml`、`.hq/local.yaml`、`0600` `secrets.env`） |
+| `herdr-bot up --hq-dir <dir>` | 启动 7×24 守护进程（Ctrl+C 或 `herdr-bot stop` 优雅退出） |
+| `herdr-bot status --hq-dir <dir>` | 查看所有追踪中的 `#General` / `#Topic` 会话、分支与 4 态状态 |
+| `herdr-bot task spawn <repo> <slug> "<需求>"` | 拉起独立 Git Worktree + Herdr 交互面板 + 频道话题卡片 |
+| `herdr-bot seal <session_key> [--reason "..."]` | 封口指定会话（保留 Worktree 至夜间 `23:30` 安全归档） |
+| `herdr-bot resume <id_or_slug>` | 原地复活已归档会话（自动重建同分支 Worktree 并恢复原对话） |
+| `herdr-bot pin / unpin <id_or_slug>` | 手动加锁豁免自动封口与夜间归档 / 解锁转为 `sealed` |
+| `herdr-bot config list / set <key> <val>` | 查看或热更新 20+ 项调优参数（如 `topic_idle_seal_minutes`） |
+| `herdr-bot guard --hq-dir <dir>` | 校验 `AGENTS.md` / `today.md` 行数体积预算与 `<repo>:<relpath>` 路径有效性 |
+| `herdr-bot doctor --hq-dir <dir>` | 检查本机 `git` / `agy` / `herdr` / `tmux` 与密钥环境状态 |
+
+---
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT License — 详见 [LICENSE](LICENSE)。

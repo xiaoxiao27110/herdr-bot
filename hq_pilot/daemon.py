@@ -150,12 +150,7 @@ class HQDaemon:
         if msg.thread_id:
             sess = self.db.get_session_by_thread(msg.thread_id)
             if text == "/done" and sess:
-                self.db.seal_session(str(sess["session_key"]), now=now)
-                if self.channel:
-                    self.channel.send_message(
-                        f"Session `{sess['session_key']}` sealed. Worktree preserved until nightly archive.",
-                        thread_id=msg.thread_id,
-                    )
+                self.seal_session(str(sess["session_key"]), now=now)
                 return
 
             if sess and sess["status"] == "sealed":
@@ -405,6 +400,54 @@ class HQDaemon:
             idle_sec = now - int(s["last_active_at"])
             if idle_sec >= idle_limit or int(s["turn_count"]) >= max_turns:
                 self.db.seal_session(str(s["session_key"]), now=now)
+
+    def _seal_idle_topic_sessions(self, now: int) -> None:
+        idle_limit = self.config.tuning.topic_idle_seal_minutes * 60
+        if idle_limit <= 0:
+            return
+        for s in self.db.list_sessions(statuses=["active"]):
+            if s["track"] not in TOPIC_TRACKS:
+                continue
+            if int(s.get("pinned") or 0) != 0:
+                continue
+            idle_sec = now - int(s["last_active_at"])
+            if idle_sec >= idle_limit:
+                self.db.seal_session(str(s["session_key"]), now=now)
+
+    def seal_session(
+        self,
+        session_key: str,
+        reason: str = "",
+        now: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Explicitly seal a session (preserving its worktree until nightly safe archive)."""
+        ts = int(now if now is not None else time.time())
+        sess = self.db.find_session(session_key)
+        if not sess:
+            raise KeyError(f"Session not found: {session_key}")
+        skey = str(sess["session_key"])
+        if sess["status"] == "archived":
+            return sess
+
+        was_sealed = sess["status"] == "sealed"
+        if int(sess.get("pinned") or 0) != 0:
+            self.db.unpin_session(skey, target_status="sealed", now=ts)
+            self.db.update_session(skey, sealed_at=ts, last_active_at=ts)
+        elif not was_sealed:
+            self.db.seal_session(skey, now=ts)
+
+        updated = self.db.get_session(skey) or sess
+        thread_id = updated.get("channel_thread_id")
+        if not was_sealed and thread_id and self.channel is not None:
+            reason_note = f" ({reason.strip()})" if reason and reason.strip() else ""
+            try:
+                self.channel.send_message(
+                    f"Session `{skey}` sealed{reason_note}. Worktree preserved until nightly archive.",
+                    thread_id=str(thread_id),
+                )
+            except Exception:
+                pass
+        return updated
 
     def _resolve_pane_name(self, session: Dict[str, Any]) -> str:
         existing = session.get("pane_name")
@@ -828,6 +871,7 @@ class HQDaemon:
                     self.db, sess, terminal_driver=self.terminal_driver, now=ts
                 )
         self._seal_idle_general_sessions(ts)
+        self._seal_idle_topic_sessions(ts)
 
         events = self.db.claim_next_events(
             limit=10,

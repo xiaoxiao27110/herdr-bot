@@ -8,6 +8,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from hq_pilot.bootstrap_env import maybe_reexec_python
+
+maybe_reexec_python(__file__)
+
 from hq_pilot.hook_cli import main
 
 if __name__ == "__main__":

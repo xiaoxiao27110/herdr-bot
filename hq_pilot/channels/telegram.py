@@ -42,7 +42,10 @@ class TelegramChannel(MessagingChannel):
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "hq-pilot/1.0",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:

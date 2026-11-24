@@ -18,7 +18,11 @@ from hq_pilot.daemon import GENERAL_PANE_NAME, HQDaemon
 from hq_pilot.db import HQDatabase
 from hq_pilot.hook_cli import handle_hook_event
 from hq_pilot.terminals.base import PaneInfo, TerminalDriver
-from hq_pilot.terminals.herdr import HerdrDriver, sanitize_herdr_agent_name
+from hq_pilot.terminals.herdr import (
+    HerdrDriver,
+    clean_agent_terminal_output,
+    sanitize_herdr_agent_name,
+)
 from hq_pilot.terminals.tmux import TmuxDriver
 
 try:
@@ -481,6 +485,176 @@ class TestHerdrInteractiveMode(unittest.TestCase):
                 self.assertEqual(term.start_agent_calls[0]["name"], GENERAL_PANE_NAME)
             finally:
                 daemon.close()
+
+    def test_agy_transcript_real_format_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tfile = Path(tmp) / "transcript_full.jsonl"
+            records = [
+                {"type": "SYSTEM_MESSAGE", "content": "system bootstrap"},
+                {"type": "USER_INPUT", "content": "帮我查下状态", "timestamp": "2026-01-01T00:00:01Z"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "thinking": "checking files first",
+                    "tool_calls": [{"name": "read_file", "args": {"path": "a.py"}}],
+                },
+                {"type": "PLANNER_RESPONSE", "content": "   ", "thinking": "still thinking"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "content": "状态正常，全部服务已就绪。",
+                    "thinking": "done",
+                    "timestamp": "2026-01-01T00:00:05Z",
+                },
+                # Backward compatibility with legacy role/message formats
+                {"role": "user", "content": "legacy question"},
+                {"type": "model", "message": {"role": "assistant", "content": "legacy answer"}},
+            ]
+            tfile.write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+                encoding="utf-8",
+            )
+
+            adapter = AgyAdapter()
+            turns, total = adapter.read_transcript_slice(tfile, from_line=0)
+            self.assertEqual(total, len(records))
+            self.assertEqual(
+                [(t.role, t.text) for t in turns],
+                [
+                    ("user", "帮我查下状态"),
+                    ("assistant", "状态正常，全部服务已就绪。"),
+                    ("user", "legacy question"),
+                    ("assistant", "legacy answer"),
+                ],
+            )
+
+    def test_stop_hook_last_reply_pane_cross_session_key_and_raw_followup_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "acme-hq"
+            hq_main(["init", str(hq_dir)])
+            tfile = Path(tmp) / "gen_full.jsonl"
+            tfile.write_text(
+                json.dumps({"type": "USER_INPUT", "content": "第一轮消息"}, ensure_ascii=False) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "thinking": "tool step"}, ensure_ascii=False) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "content": "第一轮干净回复"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            ch = IndicatorChannel()
+
+            class CrossKeyHookTerminal(RecordingTerminal):
+                def __init__(self, hq_root: Path, transcript: Path, channel_obj):
+                    super().__init__(reply_fn=lambda name, text: "Noisy fallback screen")
+                    self.hq_root = hq_root
+                    self.transcript = transcript
+                    self.channel_obj = channel_obj
+                    self.hook_results = []
+                    self.turn_idx = 0
+
+                def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+                    self.turn_idx += 1
+                    if self.turn_idx == 2:
+                        with self.transcript.open("a", encoding="utf-8") as fh:
+                            fh.write(
+                                json.dumps({"type": "USER_INPUT", "content": "第二轮消息"}, ensure_ascii=False)
+                                + "\n"
+                                + json.dumps({"type": "PLANNER_RESPONSE", "content": "第二轮干净回复"}, ensure_ascii=False)
+                                + "\n"
+                            )
+                    # Simulate stale HQ_SESSION_KEY pointing to general:1 while daemon dispatches general:2
+                    with patch.dict(os.environ, {"HQ_SESSION_KEY": "general:1"}):
+                        res = handle_hook_event(
+                            "agy",
+                            {
+                                "hookEventName": "Stop",
+                                "conversationId": "conv-stale-1",
+                                "transcriptPath": str(self.transcript),
+                            },
+                            hq_dir=self.hq_root,
+                            channel=self.channel_obj,
+                            now=1000 + self.turn_idx,
+                        )
+                        self.hook_results.append(res)
+                    return super().prompt_agent(name, text, wait=wait, timeout_ms=timeout_ms)
+
+            term = CrossKeyHookTerminal(hq_dir, tfile, ch)
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                # Seed an old sealed general:1 (stale env) and an active general:2 on the same hq-general pane
+                daemon.db.create_session(
+                    "general:1", "GENERAL", "agy", status="sealed", pane_name=GENERAL_PANE_NAME, now=900
+                )
+                daemon.db.create_session(
+                    "general:2", "GENERAL", "agy", status="active", pane_name=GENERAL_PANE_NAME, now=950
+                )
+
+                # Turn 1 (turn_count == 0): sends full build_prompt; Stop hook writes under general:1 + pane hq-general
+                ch.updates.append(
+                    InboundMessage(
+                        update_id=1,
+                        chat_id="c1",
+                        thread_id=None,
+                        sender_id="u1",
+                        text="第一轮消息",
+                        message_id="m-1",
+                    )
+                )
+                summary1 = daemon.run_once(now=1000)
+                self.assertEqual(summary1.events_processed, 1)
+                self.assertFalse(term.hook_results[0]["reply_pushed"])
+                self.assertEqual(ch.sent, [])
+                self.assertEqual(ch.finished_indicators[0]["text"], "第一轮干净回复")
+                self.assertIn("## 1. Repo Boundaries", term.prompt_calls[0]["text"])
+                self.assertIn("## 5. Event Payload", term.prompt_calls[0]["text"])
+                self.assertIsNone(daemon.db.get_meta(f"daemon_waiting_pane:{GENERAL_PANE_NAME}"))
+                self.assertIsNone(daemon.db.get_meta(f"last_reply_pane:{GENERAL_PANE_NAME}"))
+
+                # Turn 2 (pane live and turn_count > 0): sends raw user text without re-injecting AGENTS.md
+                ch.updates.append(
+                    InboundMessage(
+                        update_id=2,
+                        chat_id="c1",
+                        thread_id=None,
+                        sender_id="u1",
+                        text="第二轮消息",
+                        message_id="m-2",
+                    )
+                )
+                summary2 = daemon.run_once(now=1010)
+                self.assertEqual(summary2.events_processed, 1)
+                self.assertFalse(term.hook_results[1]["reply_pushed"])
+                self.assertEqual(ch.sent, [])
+                self.assertEqual(term.prompt_calls[1]["text"], "第二轮消息")
+                self.assertEqual(ch.finished_indicators[1]["text"], "第二轮干净回复")
+            finally:
+                daemon.close()
+
+    def test_clean_agent_terminal_output_strips_tui_footer(self) -> None:
+        raw = (
+            "已完成检查：\n"
+            "> 引用正文内容应保留\n"
+            "全部测试通过。\n"
+            "\n"
+            "────────────────────────────────────────────────────────\n"
+            "> \n"
+            "────────────────────────────────────────────────────────\n"
+            "? for shortcuts · /help              auto · Gemini 4 Neon · high\n"
+        )
+        cleaned = clean_agent_terminal_output(raw)
+        self.assertEqual(
+            cleaned,
+            "已完成检查：\n> 引用正文内容应保留\n全部测试通过。",
+        )
+
+        raw_plan = (
+            "Plan summary ready.\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "plan · Model X · medium\n"
+        )
+        self.assertEqual(clean_agent_terminal_output(raw_plan), "Plan summary ready.")
 
 
 if __name__ == "__main__":

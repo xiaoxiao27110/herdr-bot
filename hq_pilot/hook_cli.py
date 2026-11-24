@@ -140,8 +140,14 @@ def handle_hook_event(
                 )
                 if assistant_msgs:
                     latest_reply = assistant_msgs[-1]
+                    pane_name = str(sess.get("pane_name") or "").strip()
                     db.set_meta(f"last_reply:{skey}", latest_reply, now=ts)
-                    daemon_waiting = db.get_meta(f"daemon_waiting:{skey}") == "1"
+                    if pane_name:
+                        db.set_meta(f"last_reply_pane:{pane_name}", latest_reply, now=ts)
+                    daemon_waiting = db.get_meta(f"daemon_waiting:{skey}") == "1" or (
+                        bool(pane_name)
+                        and db.get_meta(f"daemon_waiting_pane:{pane_name}") == "1"
+                    )
                     thread_id = sess.get("channel_thread_id")
                     is_general = str(sess.get("track") or "") in {"GENERAL", "B"}
                     if not daemon_waiting and (thread_id or is_general):

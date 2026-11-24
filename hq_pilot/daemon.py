@@ -639,19 +639,30 @@ class HQDaemon:
         prev_turns = int(session.get("turn_count") or 0)
         self.db.record_dispatch(skey, agent_sid, prompt, now=now)
         self.db.delete_meta(f"last_reply:{skey}")
+        self.db.delete_meta(f"last_reply_pane:{pane_name}")
         self.db.set_meta(f"daemon_waiting:{skey}", "1", now=now)
+        self.db.set_meta(f"daemon_waiting_pane:{pane_name}", "1", now=now)
         try:
             fallback_reply = self.terminal_driver.prompt_agent(
                 pane_name, prompt, wait=wait
             )
         finally:
             self.db.delete_meta(f"daemon_waiting:{skey}")
+            self.db.delete_meta(f"daemon_waiting_pane:{pane_name}")
 
         hook_reply = self.db.get_meta(f"last_reply:{skey}")
         if hook_reply is not None:
             self.db.delete_meta(f"last_reply:{skey}")
+        pane_reply = self.db.get_meta(f"last_reply_pane:{pane_name}")
+        if pane_reply is not None:
+            self.db.delete_meta(f"last_reply_pane:{pane_name}")
 
-        reply = hook_reply if (hook_reply and hook_reply.strip()) else (fallback_reply or "")
+        if hook_reply and hook_reply.strip():
+            reply = hook_reply
+        elif pane_reply and pane_reply.strip():
+            reply = pane_reply
+        else:
+            reply = fallback_reply or ""
         fresh = self.db.get_session(skey) or session
         cur_turns = int(fresh.get("turn_count") or 0)
         new_turns = cur_turns if cur_turns > prev_turns else prev_turns + 1
@@ -696,7 +707,10 @@ class HQDaemon:
 
             pane_name = self._resolve_pane_name(sess)
             live_panes = {p.name for p in self.terminal_driver.list_panes()}
-            is_live_topic = (sess.get("track") in TOPIC_TRACKS) and (pane_name in live_panes)
+            is_live_pane = pane_name in live_panes
+            is_live_topic = (sess.get("track") in TOPIC_TRACKS) and is_live_pane
+            has_prior_turns = int(sess.get("turn_count") or 0) > 0
+            use_raw_prompt = is_live_topic or (is_live_pane and has_prior_turns)
             recent_outbound = self._get_recent_outbound()
             topic_slug = (
                 str(sess["topic_slug"])
@@ -705,7 +719,7 @@ class HQDaemon:
             )
             prompt = (
                 str(payload.get("text") or "")
-                if is_live_topic
+                if use_raw_prompt
                 else build_prompt(
                     self.hq_dir,
                     self.config,

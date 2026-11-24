@@ -51,9 +51,9 @@ def _parse_transcript_line(obj: Dict[str, Any], line_no: int) -> Optional[Turn]:
 
     if not role:
         raw_type = str(obj.get("type") or "").lower()
-        if raw_type in {"user", "human"}:
+        if raw_type in {"user", "human", "user_input"}:
             role = "user"
-        elif raw_type in {"assistant", "model", "agent"}:
+        elif raw_type in {"assistant", "model", "agent", "planner_response"}:
             role = "assistant"
         elif raw_type == "system":
             role = "system"

@@ -14,6 +14,31 @@ from hq_pilot.terminals.base import PaneInfo, TerminalDriver, shell_join
 
 
 _HERDR_AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_TUI_BORDER_LINE_RE = re.compile(r"^[─━═]{3,}$")
+_TUI_MODE_STATUS_RE = re.compile(r"(?:^|\s)(?:auto|plan|ask)\s*·\s*", re.IGNORECASE)
+
+
+def clean_agent_terminal_output(raw: str) -> str:
+    """Strip trailing interactive TUI chrome (borders, empty prompt, shortcuts/model status bar)."""
+    if not raw:
+        return ""
+    lines = raw.splitlines()
+    while lines:
+        stripped = lines[-1].strip()
+        if not stripped:
+            lines.pop()
+            continue
+        if _TUI_BORDER_LINE_RE.match(stripped):
+            lines.pop()
+            continue
+        if stripped in {">", "❯", "›"}:
+            lines.pop()
+            continue
+        if "? for shortcuts" in stripped.lower() or _TUI_MODE_STATUS_RE.search(stripped):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines).strip()
 
 
 def sanitize_herdr_agent_name(name: str) -> str:
@@ -235,8 +260,8 @@ class HerdrDriver(TerminalDriver):
             check=False,
         )
         if read_res.returncode == 0 and read_res.stdout.strip():
-            return read_res.stdout.strip()
-        return self.read_pane(name, lines=120).strip()
+            return clean_agent_terminal_output(read_res.stdout)
+        return clean_agent_terminal_output(self.read_pane(name, lines=120))
 
     def list_panes(self) -> List[PaneInfo]:
         if not self._server_running():

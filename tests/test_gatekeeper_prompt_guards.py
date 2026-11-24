@@ -14,7 +14,10 @@ from hq_pilot.db import HQDatabase
 from hq_pilot.gatekeeper import scan_repo_commits
 from hq_pilot.guards import run_memory_guard, run_oss_guard
 from hq_pilot.prompt_builder import build_prompt
-from test_archiver_resume_cursors import _init_git_repo
+try:
+    from tests.test_archiver_resume_cursors import _init_git_repo
+except ModuleNotFoundError:
+    from test_archiver_resume_cursors import _init_git_repo
 
 
 class TestGatekeeperPromptGuards(unittest.TestCase):

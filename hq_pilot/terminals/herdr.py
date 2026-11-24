@@ -13,7 +13,8 @@ from hq_pilot.terminals.base import PaneInfo, TerminalDriver, shell_join
 def install_herdr_guide() -> str:
     return (
         "Herdr (`hc`) is not installed. To install Herdr:\n"
-        "  1. Visit https://github.com/herdr-sh/herdr or install via cargo/homebrew.\n"
+        "  1. Run: curl -fsSL https://herdr.dev/install.sh | sh\n"
+        "     (or visit https://github.com/herdrdev/herdr)\n"
         "  2. Ensure `hc` is in PATH and verify with `hc --version`.\n"
         "  3. Until then, hq-pilot with `terminal.backend: auto` automatically uses `tmux`."
     )

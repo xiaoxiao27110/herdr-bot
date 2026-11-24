@@ -24,6 +24,7 @@ class InboundMessage:
     callback_id: Optional[str] = None
     callback_data: Optional[str] = None
     message_id: Optional[str] = None
+    reply_to_msg_id: Optional[str] = None
 
 
 class MessagingChannel(ABC):

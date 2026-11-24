@@ -145,9 +145,9 @@ class TestAdaptersAndChannels(unittest.TestCase):
             hook_path = adapter.ensure_hooks_installed(tmp, "/usr/local/bin/hq-agent-hook")
             self.assertTrue(hook_path.exists())
             hook_cfg = json.loads(hook_path.read_text(encoding="utf-8"))
-            self.assertIn("SessionStart", hook_cfg["hooks"])
-            self.assertIn("PreInvocation", hook_cfg["hooks"])
-            self.assertIn("Stop", hook_cfg["hooks"])
+            self.assertIn("SessionStart", hook_cfg["hq-pilot"])
+            self.assertIn("PreInvocation", hook_cfg["hq-pilot"])
+            self.assertIn("Stop", hook_cfg["hq-pilot"])
 
     def test_telegram_channel_mock_and_fail_closed_whitelist(self) -> None:
         calls = []

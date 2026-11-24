@@ -111,6 +111,8 @@ class TelegramChannel(MessagingChannel):
                 if not text:
                     continue
                 thread_id = msg.get("message_thread_id")
+                reply_to = msg.get("reply_to_message") or {}
+                reply_mid = reply_to.get("message_id") if isinstance(reply_to, dict) else None
                 messages.append(
                     InboundMessage(
                         update_id=uid,
@@ -120,6 +122,7 @@ class TelegramChannel(MessagingChannel):
                         text=text,
                         is_callback=False,
                         message_id=str(msg.get("message_id", "")),
+                        reply_to_msg_id=str(reply_mid) if reply_mid is not None else None,
                     )
                 )
         return messages

@@ -100,9 +100,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     cfg = load_config(args.hq_dir)
     print(f"Project: {cfg.project_name} ({cfg.hq_dir})")
     print(f"git: {shutil.which('git') or 'MISSING'}")
-    print(f"agent ({cfg.agent.backend}): {shutil.which(cfg.agent.backend) or 'NOT FOUND'}")
-    hc_path = shutil.which("hc")
-    tmux_path = shutil.which("tmux")
+    agent_bin = cfg.local.bin_overrides.get(cfg.agent.backend) or shutil.which(cfg.agent.backend)
+    print(f"agent ({cfg.agent.backend}): {agent_bin or 'NOT FOUND'}")
+    hc_path = cfg.local.bin_overrides.get("hc") or shutil.which("hc")
+    tmux_path = cfg.local.bin_overrides.get("tmux") or shutil.which("tmux")
     print(f"hc (herdr): {hc_path or 'NOT FOUND'}")
     print(f"tmux: {tmux_path or 'NOT FOUND'}")
     if not hc_path:
@@ -110,6 +111,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     secrets = load_secrets_env(cfg.hq_dir)
     print(f"\nsecrets.env keys: {sorted(secrets.keys()) if secrets else '(none)'}")
     return 0
+
+
+def cmd_task_spawn(args: argparse.Namespace) -> int:
+    daemon = HQDaemon(args.hq_dir)
+    try:
+        sess = daemon.spawn_task(args.repo, args.slug, args.prompt)
+        print(
+            f"Spawned {sess['session_key']} | pane={sess['pane_name']} "
+            f"| branch={sess['branch_name']} | worktree={sess['worktree_path']}"
+        )
+        return 0
+    finally:
+        daemon.close()
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -373,6 +387,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp_oss.add_argument("--repo", default=".")
     sp_oss.add_argument("--no-git-history", action="store_true")
     sp_oss.set_defaults(func=cmd_oss_check)
+
+    sp_task = sub.add_parser("task", help="Manage Track C interactive tasks")
+    task_sub = sp_task.add_subparsers(dest="task_action", required=True)
+    sp_task_spawn = task_sub.add_parser("spawn", help="Spawn a Track C worktree + pane")
+    sp_task_spawn.add_argument("--repo", required=True)
+    sp_task_spawn.add_argument("--slug", required=True)
+    sp_task_spawn.add_argument("--prompt", required=True)
+    sp_task_spawn.add_argument("--hq-dir", default=".")
+    sp_task_spawn.set_defaults(func=cmd_task_spawn)
 
     return p
 

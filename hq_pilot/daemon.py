@@ -20,13 +20,14 @@ from hq_pilot.config import HQConfig, load_config, load_secrets_env
 from hq_pilot.cursors import CursorStore
 from hq_pilot.db import EventRow, HQDatabase
 from hq_pilot.gatekeeper import (
+    detect_manual_touch,
     scan_distill_candidates,
     scan_pane_blocked,
     scan_repo_commits,
 )
 from hq_pilot.prompt_builder import build_prompt
 from hq_pilot.syncer import sync_hq_repo
-from hq_pilot.terminals.base import TerminalDriver
+from hq_pilot.terminals.base import TerminalDriver, git_worktree_add
 from hq_pilot.terminals.registry import get_terminal_driver
 
 
@@ -102,6 +103,37 @@ class HQDaemon:
         text = msg.text.strip()
         if not text:
             return
+
+        if msg.reply_to_msg_id:
+            action = self.db.get_deferred_action(msg.reply_to_msg_id)
+            if action and action.get("resolved_at") is None:
+                self.db.resolve_deferred_action(msg.reply_to_msg_id, now=now)
+                self.db.enqueue_event(
+                    source="deferred_resume",
+                    dedupe_key=f"defer_reply:{msg.reply_to_msg_id}:{msg.update_id}",
+                    priority=10,
+                    available_at=now,
+                    payload={
+                        "session_key": action["session_key"],
+                        "choice_id": "reply",
+                        "choice_label": text,
+                        "thread_id": msg.thread_id,
+                    },
+                    now=now,
+                )
+                return
+
+        if not msg.thread_id and text.startswith("/task "):
+            parts = text.split(None, 3)
+            if len(parts) >= 4:
+                _, repo_name, slug, task_prompt = parts
+                sess = self.spawn_task(repo_name, slug, task_prompt, now=now)
+                if self.channel:
+                    self.channel.send_message(
+                        f"Spawned Track C task `{sess['session_key']}` in pane `{sess['pane_name']}` "
+                        f"(branch `{sess['branch_name']}`, thread `{sess.get('channel_thread_id') or '-'}`)."
+                    )
+                return
 
         if msg.thread_id:
             sess = self.db.get_session_by_thread(msg.thread_id)
@@ -217,8 +249,103 @@ class HQDaemon:
                 )
             return
 
+        if data.startswith("defer:"):
+            parts = data.split(":", 2)
+            skey = parts[1] if len(parts) > 1 else ""
+            choice_idx = parts[2] if len(parts) > 2 else ""
+            choice_label = choice_idx
+            action = (
+                self.db.resolve_deferred_action(msg.message_id, now=now)
+                if msg.message_id
+                else None
+            )
+            if action:
+                skey = str(action["session_key"])
+                for opt in action.get("options") or []:
+                    if str(opt.get("id")) == str(choice_idx):
+                        choice_label = str(opt.get("label") or choice_idx)
+                        break
+            elif skey:
+                self.db.update_session(skey, suspended_msg_id=None)
+
+            if skey:
+                self.db.enqueue_event(
+                    source="deferred_resume",
+                    dedupe_key=f"defer_cb:{skey}:{msg.update_id}",
+                    priority=10,
+                    available_at=now,
+                    payload={
+                        "session_key": skey,
+                        "choice_id": choice_idx,
+                        "choice_label": choice_label,
+                        "thread_id": msg.thread_id,
+                    },
+                    now=now,
+                )
+            return
+
         if msg.message_id:
             self.db.resolve_deferred_action(msg.message_id, now=now)
+
+    def spawn_task(
+        self,
+        repo_name: str,
+        slug: str,
+        prompt: str,
+        now: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Spawn a Track C interactive worktree + Topic + TerminalDriver pane."""
+        ts = int(now if now is not None else time.time())
+        repo_path = self.config.get_repo_path(repo_name)
+        base_branch = (
+            self.config.repos[repo_name].default_branch
+            if repo_name in self.config.repos
+            else "main"
+        )
+        branch_name = f"hq/{slug}"
+        wt_path = self.hq_dir / ".hq" / "worktrees" / f"{repo_name}-{slug}"
+        git_worktree_add(repo_path, wt_path, branch_name, base_branch=base_branch)
+
+        thread_id = None
+        if self.channel is not None:
+            thread_id = self.channel.create_thread(f"[{repo_name}] {slug}")
+
+        pane_name = f"hq-{slug}"
+        skey = f"task:{repo_name}:{slug}:{ts}"
+        sess = self.db.create_session(
+            session_key=skey,
+            track="C",
+            agent_backend=self.agent_adapter.name,
+            status="active",
+            channel_thread_id=thread_id,
+            topic_slug=slug,
+            repo_name=repo_name,
+            branch_name=branch_name,
+            worktree_path=str(wt_path),
+            pane_name=pane_name,
+            now=ts,
+        )
+
+        hook_bin = self.config.local.bin_overrides.get(
+            "hq-agent-hook",
+            str(Path(__file__).resolve().parent.parent / "bin" / "hq-agent-hook"),
+        )
+        self.agent_adapter.ensure_hooks_installed(wt_path, hook_bin)
+        self.db.record_dispatch(skey, None, prompt, now=ts)
+
+        interactive_cmd = self.agent_adapter.build_interactive_cmd(
+            initial_prompt=prompt,
+            model=self.config.agent.model,
+            effort=self.config.agent.default_effort,
+        )
+        pane_cmd = [
+            "env",
+            f"HQ_DIR={self.hq_dir}",
+            f"HQ_SESSION_KEY={skey}",
+            *interactive_cmd,
+        ]
+        self.terminal_driver.run_bg(name=pane_name, cwd=wt_path, cmd=pane_cmd)
+        return sess
 
     # ------------------------------------------------------------------
     # Event Execution
@@ -308,6 +435,21 @@ class HQDaemon:
             else:
                 sess = self._ensure_general_session(now)
 
+            pane_name = sess.get("pane_name")
+            if sess.get("track") == "C" and pane_name:
+                live_panes = {p.name for p in self.terminal_driver.list_panes()}
+                if str(pane_name) in live_panes:
+                    text = str(payload.get("text") or "")
+                    self.db.record_dispatch(
+                        str(sess["session_key"]),
+                        sess.get("agent_session_id"),
+                        text,
+                        now=now,
+                    )
+                    self.terminal_driver.send_text(str(pane_name), text, enter=True)
+                    self.db.update_session(str(sess["session_key"]), last_active_at=now)
+                    return
+
             prompt = build_prompt(self.hq_dir, self.config, payload)
             reply = self._dispatch_headless(
                 sess,
@@ -378,6 +520,26 @@ class HQDaemon:
                 )
             prev_count = int(self.db.get_meta("sessions_since_dream", "0") or "0")
             self.db.set_meta("sessions_since_dream", str(prev_count + 1), now=now)
+            return
+
+        if ev.source == "deferred_resume":
+            skey = str(ev.payload.get("session_key", ""))
+            sess = self.db.get_session(skey)
+            if not sess:
+                return
+            prompt = build_prompt(self.hq_dir, self.config, ev.payload)
+            reply = self._dispatch_headless(
+                sess,
+                prompt,
+                effort=self.config.agent.default_effort,
+                now=now,
+                cwd=Path(sess["worktree_path"]) if sess.get("worktree_path") else self.hq_dir,
+            )
+            if sess.get("track") == "A":
+                self.db.seal_session(skey, now=now)
+            thread_id = ev.payload.get("thread_id") or sess.get("channel_thread_id")
+            if self.channel and reply:
+                self.channel.send_message(reply, thread_id=thread_id)
             return
 
         if ev.source == "pane_blocked":
@@ -546,6 +708,11 @@ class HQDaemon:
             )
         )
         scan_pane_blocked(self.db, self.terminal_driver, self.config, now=ts)
+        for sess in self.db.list_sessions(statuses=["active", "sealed"]):
+            if int(sess.get("pinned") or 0) == 0 and sess.get("pane_name"):
+                detect_manual_touch(
+                    self.db, sess, terminal_driver=self.terminal_driver, now=ts
+                )
         self._seal_idle_general_sessions(ts)
 
         events = self.db.claim_next_events(

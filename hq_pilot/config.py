@@ -297,9 +297,17 @@ def load_config(hq_dir: str | Path) -> HQConfig:
     )
 
     local_data = _read_yaml_file(local_path)
+    bin_overrides = {
+        str(k): str(v) for k, v in (local_data.get("bin_overrides") or {}).items()
+    }
+    for k, v in local_data.items():
+        if isinstance(k, str) and k.endswith("_bin") and v:
+            tool_name = k[:-4]
+            if tool_name and tool_name not in bin_overrides:
+                bin_overrides[tool_name] = str(v)
     local_cfg = LocalConfig(
         repo_paths={str(k): str(v) for k, v in (local_data.get("repo_paths") or {}).items()},
-        bin_overrides={str(k): str(v) for k, v in (local_data.get("bin_overrides") or {}).items()},
+        bin_overrides=bin_overrides,
     )
 
     return HQConfig(

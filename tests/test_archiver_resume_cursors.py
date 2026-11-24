@@ -15,7 +15,10 @@ from hq_pilot.daemon import HQDaemon
 from hq_pilot.db import HQDatabase
 from hq_pilot.gatekeeper import scan_distill_candidates
 from hq_pilot.terminals.base import git_worktree_add
-from test_adapters_and_channels import DummyTerminal, FakeChannel
+try:
+    from tests.test_adapters_and_channels import DummyTerminal, FakeChannel
+except ModuleNotFoundError:
+    from test_adapters_and_channels import DummyTerminal, FakeChannel
 
 
 def _init_git_repo(repo_dir: Path) -> None:

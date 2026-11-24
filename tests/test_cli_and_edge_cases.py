@@ -20,8 +20,12 @@ from hq_pilot.notify_cli import deliver_notification
 from hq_pilot.terminals.herdr import HerdrDriver, install_herdr_guide
 from hq_pilot.terminals.registry import get_terminal_driver
 from hq_pilot.terminals.tmux import TmuxDriver
-from test_adapters_and_channels import DummyTerminal, FakeChannel
-from test_archiver_resume_cursors import _init_git_repo
+try:
+    from tests.test_adapters_and_channels import DummyTerminal, FakeChannel
+    from tests.test_archiver_resume_cursors import _init_git_repo
+except ModuleNotFoundError:
+    from test_adapters_and_channels import DummyTerminal, FakeChannel
+    from test_archiver_resume_cursors import _init_git_repo
 
 
 class TestCLIAndEdgeCases(unittest.TestCase):

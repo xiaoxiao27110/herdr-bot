@@ -25,12 +25,20 @@ def _discover_hq_dir(explicit: Optional[str], payload: Dict[str, Any]) -> Option
     if env_dir:
         return Path(env_dir).expanduser().resolve()
     cwd_str = payload.get("cwd") or payload.get("workspace")
+    if not cwd_str and isinstance(payload.get("workspacePaths"), list) and payload["workspacePaths"]:
+        cwd_str = payload["workspacePaths"][0]
     if cwd_str:
         cur = Path(str(cwd_str)).resolve()
         for parent in [cur, *cur.parents]:
             if (parent / "hq.yaml").exists():
                 return parent
     return None
+
+
+def _hook_stdout_response(event_type: str) -> Dict[str, Any]:
+    if event_type == "Stop":
+        return {"decision": "allow_stop"}
+    return {"injectSteps": []}
 
 
 def handle_hook_event(
@@ -41,30 +49,43 @@ def handle_hook_event(
     now: Optional[int] = None,
 ) -> Dict[str, Any]:
     ts = int(now if now is not None else time.time())
+    event_type = str(
+        payload.get("hookEventName")
+        or payload.get("hook_event_name")
+        or payload.get("event")
+        or payload.get("type")
+        or ""
+    )
     root = _discover_hq_dir(str(hq_dir) if hq_dir else None, payload)
     if root is None or not (root / "hq.yaml").exists():
-        return {"status": "ignored", "reason": "no_hq_dir"}
+        return {"status": "ignored", "reason": "no_hq_dir", "event": event_type}
 
     cfg = load_config(root)
     db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
     adapter = get_agent_adapter(agent_name)
     try:
-        event_type = str(
-            payload.get("hook_event_name")
-            or payload.get("event")
-            or payload.get("type")
-            or ""
-        )
         agent_sid = str(
-            payload.get("conversation_id")
-            or payload.get("conversationId")
+            payload.get("conversationId")
+            or payload.get("conversation_id")
             or payload.get("session_id")
             or ""
         )
-        transcript_path = str(payload.get("transcript_path") or "")
-        user_prompt = payload.get("prompt") or payload.get("user_prompt") or payload.get("input")
+        transcript_path = str(
+            payload.get("transcriptPath") or payload.get("transcript_path") or ""
+        )
+        user_prompt = (
+            payload.get("lastUserInput")
+            or payload.get("prompt")
+            or payload.get("user_prompt")
+            or payload.get("input")
+        )
 
-        sess = db.get_session_by_agent_id(agent_sid) if agent_sid else None
+        sess = None
+        env_session_key = os.environ.get("HQ_SESSION_KEY", "").strip()
+        if env_session_key:
+            sess = db.get_session(env_session_key)
+        if sess is None and agent_sid:
+            sess = db.get_session_by_agent_id(agent_sid)
         if sess is None and agent_sid:
             # Local direct session started outside daemon -> default pinned!
             sess = db.create_session(
@@ -80,13 +101,17 @@ def handle_hook_event(
             )
 
         if sess is None:
-            return {"status": "ignored", "reason": "no_session"}
+            return {"status": "ignored", "reason": "no_session", "event": event_type}
 
         skey = str(sess["session_key"])
         updates: Dict[str, Any] = {"last_active_at": ts}
+        if agent_sid and not sess.get("agent_session_id"):
+            updates["agent_session_id"] = agent_sid
         if transcript_path and not sess.get("transcript_path"):
             updates["transcript_path"] = transcript_path
         db.update_session(skey, **updates)
+        if updates:
+            sess = db.get_session(skey) or sess
 
         pinned_reason = None
         if event_type in {"PreInvocation", "UserPromptSubmit", "SessionStart"} and user_prompt:
@@ -154,7 +179,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         except json.JSONDecodeError:
             payload = {}
 
-    handle_hook_event(args.agent, payload, hq_dir=args.hq_dir)
+    result = handle_hook_event(args.agent, payload, hq_dir=args.hq_dir)
+    event_type = str(
+        result.get("event")
+        or payload.get("hookEventName")
+        or payload.get("hook_event_name")
+        or ""
+    )
+    print(json.dumps(_hook_stdout_response(event_type)))
     return 0
 
 

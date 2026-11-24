@@ -202,16 +202,23 @@ class AgyAdapter(CodingAgentAdapter):
         hooks_dir.mkdir(parents=True, exist_ok=True)
         hooks_file = hooks_dir / "hooks.json"
 
+        existing: Dict[str, Any] = {}
+        if hooks_file.exists():
+            try:
+                loaded = json.loads(hooks_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except json.JSONDecodeError:
+                existing = {}
+
         cmd = f"{hook_bin} --agent agy"
-        config = {
-            "hooks": {
-                "SessionStart": [{"command": cmd}],
-                "PreInvocation": [{"command": cmd}],
-                "Stop": [{"command": cmd}],
-            }
+        existing["hq-pilot"] = {
+            "SessionStart": [{"command": cmd}],
+            "PreInvocation": [{"command": cmd}],
+            "Stop": [{"command": cmd}],
         }
         hooks_file.write_text(
-            json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
         return hooks_file

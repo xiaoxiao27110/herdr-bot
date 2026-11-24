@@ -31,14 +31,42 @@ except ModuleNotFoundError:
 class RecordingTerminal(TerminalDriver):
     name = "rec-term"
 
-    def __init__(self):
+    def __init__(self, reply_fn=None):
         self.bg_calls = []
+        self.start_agent_calls = []
+        self.prompt_calls = []
         self.sent_texts = []
         self.panes = {}
+        self.reply_fn = reply_fn
 
     def run_bg(self, name, cwd, cmd):
         self.bg_calls.append({"name": name, "cwd": str(cwd), "cmd": cmd})
         self.panes[name] = PaneInfo(name=name, status="running", attached=False, cwd=str(cwd))
+
+    def start_agent(self, name, cwd, kind, agent_args=None, env=None, timeout_ms=60000):
+        self.start_agent_calls.append({
+            "name": name,
+            "cwd": str(cwd),
+            "kind": kind,
+            "agent_args": list(agent_args or []),
+            "env": dict(env or {}),
+            "timeout_ms": timeout_ms,
+        })
+        super().start_agent(
+            name=name,
+            cwd=cwd,
+            kind=kind,
+            agent_args=agent_args,
+            env=env,
+            timeout_ms=timeout_ms,
+        )
+
+    def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+        self.prompt_calls.append({"name": name, "text": text, "wait": wait, "timeout_ms": timeout_ms})
+        super().prompt_agent(name=name, text=text, wait=wait, timeout_ms=timeout_ms)
+        if self.reply_fn is not None:
+            return self.reply_fn(name, text)
+        return ""
 
     def list_panes(self):
         return list(self.panes.values())
@@ -147,14 +175,14 @@ class TestReviewFixes(unittest.TestCase):
             )
             try:
                 sess = daemon.spawn_task("gateway-svc", "fix-cors", "Fix CORS headers", now=500)
-                self.assertEqual(sess["track"], "C")
+                self.assertEqual(sess["track"], "TOPIC")
                 self.assertEqual(sess["pane_name"], "hq-fix-cors")
                 self.assertEqual(sess["channel_thread_id"], "thread-101")
                 self.assertEqual(len(term.bg_calls), 1)
                 self.assertIn(f"HQ_SESSION_KEY={sess['session_key']}", term.bg_calls[0]["cmd"])
                 self.assertTrue((Path(sess["worktree_path"]) / ".agents" / "hooks.json").exists())
 
-                # Follow-up message in Topic routes to live pane via send_text
+                # Follow-up message in Topic routes to live pane via prompt_agent/send_text
                 ch.updates.append(
                     InboundMessage(
                         update_id=10,
@@ -166,8 +194,7 @@ class TestReviewFixes(unittest.TestCase):
                 )
                 summary = daemon.run_once(now=510)
                 self.assertEqual(summary.events_processed, 1)
-                self.assertEqual(len(term.sent_texts), 1)
-                self.assertEqual(term.sent_texts[0]["text"], "Also add unit tests")
+                self.assertEqual(term.sent_texts[-1]["text"], "Also add unit tests")
 
                 # Stop hook pushes assistant reply to thread-101
                 tfile = Path(tmp) / "t_cors.jsonl"
@@ -199,20 +226,17 @@ class TestReviewFixes(unittest.TestCase):
             hq_dir = Path(tmp) / "acme-hq"
             hq_main(["init", str(hq_dir)])
             ch = FakeChannel()
-            seen_cmds = []
 
-            def fake_runner(cmd, cwd):
-                seen_cmds.append(cmd)
-                return subprocess.CompletedProcess(
-                    cmd, 0, stdout=json.dumps({"reply": "Applied choice!", "sid": "conv-defer-1"}), stderr=""
-                )
+            def forbid_runner(cmd, cwd):
+                raise AssertionError(f"Headless cmd_runner must never be called: {cmd}")
 
+            term = RecordingTerminal(reply_fn=lambda name, text: "Applied choice!")
             daemon = HQDaemon(
                 hq_dir,
                 agent_adapter=AgyAdapter(),
-                terminal_driver=RecordingTerminal(),
+                terminal_driver=term,
                 channel=ch,
-                cmd_runner=fake_runner,
+                cmd_runner=forbid_runner,
             )
             try:
                 daemon.db.create_session(
@@ -251,8 +275,8 @@ class TestReviewFixes(unittest.TestCase):
                 )
                 summary = daemon.run_once(now=120)
                 self.assertEqual(summary.events_processed, 1)
-                self.assertIn("--conversation", seen_cmds[0])
-                self.assertIn("conv-defer-1", seen_cmds[0])
+                self.assertEqual(term.prompt_calls[-1]["name"], "hq-general")
+                self.assertIn("Accept", term.prompt_calls[-1]["text"])
                 sess_after = daemon.db.get_session("event:triage:1")
                 self.assertIsNone(sess_after["suspended_msg_id"])
                 self.assertEqual(sess_after["status"], "sealed")

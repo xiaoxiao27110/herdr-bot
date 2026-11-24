@@ -75,23 +75,43 @@ class FakeChannel(MessagingChannel):
 class DummyTerminal(TerminalDriver):
     name = "dummy"
 
+    def __init__(self, reply_text: str = ""):
+        self.reply_text = reply_text
+        self.started_agents = []
+        self.prompted = []
+        self.panes = {}
+
     def run_bg(self, name, cwd, cmd):
-        pass
+        self.panes[name] = PaneInfo(name=name, status="running", attached=False, cwd=str(cwd))
+
+    def start_agent(self, name, cwd, kind, agent_args=None, env=None, timeout_ms=60000):
+        self.started_agents.append({
+            "name": name,
+            "cwd": str(cwd),
+            "kind": kind,
+            "agent_args": list(agent_args or []),
+            "env": dict(env or {}),
+        })
+        self.panes[name] = PaneInfo(name=name, status="idle", attached=False, cwd=str(cwd))
+
+    def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+        self.prompted.append({"name": name, "text": text, "wait": wait})
+        return self.reply_text
 
     def list_panes(self):
-        return []
+        return list(self.panes.values())
 
     def send_text(self, name, text, enter=True):
         pass
 
     def read_pane(self, name, lines=80):
-        return ""
+        return self.reply_text
 
     def attach_cmd(self, name):
         return ["dummy", name]
 
     def kill_pane(self, name):
-        pass
+        self.panes.pop(name, None)
 
     def is_client_attached(self, name):
         return False
@@ -229,17 +249,16 @@ class TestAdaptersAndChannels(unittest.TestCase):
                 ]
             )
 
-            def fake_runner(cmd, cwd):
-                return subprocess.CompletedProcess(
-                    cmd, 0, stdout=json.dumps({"reply": "Built feature!", "sid": "fake-sid-1"}), stderr=""
-                )
+            def forbid_runner(cmd, cwd):
+                raise AssertionError(f"Headless cmd_runner must never be called: {cmd}")
 
+            term = DummyTerminal(reply_text="Built feature!")
             daemon = HQDaemon(
                 hq_dir,
                 agent_adapter=FakeAgentAdapter(),
-                terminal_driver=DummyTerminal(),
+                terminal_driver=term,
                 channel=ch,
-                cmd_runner=fake_runner,
+                cmd_runner=forbid_runner,
             )
             try:
                 summary = daemon.run_once(now=1000)

@@ -628,6 +628,9 @@ class HQDatabase:
             (key, str(value), ts),
         )
 
+    def delete_meta(self, key: str) -> None:
+        self.conn.execute("DELETE FROM meta_state WHERE key = ?", (key,))
+
     # ------------------------------------------------------------------
     # Local Channel Storage (local_messages & local_threads)
     # ------------------------------------------------------------------

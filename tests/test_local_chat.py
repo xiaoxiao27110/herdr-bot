@@ -129,20 +129,12 @@ class TestLocalChat(unittest.TestCase):
             hq_main(["init", str(hq_dir)])
 
             agent = FakeAgentAdapter()
-            term = RecordingTerminal()
-            runner_calls = []
+            term = RecordingTerminal(reply_fn=lambda name, text: f"FakeReply: {text}")
 
-            def fake_runner(cmd, cwd):
-                runner_calls.append({"cmd": cmd, "cwd": str(cwd)})
-                prompt = cmd[cmd.index("--prompt") + 1] if "--prompt" in cmd else ""
-                return subprocess.CompletedProcess(
-                    cmd,
-                    0,
-                    stdout=json.dumps({"reply": f"FakeReply: {prompt}", "sid": f"conv-{len(runner_calls)}"}),
-                    stderr="",
-                )
+            def forbid_runner(cmd, cwd):
+                raise AssertionError(f"Headless cmd_runner must never be called: {cmd}")
 
-            daemon = HQDaemon(hq_dir, agent_adapter=agent, terminal_driver=term, cmd_runner=fake_runner)
+            daemon = HQDaemon(hq_dir, agent_adapter=agent, terminal_driver=term, cmd_runner=forbid_runner)
             try:
                 self.assertIsInstance(daemon.channel, LocalChannel)
                 chat = ChatSession(daemon.db)
@@ -193,10 +185,10 @@ class TestLocalChat(unittest.TestCase):
                 self.assertTrue(any("Picked [1] Accept" in line for line in out))
 
                 daemon.run_once(now=1020)
-                # Deferred action should be resolved and agent resumed with chosen option
+                # Deferred action should be resolved and #General interactive agent prompted with chosen option
                 act = daemon.db.get_deferred_action(msg_id)
                 self.assertIsNotNone(act["resolved_at"])
-                self.assertTrue(any("Accept" in " ".join(c["cmd"]) for c in runner_calls))
+                self.assertTrue(any("Accept" in c["text"] for c in term.prompt_calls))
             finally:
                 daemon.close()
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import shlex
 import subprocess
 
@@ -53,6 +53,37 @@ class TerminalDriver(ABC):
     @abstractmethod
     def is_client_attached(self, name: str) -> bool:
         """Return True if a human terminal client is currently attached."""
+
+    def start_agent(
+        self,
+        name: str,
+        cwd: str | Path,
+        kind: str,
+        agent_args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+        timeout_ms: int = 60000,
+    ) -> None:
+        """Start an interactive coding agent in a persistent managed pane/session."""
+        cmd: List[str] = []
+        if env:
+            cmd.append("env")
+            for k, v in sorted(env.items()):
+                cmd.append(f"{k}={v}")
+        cmd.append(kind)
+        if agent_args:
+            cmd.extend(agent_args)
+        self.run_bg(name=name, cwd=cwd, cmd=cmd)
+
+    def prompt_agent(
+        self,
+        name: str,
+        text: str,
+        wait: bool = True,
+        timeout_ms: int = 300000,
+    ) -> str:
+        """Submit a prompt to an interactive agent pane and optionally wait for completion."""
+        self.send_text(name=name, text=text, enter=True)
+        return ""
 
 
 def _run_git(cwd: Path, args: List[str], check: bool = True) -> subprocess.CompletedProcess[str]:

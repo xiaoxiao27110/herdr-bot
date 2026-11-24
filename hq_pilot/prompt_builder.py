@@ -29,7 +29,7 @@ def _select_contracts(
 
     repo_set: Set[str] = set(matched_repos)
     selected_names: Set[str] = set()
-    for rname in repo_set:
+    for rname in list(repo_set):
         boundary = config.boundaries.repos.get(rname)
         if boundary:
             for dep in boundary.downstream:

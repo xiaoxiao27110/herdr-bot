@@ -138,20 +138,28 @@ def handle_hook_event(
                     turn_count=new_turns,
                     last_active_at=ts,
                 )
-                thread_id = sess.get("channel_thread_id")
-                if assistant_msgs and thread_id:
-                    ch = channel
-                    if ch is None:
-                        secrets = load_secrets_env(cfg.hq_dir)
-                        ch = get_channel(
-                            cfg.channel.backend,
-                            secrets=secrets,
-                            allowed_chat_id=cfg.channel.allowed_chat_id,
-                            db=db,
-                        )
-                    if ch is not None:
-                        ch.send_message(assistant_msgs[-1], thread_id=str(thread_id))
-                        reply_pushed = True
+                if assistant_msgs:
+                    latest_reply = assistant_msgs[-1]
+                    db.set_meta(f"last_reply:{skey}", latest_reply, now=ts)
+                    daemon_waiting = db.get_meta(f"daemon_waiting:{skey}") == "1"
+                    thread_id = sess.get("channel_thread_id")
+                    is_general = str(sess.get("track") or "") in {"GENERAL", "B"}
+                    if not daemon_waiting and (thread_id or is_general):
+                        ch = channel
+                        if ch is None:
+                            secrets = load_secrets_env(cfg.hq_dir)
+                            ch = get_channel(
+                                cfg.channel.backend,
+                                secrets=secrets,
+                                allowed_chat_id=cfg.channel.allowed_chat_id,
+                                db=db,
+                            )
+                        if ch is not None:
+                            ch.send_message(
+                                latest_reply,
+                                thread_id=str(thread_id) if thread_id else None,
+                            )
+                            reply_pushed = True
             return {"status": "ok", "event": "Stop", "session_key": skey, "reply_pushed": reply_pushed}
 
         return {

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 import subprocess
 
 from hq_pilot.terminals.base import PaneInfo, TerminalDriver, shell_join
@@ -83,3 +83,32 @@ class TmuxDriver(TerminalDriver):
             if sname.strip() == name:
                 return attached_str.strip() not in {"", "0"}
         return False
+
+    def start_agent(
+        self,
+        name: str,
+        cwd: str | Path,
+        kind: str,
+        agent_args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+        timeout_ms: int = 60000,
+    ) -> None:
+        cmd: List[str] = []
+        if env:
+            cmd.append("env")
+            for k, v in sorted(env.items()):
+                cmd.append(f"{k}={v}")
+        cmd.append(kind)
+        if agent_args:
+            cmd.extend(agent_args)
+        self.run_bg(name=name, cwd=cwd, cmd=cmd)
+
+    def prompt_agent(
+        self,
+        name: str,
+        text: str,
+        wait: bool = True,
+        timeout_ms: int = 300000,
+    ) -> str:
+        self.send_text(name=name, text=text, enter=True)
+        return ""

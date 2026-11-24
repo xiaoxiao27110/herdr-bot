@@ -2,13 +2,34 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import hashlib
 import json
+from pathlib import Path
+import re
 import subprocess
 import time
+from typing import Any, Dict, List, Optional
 
 from hq_pilot.terminals.base import PaneInfo, TerminalDriver, shell_join
+
+
+_HERDR_AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def sanitize_herdr_agent_name(name: str) -> str:
+    """Normalize an arbitrary pane/session name to Herdr's `[a-z][a-z0-9_-]{0,31}` rule."""
+    raw = (name or "").strip().lower()
+    cleaned = re.sub(r"[^a-z0-9_-]+", "-", raw)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+    if not cleaned:
+        cleaned = "hq-agent"
+    if not cleaned[0].isalpha():
+        cleaned = f"a-{cleaned}"
+    if len(cleaned) > 32:
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
+        prefix = cleaned[:25].rstrip("-") or "a"
+        cleaned = f"{prefix}-{digest}"
+    return cleaned
 
 
 def install_herdr_guide() -> str:
@@ -89,6 +110,18 @@ class HerdrDriver(TerminalDriver):
                 label_to_id[label] = wid
         return id_to_label, label_to_id
 
+    def _list_agents(self) -> List[Dict[str, Any]]:
+        data = self._run_json(["agent", "list"], check=False)
+        agents = (data.get("result") or {}).get("agents") or []
+        return [a for a in agents if isinstance(a, dict)]
+
+    def _find_live_agent(self, name: str) -> Optional[Dict[str, Any]]:
+        agent_name = sanitize_herdr_agent_name(name)
+        for item in self._list_agents():
+            if str(item.get("name", "")) in {name, agent_name}:
+                return item
+        return None
+
     def _resolve_pane_id(self, name: str) -> str:
         _, label_to_id = self._workspace_maps()
         wid = label_to_id.get(name)
@@ -102,6 +135,9 @@ class HerdrDriver(TerminalDriver):
         for p in panes:
             if isinstance(p, dict) and str(p.get("pane_id", "")) == name:
                 return name
+        agent = self._find_live_agent(name)
+        if agent and agent.get("pane_id"):
+            return str(agent["pane_id"])
         return name
 
     def run_bg(self, name: str, cwd: str | Path, cmd: List[str]) -> None:
@@ -117,27 +153,150 @@ class HerdrDriver(TerminalDriver):
         cmd_str = shell_join(cmd)
         self._run(["pane", "run", pane_id, cmd_str], check=True)
 
+    def start_agent(
+        self,
+        name: str,
+        cwd: str | Path,
+        kind: str,
+        agent_args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+        timeout_ms: int = 60000,
+    ) -> None:
+        self.ensure_server()
+        agent_name = sanitize_herdr_agent_name(name)
+        existing = self._find_live_agent(agent_name)
+        if existing is not None:
+            return
+
+        ws_cmd = [
+            "workspace",
+            "create",
+            "--cwd",
+            str(cwd),
+            "--label",
+            name,
+            "--no-focus",
+        ]
+        if env:
+            for k, v in sorted(env.items()):
+                ws_cmd.extend(["--env", f"{k}={v}"])
+        created = self._run_json(ws_cmd, check=True)
+        root_pane = (created.get("result") or {}).get("root_pane") or {}
+        pane_id = str(root_pane.get("pane_id", ""))
+        if not pane_id:
+            raise RuntimeError(f"Herdr failed to create workspace pane for {name!r}")
+
+        # Give newly spawned shell a brief moment to reach its interactive prompt.
+        time.sleep(0.3)
+
+        start_cmd = [
+            "agent",
+            "start",
+            agent_name,
+            "--kind",
+            kind,
+            "--pane",
+            pane_id,
+            "--timeout",
+            str(int(timeout_ms)),
+        ]
+        if agent_args:
+            start_cmd.append("--")
+            start_cmd.extend(agent_args)
+
+        res = self._run(start_cmd, check=False)
+        if res.returncode != 0:
+            err_detail = (res.stderr or res.stdout or "").strip()
+            raise RuntimeError(
+                f"Herdr agent start failed for {agent_name!r} (rc={res.returncode}): {err_detail}"
+            )
+
+    def prompt_agent(
+        self,
+        name: str,
+        text: str,
+        wait: bool = True,
+        timeout_ms: int = 300000,
+    ) -> str:
+        agent_name = sanitize_herdr_agent_name(name)
+        cmd = ["agent", "prompt", agent_name, text]
+        if wait:
+            cmd.extend(["--wait", "--timeout", str(int(timeout_ms))])
+        res = self._run(cmd, check=False)
+        if res.returncode != 0:
+            err_detail = (res.stderr or res.stdout or "").strip()
+            raise RuntimeError(
+                f"Herdr agent prompt failed for {agent_name!r} (rc={res.returncode}): {err_detail}"
+            )
+        if not wait:
+            return ""
+        read_res = self._run(
+            ["agent", "read", agent_name, "--source", "recent-unwrapped", "--lines", "120"],
+            check=False,
+        )
+        if read_res.returncode == 0 and read_res.stdout.strip():
+            return read_res.stdout.strip()
+        return self.read_pane(name, lines=120).strip()
+
     def list_panes(self) -> List[PaneInfo]:
         if not self._server_running():
             return []
         id_to_label, _ = self._workspace_maps()
+        agents_raw = self._list_agents()
+        agent_by_pane: Dict[str, Dict[str, Any]] = {}
+        for ag in agents_raw:
+            pid = str(ag.get("pane_id", ""))
+            if pid:
+                agent_by_pane[pid] = ag
+
         pane_data = self._run_json(["pane", "list"], check=False)
         panes_raw = (pane_data.get("result") or {}).get("panes") or []
         panes: List[PaneInfo] = []
+        seen_names: set[str] = set()
         for item in panes_raw:
             if not isinstance(item, dict):
                 continue
             wid = str(item.get("workspace_id", ""))
             pid = str(item.get("pane_id", ""))
-            label = id_to_label.get(wid) or pid
+            ag = agent_by_pane.get(pid)
+            ag_name = str(ag.get("name", "")) if ag else ""
+            label = id_to_label.get(wid) or ag_name or pid
+            status = str(
+                (ag.get("agent_status") if ag else None)
+                or item.get("agent_status")
+                or "running"
+            )
             panes.append(
                 PaneInfo(
                     name=label,
-                    status=str(item.get("agent_status", "running")),
+                    status=status,
                     attached=False,
                     cwd=str(item.get("cwd", "")),
                 )
             )
+            seen_names.add(label)
+            if ag_name and ag_name not in seen_names:
+                panes.append(
+                    PaneInfo(
+                        name=ag_name,
+                        status=status,
+                        attached=False,
+                        cwd=str(ag.get("cwd") or item.get("cwd", "")),
+                    )
+                )
+                seen_names.add(ag_name)
+        for ag in agents_raw:
+            ag_name = str(ag.get("name", ""))
+            if ag_name and ag_name not in seen_names:
+                panes.append(
+                    PaneInfo(
+                        name=ag_name,
+                        status=str(ag.get("agent_status") or "running"),
+                        attached=False,
+                        cwd=str(ag.get("cwd", "")),
+                    )
+                )
+                seen_names.add(ag_name)
         return panes
 
     def send_text(self, name: str, text: str, enter: bool = True) -> None:
@@ -165,6 +324,10 @@ class HerdrDriver(TerminalDriver):
         wid = label_to_id.get(name)
         if wid:
             self._run(["workspace", "close", wid], check=False)
+            return
+        agent = self._find_live_agent(name)
+        if agent and agent.get("workspace_id"):
+            self._run(["workspace", "close", str(agent["workspace_id"])], check=False)
             return
         pane_id = self._resolve_pane_id(name)
         self._run(["pane", "close", pane_id], check=False)

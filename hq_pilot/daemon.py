@@ -1,4 +1,4 @@
-"""0-LLM deterministic daemon event loop for hq-pilot."""
+"""0-LLM deterministic daemon event loop for hq-pilot (100% interactive terminal sessions)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-import json
 import os
 import signal
 import subprocess
@@ -31,6 +30,10 @@ from hq_pilot.syncer import sync_hq_repo
 from hq_pilot.terminals.base import TerminalDriver, git_worktree_add
 from hq_pilot.terminals.registry import get_terminal_driver
 
+
+GENERAL_PANE_NAME = "hq-general"
+GENERAL_TRACKS = {"GENERAL", "B"}
+TOPIC_TRACKS = {"TOPIC", "C"}
 
 CmdRunner = Callable[[List[str], Path], subprocess.CompletedProcess[str]]
 
@@ -88,11 +91,18 @@ class HQDaemon:
                 db=self.db,
             )
         )
+        # Retained only for constructor compatibility; daemon never invokes headless CLI runs.
         self.cmd_runner: CmdRunner = cmd_runner or default_cmd_runner
         self._stop_requested = False
 
     def close(self) -> None:
         self.db.close()
+
+    def _hook_bin_path(self) -> str:
+        return self.config.local.bin_overrides.get(
+            "hq-agent-hook",
+            str(Path(__file__).resolve().parent.parent / "bin" / "hq-agent-hook"),
+        )
 
     # ------------------------------------------------------------------
     # Channel Inbound Handling
@@ -132,7 +142,7 @@ class HQDaemon:
                 sess = self.spawn_task(repo_name, slug, task_prompt, now=now)
                 if self.channel:
                     self.channel.send_message(
-                        f"Spawned Track C task `{sess['session_key']}` in pane `{sess['pane_name']}` "
+                        f"Spawned #Topic task `{sess['session_key']}` in pane `{sess['pane_name']}` "
                         f"(branch `{sess['branch_name']}`, thread `{sess.get('channel_thread_id') or '-'}`)."
                     )
                 return
@@ -203,15 +213,23 @@ class HQDaemon:
                 else None
             ) or "Continue work on current branch."
             new_key = f"thread:{thread_id or 'main'}:{now}"
+            topic_slug = old_sess.get("topic_slug") if old_sess else None
+            pane_name = (
+                f"hq-{topic_slug}"
+                if topic_slug
+                else (f"hq-{thread_id}" if thread_id else GENERAL_PANE_NAME)
+            )
             self.db.create_session(
                 session_key=new_key,
-                track="C",
+                track="TOPIC",
                 agent_backend=self.agent_adapter.name,
                 status="active",
                 channel_thread_id=thread_id,
+                topic_slug=topic_slug,
                 repo_name=old_sess.get("repo_name") if old_sess else None,
                 branch_name=old_sess.get("branch_name") if old_sess else None,
                 worktree_path=old_sess.get("worktree_path") if old_sess else None,
+                pane_name=pane_name,
                 now=now,
             )
             self.db.enqueue_event(
@@ -254,9 +272,11 @@ class HQDaemon:
             return
 
         if data.startswith("defer:"):
-            parts = data.split(":", 2)
-            skey = parts[1] if len(parts) > 1 else ""
-            choice_idx = parts[2] if len(parts) > 2 else ""
+            rest = data[len("defer:"):]
+            if ":" in rest:
+                skey, choice_idx = rest.rsplit(":", 1)
+            else:
+                skey, choice_idx = rest, ""
             choice_label = choice_idx
             action = (
                 self.db.resolve_deferred_action(msg.message_id, now=now)
@@ -298,7 +318,7 @@ class HQDaemon:
         prompt: str,
         now: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Spawn a Track C interactive worktree + Topic + TerminalDriver pane."""
+        """Spawn a #Topic interactive worktree + thread + TerminalDriver agent pane."""
         ts = int(now if now is not None else time.time())
         repo_path = self.config.get_repo_path(repo_name)
         base_branch = (
@@ -318,7 +338,7 @@ class HQDaemon:
         skey = f"task:{repo_name}:{slug}:{ts}"
         sess = self.db.create_session(
             session_key=skey,
-            track="C",
+            track="TOPIC",
             agent_backend=self.agent_adapter.name,
             status="active",
             channel_thread_id=thread_id,
@@ -330,41 +350,48 @@ class HQDaemon:
             now=ts,
         )
 
-        hook_bin = self.config.local.bin_overrides.get(
-            "hq-agent-hook",
-            str(Path(__file__).resolve().parent.parent / "bin" / "hq-agent-hook"),
-        )
-        self.agent_adapter.ensure_hooks_installed(wt_path, hook_bin)
+        self.agent_adapter.ensure_hooks_installed(wt_path, self._hook_bin_path())
         self.db.record_dispatch(skey, None, prompt, now=ts)
 
         interactive_cmd = self.agent_adapter.build_interactive_cmd(
-            initial_prompt=prompt,
+            initial_prompt=None,
             model=self.config.agent.model,
             effort=self.config.agent.default_effort,
         )
-        pane_cmd = [
-            "env",
-            f"HQ_DIR={self.hq_dir}",
-            f"HQ_SESSION_KEY={skey}",
-            *interactive_cmd,
-        ]
-        self.terminal_driver.run_bg(name=pane_name, cwd=wt_path, cmd=pane_cmd)
+        self.terminal_driver.start_agent(
+            name=pane_name,
+            cwd=wt_path,
+            kind=self.agent_adapter.name,
+            agent_args=interactive_cmd[1:],
+            env={
+                "HQ_DIR": str(self.hq_dir),
+                "HQ_SESSION_KEY": skey,
+            },
+        )
+        if prompt:
+            self.terminal_driver.prompt_agent(pane_name, prompt, wait=False)
         return sess
 
     # ------------------------------------------------------------------
-    # Event Execution
+    # Two-Tier Interactive Session Management (#General + #Topic)
     # ------------------------------------------------------------------
     def _ensure_general_session(self, now: int) -> Dict[str, Any]:
         for s in self.db.list_sessions(statuses=["active", "pinned"]):
-            if s["track"] == "B":
+            if s["track"] in GENERAL_TRACKS:
+                if s.get("pane_name") != GENERAL_PANE_NAME:
+                    self.db.update_session(
+                        str(s["session_key"]), pane_name=GENERAL_PANE_NAME
+                    )
+                    s["pane_name"] = GENERAL_PANE_NAME
                 return s
         seq = int(self.db.get_meta("general_seq", "0") or "0") + 1
         self.db.set_meta("general_seq", str(seq), now=now)
         return self.db.create_session(
             session_key=f"general:{seq}",
-            track="B",
+            track="GENERAL",
             agent_backend=self.agent_adapter.name,
             status="active",
+            pane_name=GENERAL_PANE_NAME,
             now=now,
         )
 
@@ -372,52 +399,123 @@ class HQDaemon:
         idle_limit = self.config.tuning.general_idle_seal_minutes * 60
         max_turns = self.config.tuning.general_max_turns
         for s in self.db.list_sessions(statuses=["active"]):
-            if s["track"] != "B":
+            if s["track"] not in GENERAL_TRACKS:
                 continue
             idle_sec = now - int(s["last_active_at"])
             if idle_sec >= idle_limit or int(s["turn_count"]) >= max_turns:
                 self.db.seal_session(str(s["session_key"]), now=now)
 
-    def _dispatch_headless(
+    def _resolve_pane_name(self, session: Dict[str, Any]) -> str:
+        existing = session.get("pane_name")
+        if existing:
+            return str(existing)
+        if session.get("track") in GENERAL_TRACKS:
+            pane_name = GENERAL_PANE_NAME
+        elif session.get("topic_slug"):
+            pane_name = f"hq-{session['topic_slug']}"
+        elif session.get("channel_thread_id"):
+            pane_name = f"hq-{session['channel_thread_id']}"
+        else:
+            pane_name = GENERAL_PANE_NAME
+        self.db.update_session(str(session["session_key"]), pane_name=pane_name)
+        session["pane_name"] = pane_name
+        return pane_name
+
+    def _ensure_session_pane(
+        self,
+        session: Dict[str, Any],
+        cwd: Path,
+        effort: str,
+    ) -> str:
+        pane_name = self._resolve_pane_name(session)
+        live_panes = {p.name for p in self.terminal_driver.list_panes()}
+        if pane_name not in live_panes:
+            self.agent_adapter.ensure_hooks_installed(cwd, self._hook_bin_path())
+            add_dirs = (
+                [
+                    self.config.get_repo_path(r)
+                    for r in sorted(self.config.repos.keys())
+                    if self.config.get_repo_path(r).exists()
+                ]
+                if cwd.resolve() == self.hq_dir.resolve()
+                else None
+            )
+            interactive_cmd = self.agent_adapter.build_interactive_cmd(
+                initial_prompt=None,
+                session_id=session.get("agent_session_id"),
+                model=self.config.agent.model,
+                effort=effort,
+                add_dirs=add_dirs,
+            )
+            self.terminal_driver.start_agent(
+                name=pane_name,
+                cwd=cwd,
+                kind=self.agent_adapter.name,
+                agent_args=interactive_cmd[1:],
+                env={
+                    "HQ_DIR": str(self.hq_dir),
+                    "HQ_SESSION_KEY": str(session["session_key"]),
+                },
+            )
+        return pane_name
+
+    def _ensure_general_pane(self, now: Optional[int] = None) -> Dict[str, Any]:
+        """Ensure `#General` (`hq-general`) interactive agent pane is running and ready."""
+        ts = int(now if now is not None else time.time())
+        sess = self._ensure_general_session(ts)
+        self._ensure_session_pane(
+            sess,
+            cwd=self.hq_dir,
+            effort=self.config.agent.default_effort,
+        )
+        return sess
+
+    def _dispatch_interactive(
         self,
         session: Dict[str, Any],
         prompt: str,
         effort: str,
         now: int,
         cwd: Optional[Path] = None,
+        wait: bool = True,
     ) -> str:
         skey = str(session["session_key"])
-        agent_sid = session.get("agent_session_id")
-        self.db.record_dispatch(skey, agent_sid, prompt, now=now)
-
-        add_dirs = [
-            self.config.get_repo_path(r)
-            for r in sorted(self.config.repos.keys())
-            if self.config.get_repo_path(r).exists()
-        ]
-        cmd = self.agent_adapter.build_headless_cmd(
-            prompt=prompt,
-            session_id=agent_sid,
-            model=self.config.agent.model,
-            effort=effort,
-            add_dirs=add_dirs,
+        target_cwd = cwd or (
+            Path(session["worktree_path"]) if session.get("worktree_path") else self.hq_dir
         )
-        res = self.cmd_runner(cmd, cwd or self.hq_dir)
-        if res.returncode != 0:
-            raise RuntimeError(
-                f"Agent command failed ({res.returncode}): {res.stderr.strip()}"
-            )
-        parsed = self.agent_adapter.parse_headless_output(res.stdout)
-        new_turns = int(session.get("turn_count") or 0) + 1
-        updates: Dict[str, Any] = {
-            "turn_count": new_turns,
-            "last_active_at": now,
-        }
-        if parsed.agent_session_id and not agent_sid:
-            updates["agent_session_id"] = parsed.agent_session_id
-        self.db.update_session(skey, **updates)
-        return parsed.reply_markdown
+        pane_name = self._ensure_session_pane(session, cwd=target_cwd, effort=effort)
 
+        agent_sid = session.get("agent_session_id")
+        prev_turns = int(session.get("turn_count") or 0)
+        self.db.record_dispatch(skey, agent_sid, prompt, now=now)
+        self.db.delete_meta(f"last_reply:{skey}")
+        self.db.set_meta(f"daemon_waiting:{skey}", "1", now=now)
+        try:
+            fallback_reply = self.terminal_driver.prompt_agent(
+                pane_name, prompt, wait=wait
+            )
+        finally:
+            self.db.delete_meta(f"daemon_waiting:{skey}")
+
+        hook_reply = self.db.get_meta(f"last_reply:{skey}")
+        if hook_reply is not None:
+            self.db.delete_meta(f"last_reply:{skey}")
+
+        reply = hook_reply if (hook_reply and hook_reply.strip()) else (fallback_reply or "")
+        fresh = self.db.get_session(skey) or session
+        cur_turns = int(fresh.get("turn_count") or 0)
+        new_turns = cur_turns if cur_turns > prev_turns else prev_turns + 1
+        self.db.update_session(
+            skey,
+            pane_name=pane_name,
+            turn_count=new_turns,
+            last_active_at=now,
+        )
+        return reply
+
+    # ------------------------------------------------------------------
+    # Event Execution
+    # ------------------------------------------------------------------
     def _process_event(self, ev: EventRow, now: int) -> None:
         if ev.source == "channel":
             payload = ev.payload
@@ -430,43 +528,38 @@ class HQDaemon:
                 if not sess:
                     sess = self.db.create_session(
                         session_key=f"thread:{thread_id}:{now}",
-                        track="C",
+                        track="TOPIC",
                         agent_backend=self.agent_adapter.name,
                         status="active",
                         channel_thread_id=str(thread_id),
+                        pane_name=f"hq-{thread_id}",
                         now=now,
                     )
             else:
                 sess = self._ensure_general_session(now)
 
-            pane_name = sess.get("pane_name")
-            if sess.get("track") == "C" and pane_name:
-                live_panes = {p.name for p in self.terminal_driver.list_panes()}
-                if str(pane_name) in live_panes:
-                    text = str(payload.get("text") or "")
-                    self.db.record_dispatch(
-                        str(sess["session_key"]),
-                        sess.get("agent_session_id"),
-                        text,
-                        now=now,
-                    )
-                    self.terminal_driver.send_text(str(pane_name), text, enter=True)
-                    self.db.update_session(str(sess["session_key"]), last_active_at=now)
-                    return
+            pane_name = self._resolve_pane_name(sess)
+            live_panes = {p.name for p in self.terminal_driver.list_panes()}
+            is_live_topic = (sess.get("track") in TOPIC_TRACKS) and (pane_name in live_panes)
+            prompt = (
+                str(payload.get("text") or "")
+                if is_live_topic
+                else build_prompt(self.hq_dir, self.config, payload)
+            )
 
-            prompt = build_prompt(self.hq_dir, self.config, payload)
             indicator_id = (
                 self.channel.send_working_indicator("⏳ 收到，正在处理中...", thread_id=thread_id)
                 if self.channel
                 else None
             )
             try:
-                reply = self._dispatch_headless(
+                reply = self._dispatch_interactive(
                     sess,
                     prompt,
                     effort=self.config.agent.default_effort,
                     now=now,
                     cwd=Path(sess["worktree_path"]) if sess.get("worktree_path") else self.hq_dir,
+                    wait=True,
                 )
             except Exception as exc:
                 if self.channel and indicator_id:
@@ -490,24 +583,21 @@ class HQDaemon:
 
         if ev.source == "git_commit":
             repo_name = str(ev.payload.get("repo", ""))
-            sess = self.db.create_session(
-                session_key=f"event:{ev.id}",
-                track="A",
-                agent_backend=self.agent_adapter.name,
-                status="active",
-                repo_name=repo_name,
-                now=now,
-            )
+            sess = self._ensure_general_session(now)
             prompt = build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
                 matched_repos=[repo_name] if repo_name else None,
             )
-            self._dispatch_headless(
-                sess, prompt, effort=self.config.agent.light_effort, now=now
+            self._dispatch_interactive(
+                sess,
+                prompt,
+                effort=self.config.agent.light_effort,
+                now=now,
+                cwd=self.hq_dir,
+                wait=True,
             )
-            self.db.seal_session(sess["session_key"], now=now)
             return
 
         if ev.source == "session_distill":
@@ -515,20 +605,17 @@ class HQDaemon:
             agent_sid = str(ev.payload.get("agent_session_id", ""))
             tpath = str(ev.payload.get("transcript_path", ""))
             to_line = int(ev.payload.get("to_line", 0))
-            turns = ev.payload.get("turns") or []
 
-            distill_sess = self.db.create_session(
-                session_key=f"event:{ev.id}",
-                track="A",
-                agent_backend=self.agent_adapter.name,
-                status="active",
-                now=now,
-            )
+            sess = self._ensure_general_session(now)
             prompt = build_prompt(self.hq_dir, self.config, ev.payload)
-            reply = self._dispatch_headless(
-                distill_sess, prompt, effort=self.config.agent.light_effort, now=now
+            reply = self._dispatch_interactive(
+                sess,
+                prompt,
+                effort=self.config.agent.light_effort,
+                now=now,
+                cwd=self.hq_dir,
+                wait=True,
             )
-            self.db.seal_session(distill_sess["session_key"], now=now)
 
             if reply.strip():
                 today_path = self.hq_dir / "notes" / "today.md"
@@ -550,20 +637,22 @@ class HQDaemon:
 
         if ev.source == "deferred_resume":
             skey = str(ev.payload.get("session_key", ""))
-            sess = self.db.get_session(skey)
-            if not sess:
+            orig_sess = self.db.get_session(skey)
+            if not orig_sess:
                 return
+            general_sess = self._ensure_general_session(now)
             prompt = build_prompt(self.hq_dir, self.config, ev.payload)
-            reply = self._dispatch_headless(
-                sess,
+            reply = self._dispatch_interactive(
+                general_sess,
                 prompt,
                 effort=self.config.agent.default_effort,
                 now=now,
-                cwd=Path(sess["worktree_path"]) if sess.get("worktree_path") else self.hq_dir,
+                cwd=self.hq_dir,
+                wait=True,
             )
-            if sess.get("track") == "A":
+            if orig_sess.get("track") == "A":
                 self.db.seal_session(skey, now=now)
-            thread_id = ev.payload.get("thread_id") or sess.get("channel_thread_id")
+            thread_id = ev.payload.get("thread_id") or orig_sess.get("channel_thread_id")
             if self.channel and reply:
                 self.channel.send_message(reply, thread_id=thread_id)
             return
@@ -630,28 +719,27 @@ class HQDaemon:
                     (ev.id,),
                 )
 
-        # Step 1: Dreaming
+        # Step 1: Dreaming (routed to #General interactive pane)
         last_dream_at = int(self.db.get_meta("last_dream_at", "0") or "0")
         sessions_since = int(self.db.get_meta("sessions_since_dream", "0") or "0")
         interval_ok = (ts - last_dream_at) >= self.config.tuning.dream_min_interval_hours * 3600
         sessions_ok = sessions_since >= self.config.tuning.dream_min_sessions
 
         if self.config.tuning.dream_force_nightly or (interval_ok and sessions_ok):
-            dream_sess = self.db.create_session(
-                session_key=f"event:dream:{ts}",
-                track="A",
-                agent_backend=self.agent_adapter.name,
-                status="active",
-                now=ts,
-            )
+            dream_sess = self._ensure_general_session(ts)
             prompt = build_prompt(
                 self.hq_dir,
                 self.config,
                 {"task": "dream-consolidate", "timestamp": ts},
             )
             try:
-                self._dispatch_headless(
-                    dream_sess, prompt, effort=self.config.agent.default_effort, now=ts
+                self._dispatch_interactive(
+                    dream_sess,
+                    prompt,
+                    effort=self.config.agent.default_effort,
+                    now=ts,
+                    cwd=self.hq_dir,
+                    wait=True,
                 )
             except Exception as exc:
                 self.db.add_digest_item(
@@ -660,8 +748,6 @@ class HQDaemon:
                     message=f"Nightly dreaming failed: {exc}",
                     now=ts,
                 )
-            finally:
-                self.db.seal_session(dream_sess["session_key"], now=ts)
 
             # Archive today.md -> notes/archive/YYYY-MM-DD.md and reset today.md
             today_path = self.hq_dir / "notes" / "today.md"
@@ -801,6 +887,14 @@ class HQDaemon:
 
         signal.signal(signal.SIGTERM, _handle_sig)
         signal.signal(signal.SIGINT, _handle_sig)
+
+        try:
+            self._ensure_general_pane()
+        except Exception as exc:
+            print(
+                f"[hq-daemon] warn: failed to pre-start {GENERAL_PANE_NAME}: {exc}",
+                flush=True,
+            )
 
         try:
             while not self._stop_requested:

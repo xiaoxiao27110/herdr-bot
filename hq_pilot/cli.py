@@ -49,6 +49,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         ("hq.example.yaml", "hq.yaml"),
         ("repo-boundaries.example.yaml", "repo-boundaries.yaml"),
         ("AGENTS.example.md", "AGENTS.md"),
+        ("user-notes.example.md", "memory/user-notes.md"),
         ("secrets.env.example", ".hq/secrets.env.example"),
     ]
     for src_name, dst_rel in copies:

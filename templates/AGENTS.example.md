@@ -9,6 +9,7 @@
 ## Key Contracts & Decisions
 - Cross-repo contracts live in `memory/contracts/`.
 - Architecture decisions & invariants live in `memory/decisions.md`.
+- User context, preferences & corrections live in `memory/user-notes.md`.
 - Active cross-repo work is tracked in `tasks/active-wip.md`.
 
 ## #General & #Topic Auto-Orchestration

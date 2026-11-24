@@ -31,6 +31,7 @@ TUNING_DESCRIPTIONS: Dict[str, str] = {
     "distill_min_new_turns": "Minimum new turns required for incremental distillation",
     "dirty_worktree_warn_hours": "Hours before dirty worktree triggers morning digest warning",
     "git_sync_debounce_minutes": "Debounce window in minutes for HQ repo auto git sync",
+    "past_messages_limit": "Max recent outbound messages injected into prompt to avoid repetition",
 }
 
 
@@ -57,6 +58,7 @@ class TuningConfig:
     distill_min_new_turns: int = 3
     dirty_worktree_warn_hours: int = 48
     git_sync_debounce_minutes: int = 120
+    past_messages_limit: int = 5
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "TuningConfig":

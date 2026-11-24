@@ -64,13 +64,15 @@ def build_prompt(
     config: HQConfig,
     event_payload: Dict[str, Any],
     matched_repos: Optional[List[str]] = None,
+    recent_outbound: Optional[List[Dict[str, Any]]] = None,
+    topic_slug: Optional[str] = None,
 ) -> str:
     """
     Deterministically assemble the initial user prompt in strict Prefix-Cache order:
-      1. repo-boundaries.yaml
+      1. repo-boundaries.yaml (+ optional memory/user-notes.md static block)
       2. Sorted matching memory/contracts/*.md
-      3. tasks/active-wip.md
-      4. notes/today.md
+      3. tasks/active-wip.md (+ optional on-demand tasks/<topic_slug>.md)
+      4. notes/today.md (+ optional recent_outbound anti-repeat block)
       5. event_payload (canonical JSON)
     """
     root = Path(hq_dir).resolve()
@@ -78,6 +80,20 @@ def build_prompt(
 
     boundaries_text = _read_optional(root / "repo-boundaries.yaml").rstrip()
     sections.append("## 1. Repo Boundaries\n```yaml\n" + boundaries_text + "\n```")
+
+    user_notes_path = root / "memory" / "user-notes.md"
+    has_user_notes_dir = (root / "memory" / "user-notes").is_dir()
+    if user_notes_path.is_file() or has_user_notes_dir:
+        user_notes_text = _read_optional(user_notes_path).rstrip() if user_notes_path.is_file() else ""
+        user_notes_lines = user_notes_text.splitlines()
+        if user_notes_path.is_file() and len(user_notes_lines) <= 40 and not has_user_notes_dir:
+            sections.append("## 1.5 User Notes\n" + (user_notes_text or "(empty)"))
+        else:
+            sections.append(
+                "## 1.5 User Notes\n"
+                f"See `memory/user-notes.md` ({len(user_notes_lines)} lines) "
+                "and `memory/user-notes/` for on-demand lookup."
+            )
 
     contract_paths = _select_contracts(root, config, matched_repos=matched_repos)
     contract_blocks: List[str] = []
@@ -93,8 +109,32 @@ def build_prompt(
     wip_text = _read_optional(root / "tasks" / "active-wip.md").rstrip()
     sections.append("## 3. Active WIP\n" + (wip_text or "(empty)"))
 
+    if topic_slug:
+        task_path = root / "tasks" / f"{topic_slug}.md"
+        if task_path.is_file():
+            task_text = _read_optional(task_path).rstrip()
+            sections.append(
+                f"## 3.5 Task Progress ({topic_slug})\n" + (task_text or "(empty)")
+            )
+
     today_text = _read_optional(root / "notes" / "today.md").rstrip()
     sections.append("## 4. Today WAL\n" + (today_text or "(empty)"))
+
+    if recent_outbound:
+        outbound_lines: List[str] = []
+        for msg in recent_outbound:
+            raw_text = " ".join(str(msg.get("text") or "").split())
+            if not raw_text:
+                continue
+            if len(raw_text) > 240:
+                raw_text = raw_text[:237] + "..."
+            tid = msg.get("thread_id") or "general"
+            outbound_lines.append(f"- [thread={tid}] {raw_text}")
+        if outbound_lines:
+            sections.append(
+                "## 4.5 Recent Messages Sent to User (Do Not Repeat)\n"
+                + "\n".join(outbound_lines)
+            )
 
     payload_json = json.dumps(
         event_payload, sort_keys=True, ensure_ascii=False, indent=2

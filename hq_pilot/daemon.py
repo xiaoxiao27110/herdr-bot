@@ -35,6 +35,81 @@ GENERAL_PANE_NAME = "hq-general"
 GENERAL_TRACKS = {"GENERAL", "B"}
 TOPIC_TRACKS = {"TOPIC", "C"}
 
+
+def _upsert_task_progress_file(
+    hq_dir: Path,
+    slug: str,
+    repo_name: str,
+    branch_name: str,
+    session_key: str,
+    prompt: str,
+    status: str = "active",
+) -> Path:
+    """Create or update per-task progress file `tasks/<slug>.md`."""
+    tasks_dir = Path(hq_dir) / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    task_path = tasks_dir / f"{slug}.md"
+    if task_path.exists():
+        lines = task_path.read_text(encoding="utf-8").splitlines()
+        updated = False
+        new_lines: List[str] = []
+        for line in lines:
+            if line.strip().startswith("- status:"):
+                new_lines.append(f"- status: {status}")
+                updated = True
+            else:
+                new_lines.append(line)
+        if not updated:
+            new_lines.append(f"- status: {status}")
+        task_path.write_text("\n".join(new_lines).rstrip() + "\n", encoding="utf-8")
+        return task_path
+
+    compact_prompt = " ".join((prompt or "").split())
+    content = (
+        f"# Task: {slug}\n\n"
+        f"- repo: {repo_name}\n"
+        f"- branch: {branch_name}\n"
+        f"- session_key: {session_key}\n"
+        f"- status: {status}\n"
+        f"- prompt: {compact_prompt}\n\n"
+        "## Done\n"
+        "-\n\n"
+        "## Left\n"
+        "-\n"
+    )
+    task_path.write_text(content, encoding="utf-8")
+    return task_path
+
+
+def _upsert_active_wip_index(
+    hq_dir: Path,
+    slug: str,
+    repo_name: str,
+    branch_name: str,
+    status: str = "active",
+) -> Path:
+    """Maintain single-line per-task index entry in `tasks/active-wip.md`."""
+    wip_path = Path(hq_dir) / "tasks" / "active-wip.md"
+    wip_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = f"- [{slug}](tasks/{slug}.md) | repo={repo_name} | branch={branch_name} | status={status}"
+    prefix = f"- [{slug}](tasks/{slug}.md)"
+    if wip_path.exists():
+        lines = wip_path.read_text(encoding="utf-8").splitlines()
+    else:
+        lines = ["# Active Cross-Repo WIP", ""]
+    replaced = False
+    new_lines: List[str] = []
+    for line in lines:
+        if line.strip().startswith(prefix):
+            new_lines.append(entry)
+            replaced = True
+        else:
+            new_lines.append(line)
+    if not replaced:
+        new_lines.append(entry)
+    wip_path.write_text("\n".join(new_lines).rstrip() + "\n", encoding="utf-8")
+    return wip_path
+
 CmdRunner = Callable[[List[str], Path], subprocess.CompletedProcess[str]]
 
 
@@ -347,6 +422,12 @@ class HQDaemon:
 
         self.agent_adapter.ensure_hooks_installed(wt_path, self._hook_bin_path())
         self.db.record_dispatch(skey, None, prompt, now=ts)
+        _upsert_task_progress_file(
+            self.hq_dir, slug, repo_name, branch_name, skey, prompt, status="active"
+        )
+        _upsert_active_wip_index(
+            self.hq_dir, slug, repo_name, branch_name, status="active"
+        )
 
         interactive_cmd = self.agent_adapter.build_interactive_cmd(
             initial_prompt=None,
@@ -412,7 +493,17 @@ class HQDaemon:
                 continue
             idle_sec = now - int(s["last_active_at"])
             if idle_sec >= idle_limit:
-                self.db.seal_session(str(s["session_key"]), now=now)
+                skey = str(s["session_key"])
+                if self.db.seal_session(skey, now=now) and s.get("topic_slug"):
+                    t_slug = str(s["topic_slug"])
+                    t_repo = str(s.get("repo_name") or "")
+                    t_branch = str(s.get("branch_name") or "")
+                    _upsert_task_progress_file(
+                        self.hq_dir, t_slug, t_repo, t_branch, skey, "", status="sealed"
+                    )
+                    _upsert_active_wip_index(
+                        self.hq_dir, t_slug, t_repo, t_branch, status="sealed"
+                    )
 
     def seal_session(
         self,
@@ -437,6 +528,16 @@ class HQDaemon:
             self.db.seal_session(skey, now=ts)
 
         updated = self.db.get_session(skey) or sess
+        if updated.get("topic_slug"):
+            t_slug = str(updated["topic_slug"])
+            t_repo = str(updated.get("repo_name") or "")
+            t_branch = str(updated.get("branch_name") or "")
+            _upsert_task_progress_file(
+                self.hq_dir, t_slug, t_repo, t_branch, skey, "", status="sealed"
+            )
+            _upsert_active_wip_index(
+                self.hq_dir, t_slug, t_repo, t_branch, status="sealed"
+            )
         thread_id = updated.get("channel_thread_id")
         if not was_sealed and thread_id and self.channel is not None:
             reason_note = f" ({reason.strip()})" if reason and reason.strip() else ""
@@ -558,6 +659,12 @@ class HQDaemon:
         )
         return reply
 
+    def _get_recent_outbound(self) -> List[Dict[str, Any]]:
+        limit = int(self.config.tuning.past_messages_limit)
+        if limit <= 0:
+            return []
+        return self.db.list_recent_local_outbound(limit)
+
     # ------------------------------------------------------------------
     # Event Execution
     # ------------------------------------------------------------------
@@ -586,10 +693,22 @@ class HQDaemon:
             pane_name = self._resolve_pane_name(sess)
             live_panes = {p.name for p in self.terminal_driver.list_panes()}
             is_live_topic = (sess.get("track") in TOPIC_TRACKS) and (pane_name in live_panes)
+            recent_outbound = self._get_recent_outbound()
+            topic_slug = (
+                str(sess["topic_slug"])
+                if (sess.get("track") in TOPIC_TRACKS and sess.get("topic_slug"))
+                else None
+            )
             prompt = (
                 str(payload.get("text") or "")
                 if is_live_topic
-                else build_prompt(self.hq_dir, self.config, payload)
+                else build_prompt(
+                    self.hq_dir,
+                    self.config,
+                    payload,
+                    recent_outbound=recent_outbound,
+                    topic_slug=topic_slug,
+                )
             )
 
             indicator_id = (
@@ -629,11 +748,13 @@ class HQDaemon:
         if ev.source == "git_commit":
             repo_name = str(ev.payload.get("repo", ""))
             sess = self._ensure_general_session(now)
+            recent_outbound = self._get_recent_outbound()
             prompt = build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
                 matched_repos=[repo_name] if repo_name else None,
+                recent_outbound=recent_outbound,
             )
             self._dispatch_interactive(
                 sess,
@@ -652,7 +773,13 @@ class HQDaemon:
             to_line = int(ev.payload.get("to_line", 0))
 
             sess = self._ensure_general_session(now)
-            prompt = build_prompt(self.hq_dir, self.config, ev.payload)
+            recent_outbound = self._get_recent_outbound()
+            prompt = build_prompt(
+                self.hq_dir,
+                self.config,
+                ev.payload,
+                recent_outbound=recent_outbound,
+            )
             reply = self._dispatch_interactive(
                 sess,
                 prompt,
@@ -686,7 +813,13 @@ class HQDaemon:
             if not orig_sess:
                 return
             general_sess = self._ensure_general_session(now)
-            prompt = build_prompt(self.hq_dir, self.config, ev.payload)
+            recent_outbound = self._get_recent_outbound()
+            prompt = build_prompt(
+                self.hq_dir,
+                self.config,
+                ev.payload,
+                recent_outbound=recent_outbound,
+            )
             reply = self._dispatch_interactive(
                 general_sess,
                 prompt,

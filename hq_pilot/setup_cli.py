@@ -130,6 +130,7 @@ def _build_agents_md(
             "## Key Contracts & Decisions",
             "- Cross-repo contracts live in `memory/contracts/`.",
             "- Architecture decisions & invariants live in `memory/decisions.md`.",
+            "- User context, preferences & corrections live in `memory/user-notes.md`.",
             "- Active cross-repo work is tracked in `tasks/active-wip.md`.",
             "",
             "## #General & #Topic Auto-Orchestration",
@@ -330,6 +331,17 @@ def run_setup(
     decisions = hq_dir / "memory" / "decisions.md"
     if not decisions.exists():
         decisions.write_text("# Architecture Decisions\n\n", encoding="utf-8")
+
+    user_notes = hq_dir / "memory" / "user-notes.md"
+    if not user_notes.exists():
+        tpl_user_notes = Path(__file__).resolve().parent.parent / "templates" / "user-notes.example.md"
+        if tpl_user_notes.is_file():
+            shutil.copyfile(tpl_user_notes, user_notes)
+        else:
+            user_notes.write_text(
+                "# User Notes\n\n## Role & Context\n-\n\n## Preferences\n-\n\n## Corrections & Guardrails\n-\n",
+                encoding="utf-8",
+            )
 
     wip = hq_dir / "tasks" / "active-wip.md"
     if not wip.exists():

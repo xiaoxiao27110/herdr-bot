@@ -44,3 +44,4 @@ tuning:
   distill_min_new_turns: 3
   dirty_worktree_warn_hours: 48
   git_sync_debounce_minutes: 120
+  past_messages_limit: 5

@@ -54,3 +54,20 @@ class MessagingChannel(ABC):
     @abstractmethod
     def answer_callback(self, callback_id: str, text: str = "") -> bool:
         """Acknowledge a button callback."""
+
+    def send_working_indicator(
+        self,
+        text: str = "⏳ 收到，正在处理中...",
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Optional hook: send an in-progress placeholder message/card and return its id."""
+        return None
+
+    def finish_working_indicator(
+        self,
+        message_id: str,
+        final_text: str,
+        thread_id: Optional[str] = None,
+    ) -> bool:
+        """Optional hook: update the in-progress placeholder in-place with the final reply."""
+        return False

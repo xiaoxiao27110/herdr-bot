@@ -487,6 +487,64 @@ class FeishuChannel(MessagingChannel):
         mid = data.get("message_id")
         return str(mid) if mid is not None else None
 
+    def send_working_indicator(
+        self,
+        text: str = "⏳ 收到，正在处理中...",
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        if not self.allowed_chat_id:
+            return None
+        card = _build_interactive_card(text=text)
+        content_str = json.dumps(card, ensure_ascii=False)
+        tid = str(thread_id).strip() if thread_id is not None else ""
+        try:
+            if tid:
+                resp = self._call_api(
+                    "POST",
+                    f"/open-apis/im/v1/messages/{tid}/reply",
+                    body={
+                        "msg_type": "interactive",
+                        "content": content_str,
+                        "reply_in_thread": True,
+                    },
+                )
+            else:
+                resp = self._call_api(
+                    "POST",
+                    "/open-apis/im/v1/messages?receive_id_type=chat_id",
+                    body={
+                        "receive_id": self.allowed_chat_id,
+                        "msg_type": "interactive",
+                        "content": content_str,
+                    },
+                )
+        except Exception:
+            return None
+        if int(resp.get("code", -1)) != 0:
+            return None
+        data = resp.get("data") or {}
+        mid = data.get("message_id")
+        return str(mid) if mid is not None else None
+
+    def finish_working_indicator(
+        self,
+        message_id: str,
+        final_text: str,
+        thread_id: Optional[str] = None,
+    ) -> bool:
+        if not message_id:
+            return False
+        card = _build_interactive_card(text=final_text)
+        try:
+            resp = self._call_api(
+                "PATCH",
+                f"/open-apis/im/v1/messages/{message_id}",
+                body={"content": json.dumps(card, ensure_ascii=False)},
+            )
+        except Exception:
+            return False
+        return int(resp.get("code", -1)) == 0
+
     def create_thread(self, title: str) -> Optional[str]:
         if not self.allowed_chat_id:
             raise RuntimeError("Feishu allowed_chat_id is not configured (fail-closed)")

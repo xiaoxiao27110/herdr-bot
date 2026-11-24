@@ -287,6 +287,90 @@ class TestFeishuChannel(unittest.TestCase):
             self.assertIn("oc_grp_1", out)
             self.assertIn("Dev Ops", out)
 
+    def test_working_indicator_and_composite_mirroring(self) -> None:
+        calls = []
+
+        def mock_req(method, url, body, headers, timeout):
+            calls.append((method, url, body))
+            if "tenant_access_token" in url:
+                return {"code": 0, "tenant_access_token": "t-ind", "expire": 7200}
+            if method == "POST" and "/open-apis/im/v1/messages" in url:
+                return {"code": 0, "data": {"message_id": "om_placeholder_1"}}
+            if method == "PATCH" and "/open-apis/im/v1/messages/om_placeholder_1" in url:
+                return {"code": 0, "data": {}}
+            return {"code": 0, "data": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = HQDatabase(Path(tmp) / "runtime.sqlite")
+            try:
+                feishu = FeishuChannel(
+                    "cli_abc",
+                    "sec_xyz",
+                    allowed_chat_id="oc_123",
+                    request_fn=mock_req,
+                    auto_start_ws=False,
+                )
+                local = LocalChannel(db)
+                comp = CompositeChannel([feishu, local])
+
+                mid = comp.send_working_indicator("⏳ 收到，正在处理中...")
+                self.assertEqual(mid, "om_placeholder_1")
+
+                ok = comp.finish_working_indicator(mid, "最终回复内容")
+                self.assertTrue(ok)
+
+                # Verify PATCH was called on Feishu
+                patch_calls = [c for c in calls if c[0] == "PATCH"]
+                self.assertEqual(len(patch_calls), 1)
+                self.assertIn("/open-apis/im/v1/messages/om_placeholder_1", patch_calls[0][1])
+                self.assertIn("最终回复内容", patch_calls[0][2]["content"])
+
+                # Verify final reply was mirrored to LocalChannel
+                msgs = db.list_recent_local_outbound(10)
+                self.assertEqual(len(msgs), 1)
+                self.assertEqual(msgs[0]["text"], "最终回复内容")
+            finally:
+                db.close()
+
+    def test_daemon_dedupe_uses_message_id_across_restarts(self) -> None:
+        from hq_pilot.channels.base import InboundMessage
+        from hq_pilot.daemon import HQDaemon
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "acme-hq"
+            hq_main(["init", str(hq_dir)])
+            daemon = HQDaemon(hq_dir)
+            try:
+                # Two distinct messages that both have update_id=1 (e.g. after daemon restart)
+                msg1 = InboundMessage(
+                    update_id=1,
+                    chat_id="oc_123",
+                    thread_id=None,
+                    sender_id="ou_1",
+                    text="你好",
+                    message_id="om_first_msg",
+                )
+                msg2 = InboundMessage(
+                    update_id=1,
+                    chat_id="oc_123",
+                    thread_id=None,
+                    sender_id="ou_1",
+                    text="第二条消息",
+                    message_id="om_second_msg",
+                )
+                daemon._handle_inbound(msg1, now=1000)
+                daemon._handle_inbound(msg2, now=2000)
+                # Duplicate of msg2 should still be deduplicated
+                daemon._handle_inbound(msg2, now=2001)
+
+                rows = daemon.db.conn.execute(
+                    "SELECT dedupe_key FROM events WHERE source='channel' ORDER BY id ASC"
+                ).fetchall()
+                keys = [r["dedupe_key"] for r in rows]
+                self.assertEqual(keys, ["channel:oc_123:om_first_msg", "channel:oc_123:om_second_msg"])
+            finally:
+                daemon.close()
+
 
 if __name__ == "__main__":
     unittest.main()

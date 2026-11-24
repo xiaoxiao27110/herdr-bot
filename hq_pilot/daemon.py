@@ -171,13 +171,15 @@ class HQDaemon:
                     )
                 return
 
+        msg_uid = msg.message_id or f"{now}:{msg.update_id}"
         self.db.enqueue_event(
             source="channel",
-            dedupe_key=f"channel:{msg.chat_id}:{msg.update_id}",
+            dedupe_key=f"channel:{msg.chat_id}:{msg_uid}",
             priority=10,
             available_at=now,
             payload={
                 "update_id": msg.update_id,
+                "message_id": msg.message_id,
                 "chat_id": msg.chat_id,
                 "thread_id": msg.thread_id,
                 "sender_id": msg.sender_id,
@@ -453,15 +455,37 @@ class HQDaemon:
                     return
 
             prompt = build_prompt(self.hq_dir, self.config, payload)
-            reply = self._dispatch_headless(
-                sess,
-                prompt,
-                effort=self.config.agent.default_effort,
-                now=now,
-                cwd=Path(sess["worktree_path"]) if sess.get("worktree_path") else self.hq_dir,
+            indicator_id = (
+                self.channel.send_working_indicator("⏳ 收到，正在处理中...", thread_id=thread_id)
+                if self.channel
+                else None
             )
-            if self.channel and reply:
-                self.channel.send_message(reply, thread_id=thread_id)
+            try:
+                reply = self._dispatch_headless(
+                    sess,
+                    prompt,
+                    effort=self.config.agent.default_effort,
+                    now=now,
+                    cwd=Path(sess["worktree_path"]) if sess.get("worktree_path") else self.hq_dir,
+                )
+            except Exception as exc:
+                if self.channel and indicator_id:
+                    self.channel.finish_working_indicator(
+                        indicator_id, f"❌ 处理失败：{exc}", thread_id=thread_id
+                    )
+                raise
+            if self.channel:
+                if reply:
+                    if indicator_id and self.channel.finish_working_indicator(
+                        indicator_id, reply, thread_id=thread_id
+                    ):
+                        pass
+                    else:
+                        self.channel.send_message(reply, thread_id=thread_id)
+                elif indicator_id:
+                    self.channel.finish_working_indicator(
+                        indicator_id, "✅ 已完成（无额外文本回复）", thread_id=thread_id
+                    )
             return
 
         if ev.source == "git_commit":

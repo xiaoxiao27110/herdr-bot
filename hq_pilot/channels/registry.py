@@ -69,6 +69,35 @@ class CompositeChannel(MessagingChannel):
                 ok = True
         return ok
 
+    def send_working_indicator(
+        self,
+        text: str = "⏳ 收到，正在处理中...",
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        for ch in self.channels:
+            mid = ch.send_working_indicator(text=text, thread_id=thread_id)
+            if mid is not None:
+                return mid
+        return None
+
+    def finish_working_indicator(
+        self,
+        message_id: str,
+        final_text: str,
+        thread_id: Optional[str] = None,
+    ) -> bool:
+        updated = False
+        for ch in self.channels:
+            if isinstance(ch, LocalChannel):
+                ch.send_message(final_text, thread_id=thread_id)
+            else:
+                if ch.finish_working_indicator(message_id, final_text, thread_id=thread_id):
+                    updated = True
+                else:
+                    ch.send_message(final_text, thread_id=thread_id)
+                    updated = True
+        return updated
+
 
 def get_channel(
     backend: str,

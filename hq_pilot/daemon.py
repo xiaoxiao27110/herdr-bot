@@ -727,7 +727,15 @@ class HQDaemon:
                 self._process_event(ev, ts)
                 self.db.complete_event(ev.id)
                 summary.events_processed += 1
+                print(
+                    f"[hq-daemon] done event={ev.id} source={ev.source}",
+                    flush=True,
+                )
             except Exception as exc:
+                print(
+                    f"[hq-daemon] error event={ev.id} source={ev.source}: {exc}",
+                    flush=True,
+                )
                 self.db.fail_event(
                     ev.id,
                     max_attempts=self.config.tuning.inbox_max_attempts,

@@ -87,7 +87,7 @@ class AgyAdapter(CodingAgentAdapter):
         effort: Optional[str] = None,
         add_dirs: Optional[List[Path]] = None,
     ) -> List[str]:
-        cmd = [self.bin_path, "-p", "--output-format", "json"]
+        cmd = [self.bin_path, "--output-format", "json"]
         if session_id:
             cmd.extend(["--conversation", str(session_id)])
         if model:
@@ -96,7 +96,7 @@ class AgyAdapter(CodingAgentAdapter):
             cmd.extend(["--effort", str(effort)])
         for d in add_dirs or []:
             cmd.extend(["--add-dir", str(d)])
-        cmd.append(prompt)
+        cmd.extend(["-p", prompt])
         return cmd
 
     def build_interactive_cmd(

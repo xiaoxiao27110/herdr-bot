@@ -105,11 +105,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"git: {shutil.which('git') or 'MISSING'}")
     agent_bin = cfg.local.bin_overrides.get(cfg.agent.backend) or shutil.which(cfg.agent.backend)
     print(f"agent ({cfg.agent.backend}): {agent_bin or 'NOT FOUND'}")
-    hc_path = cfg.local.bin_overrides.get("hc") or shutil.which("hc")
+    herdr_path = (
+        cfg.local.bin_overrides.get("herdr")
+        or shutil.which("herdr")
+        or (str(Path.home() / ".local" / "bin" / "herdr") if (Path.home() / ".local" / "bin" / "herdr").is_file() else None)
+    )
     tmux_path = cfg.local.bin_overrides.get("tmux") or shutil.which("tmux")
-    print(f"hc (herdr): {hc_path or 'NOT FOUND'}")
+    print(f"herdr: {herdr_path or 'NOT FOUND'}")
     print(f"tmux: {tmux_path or 'NOT FOUND'}")
-    if not hc_path:
+    if not herdr_path:
         print("\n" + install_herdr_guide())
     secrets = load_secrets_env(cfg.hq_dir)
     print(f"\nsecrets.env keys: {sorted(secrets.keys()) if secrets else '(none)'}")

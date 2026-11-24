@@ -177,8 +177,11 @@ class TestCLIAndEdgeCases(unittest.TestCase):
             self.assertTrue((hq_dir / ".hq" / "repos" / "gateway-svc" / "README.md").exists())
 
     def test_terminal_drivers_and_telegram_callback(self) -> None:
-        self.assertIn("hc", install_herdr_guide())
-        self.assertEqual(HerdrDriver().attach_cmd("p1"), ["hc", "attach", "p1"])
+        self.assertIn("herdr", install_herdr_guide())
+        self.assertEqual(HerdrDriver().attach_cmd("p1"), ["herdr"])
+        self.assertEqual(
+            HerdrDriver(session="hq").attach_cmd("p1"), ["herdr", "session", "attach", "hq"]
+        )
         self.assertEqual(TmuxDriver().attach_cmd("p1"), ["tmux", "attach-session", "-t", "p1"])
         drv = get_terminal_driver("tmux")
         self.assertEqual(drv.name, "tmux")

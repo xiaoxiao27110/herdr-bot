@@ -120,6 +120,21 @@ class AgyAdapter(CodingAgentAdapter):
             cmd.extend(["-i", initial_prompt])
         return cmd
 
+    def extra_trust_args(self, trusted_dirs: List[Path]) -> List[str]:
+        unique: List[str] = []
+        for d in trusted_dirs:
+            if not d:
+                continue
+            resolved = str(Path(d).expanduser().resolve())
+            if resolved not in unique:
+                unique.append(resolved)
+        if not unique:
+            return []
+        return [
+            "--settings",
+            json.dumps({"trustedWorkspaces": unique}, ensure_ascii=False),
+        ]
+
     def parse_headless_output(self, stdout: str) -> HeadlessResult:
         raw = (stdout or "").strip()
         if not raw:

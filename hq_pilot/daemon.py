@@ -358,11 +358,12 @@ class HQDaemon:
             model=self.config.agent.model,
             effort=self.config.agent.default_effort,
         )
+        trust_args = self.agent_adapter.extra_trust_args([wt_path, self.hq_dir])
         self.terminal_driver.start_agent(
             name=pane_name,
             cwd=wt_path,
             kind=self.agent_adapter.name,
-            agent_args=interactive_cmd[1:],
+            agent_args=[*interactive_cmd[1:], *trust_args],
             env={
                 "HQ_DIR": str(self.hq_dir),
                 "HQ_SESSION_KEY": skey,
@@ -447,11 +448,12 @@ class HQDaemon:
                 effort=effort,
                 add_dirs=add_dirs,
             )
+            trust_args = self.agent_adapter.extra_trust_args([cwd, *(add_dirs or [])])
             self.terminal_driver.start_agent(
                 name=pane_name,
                 cwd=cwd,
                 kind=self.agent_adapter.name,
-                agent_args=interactive_cmd[1:],
+                agent_args=[*interactive_cmd[1:], *trust_args],
                 env={
                     "HQ_DIR": str(self.hq_dir),
                     "HQ_SESSION_KEY": str(session["session_key"]),

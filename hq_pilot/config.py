@@ -32,6 +32,9 @@ TUNING_DESCRIPTIONS: Dict[str, str] = {
     "dirty_worktree_warn_hours": "Hours before dirty worktree triggers morning digest warning",
     "git_sync_debounce_minutes": "Debounce window in minutes for HQ repo auto git sync",
     "past_messages_limit": "Max recent outbound messages injected into prompt to avoid repetition",
+    "quiet_hours": "Nightly quiet hours window (HH:MM-HH:MM, supports overnight e.g. 23:00-08:00; empty disables)",
+    "outbox_max_retries": "Max backoff retry attempts for failed outbox deliveries before moving to dead",
+    "outbox_max_per_minute": "Max non-urgent outbox deliveries per minute to prevent flooding / 429",
 }
 
 
@@ -59,6 +62,9 @@ class TuningConfig:
     dirty_worktree_warn_hours: int = 48
     git_sync_debounce_minutes: int = 120
     past_messages_limit: int = 5
+    quiet_hours: str = ""
+    outbox_max_retries: int = 5
+    outbox_max_per_minute: int = 12
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "TuningConfig":

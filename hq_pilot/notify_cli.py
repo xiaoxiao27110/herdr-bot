@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+import json
 from pathlib import Path
 from typing import List, Optional
 import time
@@ -11,6 +13,39 @@ from hq_pilot.channels.base import InlineButton, MessagingChannel
 from hq_pilot.channels.registry import get_channel
 from hq_pilot.config import load_config, load_secrets_env
 from hq_pilot.db import HQDatabase
+
+
+def _parse_hhmm(value: str) -> Optional[int]:
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def is_in_quiet_hours(quiet_hours: str, now: int) -> bool:
+    """Return True if local time at `now` falls within `quiet_hours` ('HH:MM-HH:MM')."""
+    raw = (quiet_hours or "").strip()
+    if not raw or "-" not in raw:
+        return False
+    parts = raw.split("-")
+    if len(parts) != 2:
+        return False
+    start_min = _parse_hhmm(parts[0])
+    end_min = _parse_hhmm(parts[1])
+    if start_min is None or end_min is None or start_min == end_min:
+        return False
+    dt = datetime.fromtimestamp(int(now))
+    cur_min = dt.hour * 60 + dt.minute
+    if start_min < end_min:
+        return start_min <= cur_min < end_min
+    return cur_min >= start_min or cur_min < end_min
 
 
 def deliver_notification(
@@ -29,6 +64,15 @@ def deliver_notification(
         lvl = level.lower().strip()
         if lvl == "digest":
             db.add_digest_item(level="digest", category="agent_digest", message=message, now=ts)
+            return None
+
+        if lvl == "notify" and is_in_quiet_hours(cfg.tuning.quiet_hours, ts):
+            db.add_digest_item(
+                level="digest",
+                category="quiet_hours_downgrade",
+                message=message,
+                now=ts,
+            )
             return None
 
         ch = channel
@@ -58,7 +102,41 @@ def deliver_notification(
             buttons = [row]
 
         prefix = f"[{lvl.upper()}] "
-        msg_id = ch.send_message(prefix + message, thread_id=thread_id, buttons=buttons) if ch else None
+        full_text = prefix + message
+        msg_id: Optional[str] = None
+        if ch is not None:
+            send_err: Optional[str] = None
+            try:
+                msg_id = ch.send_message(full_text, thread_id=thread_id, buttons=buttons)
+                if not msg_id:
+                    send_err = "channel.send_message returned None"
+            except Exception as exc:
+                send_err = str(exc) or exc.__class__.__name__
+                msg_id = None
+
+            if not msg_id:
+                buttons_json = (
+                    json.dumps(
+                        [
+                            [{"text": b.text, "callback_data": b.callback_data} for b in r]
+                            for r in buttons
+                        ],
+                        ensure_ascii=False,
+                    )
+                    if buttons
+                    else None
+                )
+                db.enqueue_outbox(
+                    level=lvl,
+                    text=full_text,
+                    thread_id=thread_id,
+                    buttons_json=buttons_json,
+                    session_key=session_key,
+                    next_attempt_at=ts,
+                    last_error=send_err,
+                    now=ts,
+                )
+                return None
 
         if lvl in {"question", "review"} and msg_id and session_key:
             db.create_deferred_action(

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+import json
 import os
 import signal
 import subprocess
@@ -34,6 +35,7 @@ from hq_pilot.terminals.registry import get_terminal_driver
 GENERAL_PANE_NAME = "hq-general"
 GENERAL_TRACKS = {"GENERAL", "B"}
 TOPIC_TRACKS = {"TOPIC", "C"}
+OUTBOX_BACKOFF_SCHEDULE = [10, 30, 120, 300, 600]
 
 
 def _upsert_task_progress_file(
@@ -131,6 +133,7 @@ class TickSummary:
     commits_enqueued: int = 0
     nightly_ran: bool = False
     digest_sent: bool = False
+    outbox_sent: int = 0
 
 
 class HQDaemon:
@@ -1047,7 +1050,102 @@ class HQDaemon:
             self.db.set_meta("last_digest_date", today_str, now=ts)
             summary.digest_sent = True
 
+        summary.outbox_sent = self._drain_outbox(ts)
+
         return summary
+
+    def _drain_outbox(self, now: int) -> int:
+        """Retry due durable outbox messages with backoff and per-minute rate protection."""
+        if self.channel is None:
+            return 0
+        max_per_min = int(self.config.tuning.outbox_max_per_minute)
+        max_retries = int(self.config.tuning.outbox_max_retries)
+        sent_in_window = (
+            self.db.count_recent_outbox_sent(now - 60) if max_per_min > 0 else 0
+        )
+        fetch_limit = max(10, max_per_min) if max_per_min > 0 else 20
+        due_rows = self.db.list_due_outbox(now=now, limit=fetch_limit)
+        sent_count = 0
+
+        for row in due_rows:
+            lvl = str(row.get("level") or "").lower().strip()
+            if (
+                max_per_min > 0
+                and sent_in_window >= max_per_min
+                and lvl not in {"question", "review"}
+            ):
+                continue
+
+            buttons: Optional[List[List[InlineButton]]] = None
+            opt_objs: List[Dict[str, str]] = []
+            raw_buttons_json = row.get("buttons_json")
+            if raw_buttons_json:
+                try:
+                    parsed = json.loads(raw_buttons_json)
+                    if isinstance(parsed, list):
+                        rebuilt: List[List[InlineButton]] = []
+                        opt_idx = 0
+                        for btn_row in parsed:
+                            if not isinstance(btn_row, list):
+                                continue
+                            cur_row: List[InlineButton] = []
+                            for b in btn_row:
+                                if not isinstance(b, dict):
+                                    continue
+                                b_text = str(b.get("text", ""))
+                                b_cb = str(b.get("callback_data", ""))
+                                cur_row.append(InlineButton(text=b_text, callback_data=b_cb))
+                                opt_idx += 1
+                                oid = (
+                                    b_cb.rsplit(":", 1)[-1]
+                                    if b_cb.startswith("defer:") and ":" in b_cb
+                                    else str(opt_idx)
+                                )
+                                opt_objs.append({"id": oid, "label": b_text})
+                            if cur_row:
+                                rebuilt.append(cur_row)
+                        if rebuilt:
+                            buttons = rebuilt
+                except Exception:
+                    buttons = None
+
+            try:
+                msg_id = self.channel.send_message(
+                    str(row["text"]),
+                    thread_id=row.get("thread_id"),
+                    buttons=buttons,
+                )
+                if not msg_id:
+                    raise RuntimeError("channel.send_message returned None")
+            except Exception as exc:
+                attempts = int(row.get("attempts") or 0)
+                backoff_idx = min(attempts, len(OUTBOX_BACKOFF_SCHEDULE) - 1)
+                backoff_sec = OUTBOX_BACKOFF_SCHEDULE[backoff_idx]
+                self.db.mark_outbox_retry(
+                    outbox_id=int(row["id"]),
+                    error=str(exc) or exc.__class__.__name__,
+                    next_attempt_at=now + backoff_sec,
+                    max_retries=max_retries,
+                    now=now,
+                )
+                continue
+
+            self.db.mark_outbox_sent(int(row["id"]), now=now)
+            sent_count += 1
+            sent_in_window += 1
+
+            skey = row.get("session_key")
+            if lvl in {"question", "review"} and skey and opt_objs:
+                self.db.create_deferred_action(
+                    channel_msg_id=str(msg_id),
+                    session_key=str(skey),
+                    level=lvl,
+                    options=opt_objs,
+                    ttl_hours=self.config.tuning.deferred_approval_ttl_hours,
+                    now=now,
+                )
+
+        return sent_count
 
     def run_forever(self, poll_interval: float = 2.0) -> None:
         pid_file = self.hq_dir / ".hq" / "daemon.pid"

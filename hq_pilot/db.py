@@ -110,6 +110,24 @@ CREATE TABLE IF NOT EXISTS local_threads (
     closed INTEGER DEFAULT 0,
     created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS outbox_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    level TEXT NOT NULL,
+    thread_id TEXT,
+    text TEXT NOT NULL,
+    buttons_json TEXT,
+    session_key TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    sent_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_due
+    ON outbox_messages (status, next_attempt_at, id);
 """
 
 
@@ -780,3 +798,130 @@ class HQDatabase:
             "SELECT * FROM local_threads ORDER BY created_at ASC, thread_id ASC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Durable Outbox Retry Queue
+    # ------------------------------------------------------------------
+    def enqueue_outbox(
+        self,
+        level: str,
+        text: str,
+        thread_id: Optional[str] = None,
+        buttons_json: Optional[str] = None,
+        session_key: Optional[str] = None,
+        next_attempt_at: Optional[int] = None,
+        last_error: Optional[str] = None,
+        now: Optional[int] = None,
+    ) -> int:
+        ts = int(now if now is not None else time.time())
+        next_at = int(next_attempt_at if next_attempt_at is not None else ts)
+        cur = self.conn.execute(
+            """
+            INSERT INTO outbox_messages (
+                level, thread_id, text, buttons_json, session_key,
+                status, attempts, next_attempt_at, last_error, created_at, sent_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, NULL)
+            """,
+            (
+                level,
+                thread_id,
+                text,
+                buttons_json,
+                session_key,
+                next_at,
+                last_error,
+                ts,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def get_outbox_message(self, outbox_id: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM outbox_messages WHERE id = ?",
+            (int(outbox_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_due_outbox(
+        self, now: Optional[int] = None, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        ts = int(now if now is not None else time.time())
+        rows = self.conn.execute(
+            """
+            SELECT * FROM outbox_messages
+            WHERE status = 'pending' AND next_attempt_at <= ?
+            ORDER BY next_attempt_at ASC, id ASC
+            LIMIT ?
+            """,
+            (ts, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_outbox_sent(
+        self, outbox_id: int, now: Optional[int] = None
+    ) -> None:
+        ts = int(now if now is not None else time.time())
+        self.conn.execute(
+            """
+            UPDATE outbox_messages
+            SET status = 'sent', sent_at = ?, last_error = NULL
+            WHERE id = ?
+            """,
+            (ts, int(outbox_id)),
+        )
+
+    def mark_outbox_retry(
+        self,
+        outbox_id: int,
+        error: str,
+        next_attempt_at: int,
+        max_retries: int = 5,
+        now: Optional[int] = None,
+    ) -> str:
+        ts = int(now if now is not None else time.time())
+        row = self.conn.execute(
+            "SELECT * FROM outbox_messages WHERE id = ?",
+            (int(outbox_id),),
+        ).fetchone()
+        if not row:
+            return "missing"
+        new_attempts = int(row["attempts"]) + 1
+        if new_attempts >= int(max_retries):
+            self.conn.execute(
+                """
+                UPDATE outbox_messages
+                SET status = 'dead', attempts = ?, last_error = ?
+                WHERE id = ?
+                """,
+                (new_attempts, error, int(outbox_id)),
+            )
+            self.add_digest_item(
+                level="alert",
+                category="outbox_dead",
+                message=(
+                    f"Outbox #{outbox_id} ({row['level']}) moved to dead after "
+                    f"{new_attempts} attempts: {error}"
+                ).strip(),
+                now=ts,
+            )
+            return "dead"
+        self.conn.execute(
+            """
+            UPDATE outbox_messages
+            SET status = 'pending', attempts = ?, next_attempt_at = ?, last_error = ?
+            WHERE id = ?
+            """,
+            (new_attempts, int(next_attempt_at), error, int(outbox_id)),
+        )
+        return "pending"
+
+    def count_recent_outbox_sent(self, since_ts: int) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM outbox_messages
+            WHERE status = 'sent' AND sent_at IS NOT NULL AND sent_at >= ?
+            """,
+            (int(since_ts),),
+        ).fetchone()
+        return int(row["cnt"]) if row else 0

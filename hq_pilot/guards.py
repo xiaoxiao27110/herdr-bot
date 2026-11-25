@@ -48,7 +48,7 @@ def run_memory_guard(
     known_repos = set(cfg.repos.keys()) | set(cfg.boundaries.repos.keys())
     if known_repos:
         repo_alt = "|".join(re.escape(r) for r in sorted(known_repos))
-        ref_re = re.compile(rf"`?((?:{repo_alt}):[A-Za-z0-9_.\-/]+)`?")
+        ref_re = re.compile(rf"(?<![A-Za-z0-9_.\-/:])`?((?:{repo_alt}):[A-Za-z0-9_.\-/]+)`?(?!:)")
         md_files: List[Path] = []
         if index_path.exists():
             md_files.append(index_path)

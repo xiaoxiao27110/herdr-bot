@@ -24,10 +24,12 @@ TUNING_DESCRIPTIONS: Dict[str, str] = {
     "active_repo_quiet_minutes": "Quiet window in minutes when repo has recent uncommitted edits",
     "pane_blocked_notify_sec": "Delay in seconds before notifying on blocked managed pane",
     "deferred_approval_ttl_hours": "TTL in hours for deferred approval cards",
-    "general_idle_seal_minutes": "Idle timeout in minutes before sealing #General session",
-    "general_max_turns": "Max turns before rotating/sealing #General session",
+    "general_idle_seal_minutes": "Idle timeout in minutes before rotating #General session with handoff summary",
+    "general_max_turns": "Max turns before marking #General for quiet daytime /new rotation",
+    "general_rotate_transcript_mb": "Transcript size threshold in MB before marking #General for daytime /new rotation",
+    "general_rotate_quiet_minutes": "Continuous quiet minutes required before executing daytime size/turns #General /new rotation",
     "general_nightly_reset": "If true, mark #General for in-place /new rotation after nightly closeout",
-    "general_rotation_quiet_minutes": "Continuous quiet minutes required before executing due daily #General /new rotation",
+    "general_rotation_quiet_minutes": "Continuous quiet minutes required before executing due nightly #General /new rotation",
     "transcript_busy_window_sec": "Seconds since post-Stop transcript write within which a session is treated as busy",
     "topic_idle_seal_minutes": "Idle timeout in minutes before sealing non-pinned #Topic session",
     "distill_idle_minutes": "Idle threshold in minutes for incremental session distillation",
@@ -58,7 +60,9 @@ class TuningConfig:
     pane_blocked_notify_sec: int = 60
     deferred_approval_ttl_hours: int = 24
     general_idle_seal_minutes: int = 1440
-    general_max_turns: int = 200
+    general_max_turns: int = 60
+    general_rotate_transcript_mb: int = 8
+    general_rotate_quiet_minutes: int = 30
     general_nightly_reset: bool = True
     general_rotation_quiet_minutes: int = 60
     transcript_busy_window_sec: int = 120

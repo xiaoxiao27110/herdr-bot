@@ -27,8 +27,12 @@ class TestConfigAndTuning(unittest.TestCase):
         self.assertEqual(t.pane_blocked_notify_sec, 60)
         self.assertEqual(t.deferred_approval_ttl_hours, 24)
         self.assertEqual(t.general_idle_seal_minutes, 1440)
-        self.assertEqual(t.general_max_turns, 200)
+        self.assertEqual(t.general_max_turns, 60)
+        self.assertEqual(t.general_rotate_transcript_mb, 8)
+        self.assertEqual(t.general_rotate_quiet_minutes, 30)
         self.assertTrue(t.general_nightly_reset)
+        self.assertEqual(t.general_rotation_quiet_minutes, 60)
+        self.assertEqual(t.transcript_busy_window_sec, 120)
         self.assertEqual(t.topic_idle_seal_minutes, 120)
         self.assertEqual(t.distill_idle_minutes, 20)
         self.assertEqual(t.distill_min_new_turns, 3)
@@ -55,9 +59,24 @@ class TestConfigAndTuning(unittest.TestCase):
                 hq_main(["config", "set", "dream_force_nightly", "false", "--hq-dir", str(hq_dir)]),
                 0,
             )
+            self.assertEqual(
+                hq_main(["config", "set", "general_max_turns", "45", "--hq-dir", str(hq_dir)]),
+                0,
+            )
+            self.assertEqual(
+                hq_main(["config", "set", "general_rotate_transcript_mb", "12", "--hq-dir", str(hq_dir)]),
+                0,
+            )
+            self.assertEqual(
+                hq_main(["config", "set", "general_rotate_quiet_minutes", "15", "--hq-dir", str(hq_dir)]),
+                0,
+            )
             self.assertTrue(cfg.reload_if_changed())
             self.assertEqual(cfg.tuning.commit_debounce_sec, 120)
             self.assertFalse(cfg.tuning.dream_force_nightly)
+            self.assertEqual(cfg.tuning.general_max_turns, 45)
+            self.assertEqual(cfg.tuning.general_rotate_transcript_mb, 12)
+            self.assertEqual(cfg.tuning.general_rotate_quiet_minutes, 15)
 
             with self.assertRaises(ValueError):
                 update_tuning_value(hq_dir, "commit_debounce_sec", "not-an-int")

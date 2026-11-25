@@ -58,6 +58,87 @@ def _format_digest_category(category: str) -> str:
     return "系统提醒"
 
 
+def _build_busy_queue_card_text(busy_kind: str, hint: str, count: int) -> str:
+    """Format button-less Feishu queuing card text for a busy `#General` batch."""
+    n = max(1, int(count))
+    if busy_kind == "blocked":
+        if n <= 1:
+            return "⏸️ 总管正在等待审批，请打开 herdr 处理；你的消息已排队"
+        return f"⏸️ 总管正在等待审批，请打开 herdr 处理；你的消息已排队（已收到 {n} 条，忙完后一并回复）"
+    if n <= 1:
+        return f"⏳ 总管正在处理{hint}，你的消息已排队，忙完后一并回复"
+    return f"⏳ 总管正在处理{hint}，已收到 {n} 条，忙完后一并回复"
+
+
+def _format_merged_channel_batch(events: List[EventRow]) -> str:
+    """Merge chronological queued Feishu messages into one turn (no prefix if single)."""
+    if not events:
+        return ""
+    if len(events) == 1:
+        return str(events[0].payload.get("text") or "")
+    lines: List[str] = [f"[排队期间你陆续发来以下 {len(events)} 条消息，请一并回复]"]
+    for idx, item in enumerate(events, start=1):
+        ts_val = int(item.payload.get("received_at") or item.created_at or 0)
+        hhmm = datetime.fromtimestamp(ts_val).strftime("%H:%M") if ts_val > 0 else "--:--"
+        msg_text = str(item.payload.get("text") or "").strip()
+        lines.append(f"{idx}. ({hhmm}) {msg_text}")
+    return "\n".join(lines)
+
+
+def _append_topic_seal_to_today_wal(
+    hq_dir: Path,
+    slug: str,
+    branch_name: str,
+    summary_text: str,
+    max_lines: int = 60,
+) -> Path:
+    """Upsert a single-line `[WIP]` Topic seal summary into `notes/today.md` within `max_lines`."""
+    today_path = Path(hq_dir) / "notes" / "today.md"
+    today_path.parent.mkdir(parents=True, exist_ok=True)
+    if today_path.exists():
+        lines = today_path.read_text(encoding="utf-8").splitlines()
+    else:
+        lines = ["# Today WAL [UNVERIFIED / TODAY ONLY]", ""]
+
+    compact = " ".join((summary_text or "").split())
+    if len(compact) > 160:
+        compact = compact[:157] + "..."
+    if not compact:
+        compact = "已完成并封口"
+    branch_suffix = f"（分支 {branch_name}）" if branch_name else ""
+    entry = f"- [WIP] Topic {slug} 已封口：{compact}{branch_suffix}"
+    prefix = f"- [WIP] Topic {slug} "
+
+    replaced = False
+    new_lines: List[str] = []
+    for line in lines:
+        if line.strip().startswith(prefix):
+            new_lines.append(entry)
+            replaced = True
+        else:
+            new_lines.append(line)
+    if not replaced:
+        new_lines.append(entry)
+
+    limit = int(max_lines)
+    if limit > 0 and len(new_lines) > limit:
+        header_end = 0
+        for idx, line in enumerate(new_lines):
+            if idx == 0 and line.startswith("#"):
+                header_end = 1
+            elif idx == 1 and header_end == 1 and not line.strip():
+                header_end = 2
+            else:
+                break
+        header = new_lines[:header_end]
+        body = new_lines[header_end:]
+        keep_body = max(1, limit - len(header))
+        new_lines = header + body[-keep_body:]
+
+    today_path.write_text("\n".join(new_lines).rstrip() + "\n", encoding="utf-8")
+    return today_path
+
+
 def _upsert_task_progress_file(
     hq_dir: Path,
     slug: str,
@@ -240,56 +321,19 @@ class HQDaemon:
                 )
                 return
 
-        if not msg.thread_id and text.startswith("/task "):
+        if text.startswith("/task "):
             parts = text.split(None, 3)
             if len(parts) >= 4:
                 _, repo_name, slug, task_prompt = parts
                 sess = self.spawn_task(repo_name, slug, task_prompt, now=now)
                 if self.channel:
                     self.channel.send_message(
-                        f"已启动任务 `{sess['session_key']}`（面板 `{sess['pane_name']}`，分支 `{sess['branch_name']}`）。"
+                        f"已启动任务 `{sess['session_key']}`（面板 `{sess['pane_name']}`，分支 `{sess['branch_name']}`），"
+                        "可在 herdr 查看；飞书话题仅作进度通知区。"
                     )
                 return
 
-        if msg.thread_id:
-            sess_any = self.db.get_session_by_thread(msg.thread_id, include_archived=True)
-            if sess_any and sess_any["status"] == "archived":
-                if self.channel:
-                    self.channel.send_message(
-                        f"会话 `{sess_any['session_key']}` 已归档（分支 `{sess_any.get('branch_name') or '-'}` 仍保留），"
-                        f"可执行 `herdr-bot resume {sess_any['session_key']} --hq-dir {self.hq_dir}` 恢复工作树后继续。",
-                        thread_id=msg.thread_id,
-                    )
-                return
-
-            sess = self.db.get_session_by_thread(msg.thread_id)
-            if text == "/done" and sess:
-                self.seal_session(str(sess["session_key"]), now=now)
-                return
-
-            if sess and sess["status"] == "sealed":
-                # Sealed topic interception: refuse direct injection, offer 2 options
-                self.db.set_meta(f"pending_sealed_msg:{msg.thread_id}", text, now=now)
-                if self.channel:
-                    buttons = [
-                        [
-                            InlineButton(
-                                text="1. 基于当前分支开新会话",
-                                callback_data=f"seal_new:{sess['session_key']}",
-                            ),
-                            InlineButton(
-                                text="2. 解锁继续原会话",
-                                callback_data=f"seal_pin:{sess['session_key']}",
-                            ),
-                        ]
-                    ]
-                    self.channel.send_message(
-                        f"会话 `{sess['session_key']}` 已封口，请选择继续方式：",
-                        thread_id=msg.thread_id,
-                        buttons=buttons,
-                    )
-                return
-
+        # Single-window Feishu routing: ignore `msg.thread_id`, always route to `#General`
         msg_uid = msg.message_id or f"{now}:{msg.update_id}"
         self.db.enqueue_event(
             source="channel",
@@ -300,9 +344,10 @@ class HQDaemon:
                 "update_id": msg.update_id,
                 "message_id": msg.message_id,
                 "chat_id": msg.chat_id,
-                "thread_id": msg.thread_id,
+                "thread_id": None,
                 "sender_id": msg.sender_id,
                 "text": text,
+                "received_at": now,
             },
             now=now,
         )
@@ -311,74 +356,6 @@ class HQDaemon:
         data = msg.callback_data or ""
         if self.channel and msg.callback_id:
             self.channel.answer_callback(msg.callback_id, "已收到")
-
-        if data.startswith("seal_new:"):
-            old_key = data.split(":", 1)[1]
-            old_sess = self.db.get_session(old_key)
-            thread_id = msg.thread_id or (old_sess.get("channel_thread_id") if old_sess else None)
-            pending_text = (
-                self.db.get_meta(f"pending_sealed_msg:{thread_id}")
-                if thread_id
-                else None
-            ) or "继续当前分支的工作。"
-            new_key = f"thread:{thread_id or 'main'}:{now}"
-            topic_slug = old_sess.get("topic_slug") if old_sess else None
-            pane_name = (
-                f"hq-{topic_slug}"
-                if topic_slug
-                else (f"hq-{thread_id}" if thread_id else GENERAL_PANE_NAME)
-            )
-            self.db.create_session(
-                session_key=new_key,
-                track="TOPIC",
-                agent_backend=self.agent_adapter.name,
-                status="active",
-                channel_thread_id=thread_id,
-                topic_slug=topic_slug,
-                repo_name=old_sess.get("repo_name") if old_sess else None,
-                branch_name=old_sess.get("branch_name") if old_sess else None,
-                worktree_path=old_sess.get("worktree_path") if old_sess else None,
-                pane_name=pane_name,
-                now=now,
-            )
-            self.db.enqueue_event(
-                source="channel",
-                dedupe_key=f"seal_new_exec:{new_key}",
-                priority=10,
-                available_at=now,
-                payload={
-                    "session_key": new_key,
-                    "thread_id": thread_id,
-                    "text": pending_text,
-                },
-                now=now,
-            )
-            return
-
-        if data.startswith("seal_pin:"):
-            old_key = data.split(":", 1)[1]
-            self.db.pin_session(old_key, reason="channel_unlock", now=now)
-            old_sess = self.db.get_session(old_key)
-            thread_id = msg.thread_id or (old_sess.get("channel_thread_id") if old_sess else None)
-            pending_text = (
-                self.db.get_meta(f"pending_sealed_msg:{thread_id}")
-                if thread_id
-                else None
-            )
-            if pending_text:
-                self.db.enqueue_event(
-                    source="channel",
-                    dedupe_key=f"seal_pin_exec:{old_key}:{now}",
-                    priority=10,
-                    available_at=now,
-                    payload={
-                        "session_key": old_key,
-                        "thread_id": thread_id,
-                        "text": pending_text,
-                    },
-                    now=now,
-                )
-            return
 
         if data.startswith("defer:"):
             rest = data[len("defer:"):]
@@ -490,52 +467,19 @@ class HQDaemon:
             return
 
         if data.startswith("busy_wait:") or data.startswith("busy_fork:"):
-            is_fork = data.startswith("busy_fork:")
-            try:
-                ev_id = int(data.split(":", 1)[1])
-            except ValueError:
-                return
-            ev_row = self.db.get_event(ev_id)
-            if not ev_row or str(ev_row.get("status")) != "waiting_general":
-                if self.channel:
-                    self.channel.send_message(
-                        "该消息已开始处理或已完成。",
-                        thread_id=msg.thread_id,
-                    )
-                return
-
-            ev_payload = json.loads(ev_row["payload_json"])
-            card_id = msg.message_id or ev_payload.get("busy_card_msg_id")
-            tid = msg.thread_id or ev_payload.get("thread_id")
-
-            if not is_fork:
-                wait_ack = "⏳ 已确认排队，等当前任务忙完后立即为你处理..."
-                if self.channel:
-                    if not (
-                        card_id
-                        and self.channel.finish_working_indicator(
-                            str(card_id), wait_ack, thread_id=tid
-                        )
-                    ):
-                        self.channel.send_message(wait_ack, thread_id=tid)
-                return
-
-            orig_text = str(ev_payload.get("text") or "").strip() or "并行处理新任务"
-            fork_sess = self._spawn_fork_from_general(orig_text, now=now)
-            self.db.complete_event(ev_id)
-            fork_ack = (
-                f"🔀 已另开并行分身 `{fork_sess['pane_name']}`"
-                f"（分支 `{fork_sess.get('branch_name') or '-'}`，"
-                f"话题 `{fork_sess.get('channel_thread_id') or '-'}`），后续请在该话题中回复。"
-            )
             if self.channel:
-                if not (
-                    card_id
-                    and self.channel.finish_working_indicator(
-                        str(card_id), fork_ack, thread_id=tid
-                    )
-                ):
-                    self.channel.send_message(fork_ack, thread_id=tid)
+                self.channel.send_message(
+                    "该按钮已失效，消息已在排队",
+                    thread_id=None,
+                )
+            return
+
+        if data.startswith("seal_new:") or data.startswith("seal_pin:"):
+            if self.channel:
+                self.channel.send_message(
+                    "该按钮已失效，请直接在主窗口发送消息。",
+                    thread_id=None,
+                )
             return
 
         if msg.message_id:
@@ -666,6 +610,22 @@ class HQDaemon:
                 pass
         return 0
 
+    def _get_transcript_size_bytes(self, session: Dict[str, Any]) -> int:
+        skey = str(session["session_key"])
+        override = self.db.get_meta(f"transcript_size_bytes:{skey}")
+        if override is not None:
+            try:
+                return max(0, int(override))
+            except ValueError:
+                pass
+        tpath = session.get("transcript_path")
+        if tpath and Path(str(tpath)).exists():
+            try:
+                return int(Path(str(tpath)).stat().st_size)
+            except OSError:
+                pass
+        return 0
+
     def _get_current_work_hint(self, session: Dict[str, Any]) -> str:
         skey = str(session["session_key"])
         hint = (self.db.get_meta(f"current_work_hint:{skey}") or "").strip()
@@ -775,97 +735,9 @@ class HQDaemon:
             lines.append("- 上一轮会话已正常收口，详见 `notes/` 与 `tasks/active-wip.md`。")
         return "\n".join(lines)
 
-    def _spawn_fork_from_general(self, user_text: str, now: int) -> Dict[str, Any]:
-        """Spawn a parallel `#Topic` fork carrying `#General`'s recent context + user request."""
-        general_sess = self._ensure_general_session(now)
-        handoff_ctx = self._build_general_handoff_summary(general_sess, now)
-        user_notes_path = self.hq_dir / "memory" / "user-notes.md"
-        notes_snippet = ""
-        if user_notes_path.is_file():
-            raw_notes = user_notes_path.read_text(encoding="utf-8").strip()
-            if raw_notes:
-                notes_snippet = "\n\n### 用户偏好与约束摘要\n" + "\n".join(
-                    raw_notes.splitlines()[:20]
-                )
-
-        fork_prompt = (
-            "## 并行分身交接背景（来自 #General）\n"
-            f"{handoff_ctx}{notes_snippet}\n\n"
-            "## 本分身需独立处理的任务\n"
-            f"{user_text}"
-        )
-
-        # Match mentioned repository name if present; otherwise pick first valid configured repo
-        chosen_repo = ""
-        lowered = user_text.lower()
-        for rname in sorted(self.config.repos.keys()):
-            if rname.lower() in lowered and (self.config.get_repo_path(rname) / ".git").exists():
-                chosen_repo = rname
-                break
-        if not chosen_repo:
-            for rname in sorted(self.config.repos.keys()):
-                if (self.config.get_repo_path(rname) / ".git").exists():
-                    chosen_repo = rname
-                    break
-
-        slug_base = re.sub(r"[^a-z0-9]+", "-", user_text.lower()).strip("-")[:16] or "fork"
-        slug = f"{slug_base}-{now % 100000}"
-
-        if chosen_repo:
-            return self.spawn_task(chosen_repo, slug, fork_prompt, now=now)
-
-        # Zero-repo fallback: create isolated directory under .hq/worktrees/<slug>
-        wt_path = self.hq_dir / ".hq" / "worktrees" / f"general-{slug}"
-        wt_path.mkdir(parents=True, exist_ok=True)
-        thread_id = self.channel.create_thread(f"[fork] {slug}") if self.channel else None
-        pane_name = f"hq-{slug}"
-        skey = f"task:general:{slug}:{now}"
-        sess = self.db.create_session(
-            session_key=skey,
-            track="TOPIC",
-            agent_backend=self.agent_adapter.name,
-            status="active",
-            channel_thread_id=thread_id,
-            topic_slug=slug,
-            branch_name=f"hq/{slug}",
-            worktree_path=str(wt_path),
-            pane_name=pane_name,
-            now=now,
-        )
-        delivery_prompt = self._materialize_long_prompt(fork_prompt, tag=f"fork-{slug}", now=now)
-        self.agent_adapter.ensure_hooks_installed(wt_path, self._hook_bin_path())
-        self.db.record_dispatch(skey, None, delivery_prompt, now=now)
-        self.db.set_meta(f"last_input_origin:{skey}", "daemon", now=now)
-        _upsert_task_progress_file(
-            self.hq_dir, slug, "general", f"hq/{slug}", skey, user_text, status="active"
-        )
-        _upsert_active_wip_index(
-            self.hq_dir, slug, "general", f"hq/{slug}", status="active"
-        )
-        interactive_cmd = self.agent_adapter.build_interactive_cmd(
-            initial_prompt=None,
-            model=self.config.agent.model,
-            effort=self.config.agent.default_effort,
-        )
-        trust_args = self.agent_adapter.extra_trust_args(
-            [wt_path, self.hq_dir],
-            permission_mode=self.config.agent.permission_mode,
-        )
-        self.terminal_driver.start_agent(
-            name=pane_name,
-            cwd=wt_path,
-            kind=self.agent_adapter.name,
-            agent_args=[*interactive_cmd[1:], *trust_args],
-            env={
-                "HQ_DIR": str(self.hq_dir),
-                "HQ_SESSION_KEY": skey,
-            },
-        )
-        if delivery_prompt:
-            self.terminal_driver.prompt_agent(pane_name, delivery_prompt, wait=False)
-        return sess
-
-    def rotate_general_session(self, now: int, force: bool = False) -> bool:
+    def rotate_general_session(
+        self, now: int, force: bool = False, reason: str = "night"
+    ) -> bool:
         """Rotate `#General` in-place via `/new`, migrating timers and saving handoff summary."""
         current: Optional[Dict[str, Any]] = None
         for s in self.db.list_sessions(statuses=["active", "pinned"]):
@@ -893,6 +765,8 @@ class HQDaemon:
                 return False
             is_busy, _, _ = self._inspect_session_busy(current, now)
             if is_busy:
+                return False
+            if self.db.has_queued_channel_events():
                 return False
 
         handoff_summary = self._build_general_handoff_summary(current, now)
@@ -923,15 +797,19 @@ class HQDaemon:
         self.db.migrate_session_timers(skey, new_key)
         self.db.delete_meta(f"last_reply:{new_key}")
         self.db.delete_meta(f"last_input_origin:{new_key}")
+
+        norm_reason = "size" if reason == "size" else "night"
         self.db.set_meta("general_handoff_summary", handoff_summary, now=now)
+        self.db.set_meta("general_handoff_reason", norm_reason, now=now)
         self.db.set_meta("general_handoff_pending", "1", now=now)
-        self.db.set_meta("general_rotation_notice_pending", "1", now=now)
+        self.db.set_meta("general_rotation_notice_pending", norm_reason, now=now)
         self.db.delete_meta("general_rotation_due")
         return True
 
     def _maybe_run_due_general_rotation(self, now: int) -> bool:
-        """Execute due daily `#General` rotation only when idle and continuously quiet >= N min."""
-        if self.db.get_meta("general_rotation_due") != "1":
+        """Execute due `#General` rotation (night or daytime size/turns) when idle, no queued Feishu msgs, and quiet >= threshold."""
+        due = (self.db.get_meta("general_rotation_due") or "").strip()
+        if due not in {"1", "night", "size"}:
             return False
         current: Optional[Dict[str, Any]] = None
         for s in self.db.list_sessions(statuses=["active", "pinned"]):
@@ -942,11 +820,21 @@ class HQDaemon:
             self.db.delete_meta("general_rotation_due")
             return False
 
+        if self.db.has_queued_channel_events():
+            return False
+
         is_busy, _, _ = self._inspect_session_busy(current, now)
         if is_busy:
             return False
 
-        quiet_sec = max(0, int(self.config.tuning.general_rotation_quiet_minutes)) * 60
+        if due == "size":
+            quiet_min = int(self.config.tuning.general_rotate_quiet_minutes)
+            rot_reason = "size"
+        else:
+            quiet_min = int(self.config.tuning.general_rotation_quiet_minutes)
+            rot_reason = "night"
+
+        quiet_sec = max(0, quiet_min) * 60
         last_act = max(
             int(current.get("last_active_at") or 0),
             self._get_valid_transcript_mtime(current, now),
@@ -954,20 +842,114 @@ class HQDaemon:
         if quiet_sec > 0 and (now - last_act) < quiet_sec:
             return False
 
-        return self.rotate_general_session(now, force=False)
+        return self.rotate_general_session(now, force=False, reason=rot_reason)
 
     def _seal_idle_general_sessions(self, now: int) -> None:
         idle_limit = self.config.tuning.general_idle_seal_minutes * 60
         max_turns = self.config.tuning.general_max_turns
+        max_mb = self.config.tuning.general_rotate_transcript_mb
+        max_bytes = max_mb * 1024 * 1024 if max_mb > 0 else 0
+
         for s in self.db.list_sessions(statuses=["active"]):
             if s["track"] not in GENERAL_TRACKS:
                 continue
-            idle_sec = now - int(s["last_active_at"])
+            last_act = max(
+                int(s["last_active_at"]),
+                self._get_valid_transcript_mtime(s, now),
+            )
+            idle_sec = now - last_act
             idle_exceeded = idle_limit > 0 and idle_sec >= idle_limit
             turns_exceeded = max_turns > 0 and int(s["turn_count"]) >= max_turns
-            if idle_exceeded or turns_exceeded:
-                self.rotate_general_session(now, force=False)
+            size_exceeded = max_bytes > 0 and self._get_transcript_size_bytes(s) >= max_bytes
+
+            if turns_exceeded or size_exceeded:
+                existing_due = (self.db.get_meta("general_rotation_due") or "").strip()
+                if existing_due not in {"1", "night", "size"}:
+                    self.db.set_meta("general_rotation_due", "size", now=now)
+
+            if idle_exceeded and not self.db.has_queued_channel_events():
+                self.rotate_general_session(now, force=False, reason="night")
                 break
+
+    def _extract_topic_last_reply(self, sess: Dict[str, Any]) -> str:
+        """0-LLM read of a Topic's latest assistant reply from meta_state or transcript."""
+        skey = str(sess["session_key"])
+        meta_reply = (self.db.get_meta(f"last_reply:{skey}") or "").strip()
+        if meta_reply:
+            return meta_reply
+        tpath = sess.get("transcript_path")
+        if tpath and Path(str(tpath)).exists():
+            try:
+                turns, _ = self.agent_adapter.read_transcript_slice(str(tpath), from_line=0)
+                assistants = [t.text.strip() for t in turns if t.role == "assistant" and t.text.strip()]
+                if assistants:
+                    return assistants[-1]
+            except Exception:
+                pass
+        return ""
+
+    def _read_topic_recent_commit(self, sess: Dict[str, Any]) -> str:
+        wt_str = sess.get("worktree_path")
+        if not wt_str or not Path(str(wt_str)).exists():
+            return ""
+        try:
+            res = subprocess.run(
+                ["git", "-C", str(wt_str), "log", "-1", "--format=%h %s"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if res.returncode == 0:
+                return res.stdout.strip()
+        except Exception:
+            pass
+        return ""
+
+    def _emit_topic_seal_summary(
+        self,
+        sess: Dict[str, Any],
+        reason: str = "",
+        now: Optional[int] = None,
+    ) -> None:
+        """0-LLM Topic result reflow: push Chinese summary to main window and append `[WIP]` to `notes/today.md`."""
+        _ = now
+        if sess.get("track") not in TOPIC_TRACKS:
+            return
+        skey = str(sess["session_key"])
+        slug = str(sess.get("topic_slug") or skey)
+        branch_name = str(sess.get("branch_name") or "").strip()
+        raw_reply = self._extract_topic_last_reply(sess)
+        reason_clean = (reason or "").strip()
+
+        summary_body = raw_reply
+        if not summary_body:
+            if reason_clean:
+                summary_body = reason_clean
+            else:
+                recent_commit = self._read_topic_recent_commit(sess)
+                summary_body = f"最近提交 {recent_commit}" if recent_commit else "已完成并封口"
+        elif reason_clean and reason_clean not in summary_body:
+            summary_body = f"{summary_body}\n（封口说明：{reason_clean}）"
+
+        if len(summary_body) > 600:
+            summary_body = summary_body[:597] + "..."
+
+        _append_topic_seal_to_today_wal(
+            self.hq_dir,
+            slug=slug,
+            branch_name=branch_name,
+            summary_text=summary_body,
+            max_lines=self.config.tuning.today_wal_max_lines,
+        )
+
+        if self.channel is not None:
+            branch_suffix = f"（分支 {branch_name}）" if branch_name else ""
+            msg_text = f"✅ 任务 {slug} 已完成：{summary_body}{branch_suffix}"
+            try:
+                self.channel.send_message(msg_text, thread_id=None)
+            except Exception:
+                pass
 
     def _seal_idle_topic_sessions(self, now: int) -> None:
         idle_limit = self.config.tuning.topic_idle_seal_minutes * 60
@@ -981,16 +963,19 @@ class HQDaemon:
             idle_sec = now - int(s["last_active_at"])
             if idle_sec >= idle_limit:
                 skey = str(s["session_key"])
-                if self.db.seal_session(skey, now=now) and s.get("topic_slug"):
-                    t_slug = str(s["topic_slug"])
-                    t_repo = str(s.get("repo_name") or "")
-                    t_branch = str(s.get("branch_name") or "")
-                    _upsert_task_progress_file(
-                        self.hq_dir, t_slug, t_repo, t_branch, skey, "", status="sealed"
-                    )
-                    _upsert_active_wip_index(
-                        self.hq_dir, t_slug, t_repo, t_branch, status="sealed"
-                    )
+                if self.db.seal_session(skey, now=now):
+                    updated = self.db.get_session(skey) or s
+                    if updated.get("topic_slug"):
+                        t_slug = str(updated["topic_slug"])
+                        t_repo = str(updated.get("repo_name") or "")
+                        t_branch = str(updated.get("branch_name") or "")
+                        _upsert_task_progress_file(
+                            self.hq_dir, t_slug, t_repo, t_branch, skey, "", status="sealed"
+                        )
+                        _upsert_active_wip_index(
+                            self.hq_dir, t_slug, t_repo, t_branch, status="sealed"
+                        )
+                    self._emit_topic_seal_summary(updated, reason="空闲超时自动封口", now=now)
 
     def seal_session(
         self,
@@ -1025,16 +1010,20 @@ class HQDaemon:
             _upsert_active_wip_index(
                 self.hq_dir, t_slug, t_repo, t_branch, status="sealed"
             )
-        thread_id = updated.get("channel_thread_id")
-        if not was_sealed and thread_id and self.channel is not None:
-            reason_note = f"（原因：{reason.strip()}）" if reason and reason.strip() else ""
-            try:
-                self.channel.send_message(
-                    f"会话 `{skey}` 已封口（工作树保留至夜间安全归档）{reason_note}。",
-                    thread_id=str(thread_id),
-                )
-            except Exception:
-                pass
+        if not was_sealed:
+            if updated.get("track") in TOPIC_TRACKS:
+                self._emit_topic_seal_summary(updated, reason=reason, now=ts)
+            else:
+                thread_id = updated.get("channel_thread_id")
+                if thread_id and self.channel is not None:
+                    reason_note = f"（原因：{reason.strip()}）" if reason and reason.strip() else ""
+                    try:
+                        self.channel.send_message(
+                            f"会话 `{skey}` 已封口（工作树保留至夜间安全归档）{reason_note}。",
+                            thread_id=None,
+                        )
+                    except Exception:
+                        pass
         return updated
 
     def _resolve_pane_name(self, session: Dict[str, Any]) -> str:
@@ -1256,10 +1245,14 @@ class HQDaemon:
         summary = (self.db.get_meta("general_handoff_summary") or "").strip()
         if not summary:
             return ""
-        return f"## 昨日会话交接摘要\n{summary}\n\n"
+        reason = (self.db.get_meta("general_handoff_reason") or "night").strip()
+        header = (
+            "## 昨日会话交接摘要" if reason in {"night", "1", ""} else "## 上一轮会话交接摘要"
+        )
+        return f"{header}\n{summary}\n\n"
 
     def _wake_waiting_events(self, now: int) -> int:
-        """Promote at most 1 FIFO `waiting_general` event per idle target session."""
+        """Promote at most 1 FIFO `waiting_general` event (or batch leader) per idle target session."""
         waiting = self.db.list_waiting_events()
         if not waiting:
             return 0
@@ -1280,107 +1273,122 @@ class HQDaemon:
                     promoted += 1
         return promoted
 
+    def _park_channel_event_in_batch(
+        self,
+        ev: EventRow,
+        sess: Dict[str, Any],
+        busy_kind: str,
+        hint: str,
+    ) -> None:
+        """Park a Feishu channel event into the open busy batch (1 button-less card per batch)."""
+        payload = ev.payload
+        skey = str(sess["session_key"])
+
+        # Already assigned to a batch (e.g. promoted leader re-parked because General became busy again)
+        if payload.get("busy_batch_id") and payload.get("busy_card_msg_id"):
+            self.db.park_event_waiting(
+                ev.id,
+                payload_updates={"wait_session_key": skey},
+            )
+            return
+
+        open_batch = [e for e in self.db.list_open_busy_batch_events() if e.id != ev.id]
+        if open_batch:
+            batch_id = str(open_batch[0].payload.get("busy_batch_id") or f"batch:{open_batch[0].id}")
+            card_id = open_batch[0].payload.get("busy_card_msg_id")
+            new_count = len(open_batch) + 1
+            card_text = _build_busy_queue_card_text(busy_kind, hint, new_count)
+            if not card_id and self.channel is not None:
+                card_id = self.channel.send_message(card_text, thread_id=None)
+            elif card_id and self.channel is not None:
+                self.channel.finish_working_indicator(str(card_id), card_text, thread_id=None)
+            self.db.park_event_waiting(
+                ev.id,
+                payload_updates={
+                    "busy_batch_id": batch_id,
+                    "busy_card_msg_id": card_id,
+                    "wait_session_key": skey,
+                },
+            )
+            return
+
+        batch_id = f"batch:{ev.id}"
+        card_text = _build_busy_queue_card_text(busy_kind, hint, 1)
+        card_id = (
+            self.channel.send_message(card_text, thread_id=None)
+            if self.channel is not None
+            else None
+        )
+        self.db.park_event_waiting(
+            ev.id,
+            payload_updates={
+                "busy_batch_id": batch_id,
+                "busy_card_msg_id": card_id,
+                "wait_session_key": skey,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Event Execution
     # ------------------------------------------------------------------
-    def _process_event(self, ev: EventRow, now: int) -> None:
+    def _process_event(self, ev: EventRow, now: int) -> int:
         if ev.source == "channel":
-            payload = ev.payload
-            thread_id = payload.get("thread_id")
-            explicit_key = payload.get("session_key")
-            if explicit_key:
-                sess = self.db.get_session(str(explicit_key)) or self._ensure_general_session(now)
-            elif thread_id:
-                sess = self.db.get_session_by_thread(str(thread_id))
-                if not sess:
-                    sess = self.db.create_session(
-                        session_key=f"thread:{thread_id}:{now}",
-                        track="TOPIC",
-                        agent_backend=self.agent_adapter.name,
-                        status="active",
-                        channel_thread_id=str(thread_id),
-                        pane_name=f"hq-{thread_id}",
-                        now=now,
-                    )
-            else:
-                sess = self._ensure_general_session(now)
-
+            payload = dict(ev.payload)
+            # Single-window Feishu routing: always target `#General`, always reply in main window
+            sess = self._ensure_general_session(now)
             pane_name = self._resolve_pane_name(sess)
             is_busy, busy_kind, hint = self._inspect_session_busy(sess, now)
             if is_busy:
-                card_id = payload.get("busy_card_msg_id")
-                if not card_id and self.channel is not None:
-                    if sess.get("track") in GENERAL_TRACKS and not thread_id:
-                        if busy_kind == "blocked":
-                            card_text = (
-                                f"⏸️ 总管正在等待审批（面板 `{pane_name}`），"
-                                "请打开 `herdr` 处理，或选择本条消息处理方式："
-                            )
-                        else:
-                            card_text = f"⏳ 总管正在处理{hint}，这条消息怎么处理？"
-                        buttons = [
-                            [
-                                InlineButton(text="等它忙完", callback_data=f"busy_wait:{ev.id}"),
-                                InlineButton(text="另开分身并行", callback_data=f"busy_fork:{ev.id}"),
-                            ]
-                        ]
-                    else:
-                        card_text = f"⏳ 当前任务面板 `{pane_name}` 正在处理中，本条消息已进入排队："
-                        buttons = [
-                            [InlineButton(text="等它忙完", callback_data=f"busy_wait:{ev.id}")]
-                        ]
-                    card_id = self.channel.send_message(
-                        card_text, thread_id=thread_id, buttons=buttons
-                    )
-                self.db.park_event_waiting(
-                    ev.id,
-                    payload_updates={
-                        "busy_card_msg_id": card_id,
-                        "wait_session_key": str(sess["session_key"]),
-                    },
-                )
+                self._park_channel_event_in_batch(ev, sess, busy_kind, hint)
                 raise _EventParked()
 
-            raw_user_text = str(payload.get("text") or "")
-            compact_hint = " ".join(raw_user_text.split())[:24]
+            batch_events: List[EventRow] = [ev]
+            follower_ids: List[int] = []
+            if payload.get("busy_batch_id") or payload.get("batch_closed"):
+                closed = self.db.close_busy_batch_for_dispatch(ev.id)
+                if closed:
+                    batch_events = closed
+                    follower_ids = [b.id for b in batch_events if b.id != ev.id]
+                    refreshed_leader = self.db.get_event(ev.id)
+                    if refreshed_leader:
+                        payload = json.loads(refreshed_leader["payload_json"])
+                        ev.payload = payload
+
+            merged_user_text = _format_merged_channel_batch(batch_events)
+            first_msg_text = str(batch_events[0].payload.get("text") or "")
+            compact_hint = " ".join(first_msg_text.split())[:24]
             if compact_hint:
                 self.db.set_meta(f"current_work_hint:{sess['session_key']}", compact_hint, now=now)
 
             live_panes = {p.name for p in self.terminal_driver.list_panes()}
             is_live_pane = pane_name in live_panes
-            is_live_topic = (sess.get("track") in TOPIC_TRACKS) and is_live_pane
             has_prior_turns = int(sess.get("turn_count") or 0) > 0
-            use_raw_prompt = is_live_topic or (is_live_pane and has_prior_turns)
+            use_raw_prompt = is_live_pane and has_prior_turns
             recent_outbound = self._get_recent_outbound()
-            topic_slug = (
-                str(sess["topic_slug"])
-                if (sess.get("track") in TOPIC_TRACKS and sess.get("topic_slug"))
-                else None
-            )
             handoff_prefix = self._consume_general_handoff_prefix(sess)
+            prompt_payload = dict(payload)
+            prompt_payload["text"] = merged_user_text
+            prompt_payload["thread_id"] = None
             base_prompt = (
-                raw_user_text
+                merged_user_text
                 if use_raw_prompt
                 else build_prompt(
                     self.hq_dir,
                     self.config,
-                    payload,
+                    prompt_payload,
                     recent_outbound=recent_outbound,
-                    topic_slug=topic_slug,
+                    topic_slug=None,
                 )
             )
             prompt = (handoff_prefix + base_prompt) if handoff_prefix else base_prompt
 
             existing_busy_card = payload.get("busy_card_msg_id")
             if existing_busy_card:
-                indicator_id = str(existing_busy_card)
-                if self.channel:
-                    self.channel.finish_working_indicator(
-                        indicator_id, "⏳ 轮到你了，正在处理中...", thread_id=thread_id
-                    )
+                # Keep queuing card untouched until final reply arrives (no "轮到你了" flicker)
+                indicator_id: Optional[str] = str(existing_busy_card)
             else:
                 indicator_id = (
-                    self.channel.send_working_indicator("⏳ 收到，正在处理中...", thread_id=thread_id)
+                    self.channel.send_working_indicator("⏳ 收到，正在处理中...", thread_id=None)
                     if self.channel
                     else None
                 )
@@ -1390,40 +1398,49 @@ class HQDaemon:
                     prompt,
                     effort=self.config.agent.default_effort,
                     now=now,
-                    cwd=Path(sess["worktree_path"]) if sess.get("worktree_path") else self.hq_dir,
+                    cwd=self.hq_dir,
                     wait=True,
                 )
             except Exception as exc:
                 if self.channel and indicator_id:
                     self.channel.finish_working_indicator(
-                        indicator_id, f"❌ 处理失败：{exc}", thread_id=thread_id
+                        indicator_id, f"❌ 处理失败：{exc}", thread_id=None
                     )
                 raise
 
+            notice_pending = self.db.get_meta("general_rotation_notice_pending")
             if (
                 sess.get("track") in GENERAL_TRACKS
                 and reply
-                and self.db.get_meta("general_rotation_notice_pending") == "1"
+                and notice_pending in {"1", "night", "size"}
             ):
                 self.db.delete_meta("general_rotation_notice_pending")
-                reply = (
-                    reply.rstrip()
-                    + "\n\n---\n_🧹 昨晚已整理记忆并开启新对话，旧对话可在 `herdr` 中输入 `/resume` 查看。_"
-                )
+                if notice_pending == "size":
+                    notice_line = (
+                        "\n\n---\n_🧹 当前对话上下文较长，已自动整理交接摘要并开启新对话，"
+                        "旧对话可在 `herdr` 中输入 `/resume` 查看。_"
+                    )
+                else:
+                    notice_line = (
+                        "\n\n---\n_🧹 昨晚已整理记忆并开启新对话，旧对话可在 `herdr` 中输入 `/resume` 查看。_"
+                    )
+                reply = reply.rstrip() + notice_line
 
             if self.channel:
                 if reply:
                     if indicator_id and self.channel.finish_working_indicator(
-                        indicator_id, reply, thread_id=thread_id
+                        indicator_id, reply, thread_id=None
                     ):
                         pass
                     else:
-                        self.channel.send_message(reply, thread_id=thread_id)
+                        self.channel.send_message(reply, thread_id=None)
                 elif indicator_id:
                     self.channel.finish_working_indicator(
-                        indicator_id, "✅ 已完成（无额外文本回复）", thread_id=thread_id
+                        indicator_id, "✅ 已完成（无额外文本回复）", thread_id=None
                     )
-            return
+            if follower_ids:
+                self.db.complete_events(follower_ids)
+            return len(batch_events)
 
         if ev.source == "git_commit":
             repo_name = str(ev.payload.get("repo", ""))
@@ -1709,7 +1726,7 @@ class HQDaemon:
             now=ts,
         )
         if self.config.tuning.general_nightly_reset:
-            self.db.set_meta("general_rotation_due", "1", now=ts)
+            self.db.set_meta("general_rotation_due", "night", now=ts)
             self._maybe_run_due_general_rotation(ts)
         sync_hq_repo(self.hq_dir, commit_message="hq-pilot: nightly memory closeout", push=False)
         return report
@@ -1775,9 +1792,11 @@ class HQDaemon:
         )
         for ev in events:
             try:
-                self._process_event(ev, ts)
+                processed_count = self._process_event(ev, ts)
                 self.db.complete_event(ev.id)
-                summary.events_processed += 1
+                summary.events_processed += (
+                    processed_count if isinstance(processed_count, int) and processed_count > 0 else 1
+                )
                 print(
                     f"[hq-daemon] done event={ev.id} source={ev.source}",
                     flush=True,
@@ -1789,12 +1808,17 @@ class HQDaemon:
                     f"[hq-daemon] error event={ev.id} source={ev.source}: {exc}",
                     flush=True,
                 )
-                self.db.fail_event(
+                fail_state = self.db.fail_event(
                     ev.id,
                     max_attempts=self.config.tuning.inbox_max_attempts,
                     now=ts,
                     error_msg=str(exc),
                 )
+                if fail_state == "dead":
+                    member_ids = ev.payload.get("batch_member_ids") or []
+                    follower_ids = [int(i) for i in member_ids if int(i) != ev.id]
+                    if follower_ids:
+                        self.db.mark_events_dead(follower_ids)
                 summary.events_failed += 1
 
         dt = datetime.fromtimestamp(ts)

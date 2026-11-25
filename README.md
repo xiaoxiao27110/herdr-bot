@@ -15,10 +15,10 @@
    - 彻底告别无状态 `agy -p` 单次调用：每一个会话都是真实的 **Herdr** 持久交互面板（未安装 Herdr 时自动降级 `tmux`），随时可在终端敲 `herdr` 切入现场围观、打断或人工协作。
    - 通过轻量级生命周期 Hook（`<10ms`）在每轮结束时精准提取干净回复，原位刷新飞书/Telegram「⏳ 正在处理中...」状态卡片。
 
-2. **纯两级会话（`#General` + `#Topic`）与全自动开/关 Topic 闭环**
-   - **`#General`（`hq-general` 协调面板）**：处理日常轻量问答、项目状态查询、跨仓库敏感提交巡检、增量对话蒸馏与夜间记忆整合——轻量沟通直接秒回，绝不乱开窗口。
-   - **`#Topic`（`hq-<slug>` 独立任务面板）**：遇到需要修改代码、跑测试或长链路排查的独立开发需求时，**无需人工手敲 `/task`**，`#General` 会自主执行 `herdr-bot task spawn` 创建独立 Git Worktree + Herdr 专属面板 + 飞书/Telegram 独立话题卡片。
-   - **全自动封口闭环（告别强制 `/done`）**：任务完成并验收通过后，Agent 可调用 `herdr-bot seal` 自主封口；即使忘记手动封口，空闲满 `topic_idle_seal_minutes`（默认 `120` 分钟）后守护进程也会自动将非 `pinned` 活跃话题转为 `sealed`（保留 Worktree 至夜间安全归档）。
+2. **飞书单窗口只对 `#General` + 忙碌合并排队 + `#Topic` 结果回流**
+   - **`#General`（`hq-general` 常驻总管面板）**：飞书单窗口统一对接 `#General`（在主窗口或任意话题内回复一律路由至 `#General` 并回复主窗口）。General 忙碌时仅回一张无按钮排队卡片并原地更新计数，空闲后将排队消息按时间顺序合并为一轮一次性回复。
+   - **`#Topic`（`hq-<slug>` 独立任务面板）**：仅在用户明确要求（自然语言或 `/task`）时由 `herdr-bot task spawn` 创建独立 Git Worktree + Herdr 专属面板；飞书话题仅作进度通知区，多面板并行交互在 Herdr 终端中完成。
+   - **封口回流与无感换新**：Topic 封口（手动 `herdr-bot seal` 或空闲满 `topic_idle_seal_minutes` 自动封口）时，0-LLM 自动将中文小结推送飞书主窗口并写入 `notes/today.md`。`#General` 同时支持夜间收口后静默 `60` 分钟与白天轮数/日志体量超标后静默 `30` 分钟原地 `/new` 带交接摘要换新。
 
 3. **人工接管自动保护（`pinned`）与 4 态安全归档**
    - 会话完整生命周期：`active` → `sealed`（逻辑封口，保留分支与工作树）→ `archived`（每晚 `23:30` 自动蒸馏做梦后清理干净工作树，永久保留 Git 分支与对话记录，支持 `herdr-bot resume <id>` 一键重建工作树原地续聊）。
@@ -82,17 +82,17 @@ herdr
 ## 架构总览
 
 ```text
-飞书话题卡片 / Telegram Topics / 本地终端 chat / Git 敏感提交 / 定时任务
+飞书单窗口 / Telegram / 本地终端 chat / Git 敏感提交 / 定时任务
                                │
                                ▼
-         0-LLM 守护内核 (SQLite 租约队列 + 游标状态 + 安全守卫)
+         0-LLM 守护内核 (SQLite 租约队列 + 忙碌合并批次 + 游标状态)
                                │
          ┌─────────────────────┴─────────────────────┐
          ▼                                           ▼
   #General (hq-general)                      #Topic (hq-<slug>)
-  Herdr 常驻协调面板 (HQ 记忆根)             独立 Git Worktree + Herdr 面板
-  - 轻量问答、状态汇报直接秒回               - 由 #General 自主 task spawn 拉起
-  - 跨仓提交巡检 & 增量记忆蒸馏               - 验收后自主 seal 或空闲 120m 自动封口
+  Herdr 常驻总管面板 (HQ 记忆根)             独立 Git Worktree + Herdr 面板
+  - 承接全部飞书消息，忙时合并排队回复        - 仅按用户明确要求 task spawn 拉起
+  - 夜间 / 白天按体量静默带交接摘要 /new 换新  - 飞书话题仅作进度通知，封口回流主窗口
   - 23:30 夜间做梦整合与 09:30 晨报           - 人工切入 Herdr 自动转 pinned 免清理保护
 ```
 

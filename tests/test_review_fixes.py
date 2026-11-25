@@ -182,24 +182,10 @@ class TestReviewFixes(unittest.TestCase):
                 self.assertIn(f"HQ_SESSION_KEY={sess['session_key']}", term.bg_calls[0]["cmd"])
                 self.assertTrue((Path(sess["worktree_path"]) / ".agents" / "hooks.json").exists())
 
-                # Follow-up message in Topic routes to live pane via prompt_agent/send_text
-                ch.updates.append(
-                    InboundMessage(
-                        update_id=10,
-                        chat_id="c1",
-                        thread_id="thread-101",
-                        sender_id="u1",
-                        text="Also add unit tests",
-                    )
-                )
-                summary = daemon.run_once(now=510)
-                self.assertEqual(summary.events_processed, 1)
-                self.assertEqual(term.sent_texts[-1]["text"], "Also add unit tests")
-
-                # Stop hook pushes assistant reply to thread-101
+                # Stop hook for daemon-spawned Topic turn pushes progress reply to Topic thread-101
                 tfile = Path(tmp) / "t_cors.jsonl"
                 tfile.write_text(
-                    json.dumps({"role": "user", "content": "Also add unit tests"}) + "\n"
+                    json.dumps({"role": "user", "content": "Fix CORS headers"}) + "\n"
                     + json.dumps({"role": "assistant", "content": "CORS + unit tests done."}) + "\n",
                     encoding="utf-8",
                 )
@@ -218,6 +204,21 @@ class TestReviewFixes(unittest.TestCase):
                 self.assertTrue(res["reply_pushed"])
                 self.assertEqual(ch.sent[-1]["text"], "CORS + unit tests done.")
                 self.assertEqual(ch.sent[-1]["thread_id"], "thread-101")
+
+                # User reply inside Topic thread routes to #General (single-window), NOT Topic pane
+                ch.updates.append(
+                    InboundMessage(
+                        update_id=10,
+                        chat_id="c1",
+                        thread_id="thread-101",
+                        sender_id="u1",
+                        text="Also add unit tests",
+                    )
+                )
+                summary = daemon.run_once(now=530)
+                self.assertEqual(summary.events_processed, 1)
+                self.assertEqual(term.prompt_calls[-1]["name"], "hq-general")
+                self.assertIn("Also add unit tests", term.prompt_calls[-1]["text"])
             finally:
                 daemon.close()
 

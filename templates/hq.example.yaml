@@ -40,7 +40,9 @@ tuning:
   pane_blocked_notify_sec: 60
   deferred_approval_ttl_hours: 24
   general_idle_seal_minutes: 1440
-  general_max_turns: 200
+  general_max_turns: 60
+  general_rotate_transcript_mb: 8
+  general_rotate_quiet_minutes: 30
   general_nightly_reset: true
   general_rotation_quiet_minutes: 60
   transcript_busy_window_sec: 120

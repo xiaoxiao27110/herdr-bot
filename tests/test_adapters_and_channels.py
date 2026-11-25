@@ -232,7 +232,7 @@ class TestAdaptersAndChannels(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             closed_ch.send_message("should fail")
 
-    def test_daemon_decoupled_with_fake_adapter_and_sealed_topic_interception(self) -> None:
+    def test_daemon_decoupled_with_fake_adapter_and_single_window_routing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "acme-hq"
             hq_main(["init", str(hq_dir)])
@@ -261,52 +261,41 @@ class TestAdaptersAndChannels(unittest.TestCase):
                 cmd_runner=forbid_runner,
             )
             try:
+                # Thread message routes to #General and replies in main window (thread_id=None)
                 summary = daemon.run_once(now=1000)
                 self.assertEqual(summary.events_processed, 1)
                 self.assertEqual(ch.sent[-1]["text"], "Built feature!")
+                self.assertIsNone(ch.sent[-1]["thread_id"])
+                self.assertEqual(term.prompted[-1]["name"], "hq-general")
+                self.assertIsNone(daemon.db.get_session_by_thread("77"))
 
-                # Seal the topic via /done
-                ch.updates.append(
-                    InboundMessage(update_id=2, chat_id="c1", thread_id="77", sender_id="u1", text="/done")
+                # Even when a sealed Topic exists for thread "77", replying in that thread goes to #General
+                daemon.db.create_session(
+                    "task:repo:old-topic:900",
+                    "TOPIC",
+                    "fake-agent",
+                    status="sealed",
+                    channel_thread_id="77",
+                    topic_slug="old-topic",
+                    branch_name="hq/old-topic",
+                    now=900,
                 )
-                daemon.run_once(now=1010)
-                sess = daemon.db.get_session_by_thread("77")
-                self.assertEqual(sess["status"], "sealed")
-                self.assertEqual(
-                    ch.sent[-1]["text"],
-                    f"会话 `{sess['session_key']}` 已封口（工作树保留至夜间安全归档）。",
-                )
-
-                # Posting to sealed topic triggers 2-option inline keyboard instead of running agent
-                ch.updates.append(
-                    InboundMessage(update_id=3, chat_id="c1", thread_id="77", sender_id="u1", text="one more tweak")
-                )
-                s2 = daemon.run_once(now=1020)
-                self.assertEqual(s2.events_processed, 0)
-                self.assertEqual(
-                    ch.sent[-1]["text"],
-                    f"会话 `{sess['session_key']}` 已封口，请选择继续方式：",
-                )
-                self.assertNotIn("is sealed", ch.sent[-1]["text"])
-                self.assertIsNotNone(ch.sent[-1]["buttons"])
-                self.assertEqual(len(ch.sent[-1]["buttons"][0]), 2)
-
-                # Clicking option 2 unlocks to pinned and executes the pending message
                 ch.updates.append(
                     InboundMessage(
-                        update_id=4,
+                        update_id=2,
                         chat_id="c1",
                         thread_id="77",
                         sender_id="u1",
-                        text="",
-                        is_callback=True,
-                        callback_id="cb-1",
-                        callback_data=f"seal_pin:{sess['session_key']}",
+                        text="one more tweak",
                     )
                 )
-                s3 = daemon.run_once(now=1030)
-                self.assertEqual(s3.events_processed, 1)
-                self.assertEqual(daemon.db.get_session(sess["session_key"])["status"], "pinned")
+                s2 = daemon.run_once(now=1020)
+                self.assertEqual(s2.events_processed, 1)
+                self.assertEqual(ch.sent[-1]["text"], "Built feature!")
+                self.assertIsNone(ch.sent[-1]["thread_id"])
+                self.assertIsNone(ch.sent[-1]["buttons"])
+                self.assertEqual(term.prompted[-1]["name"], "hq-general")
+                self.assertEqual(daemon.db.get_session("task:repo:old-topic:900")["status"], "sealed")
             finally:
                 daemon.close()
 

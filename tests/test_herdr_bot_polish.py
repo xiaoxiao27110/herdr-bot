@@ -125,8 +125,14 @@ class TestHerdrBotPolish(unittest.TestCase):
                 sealed = daemon.seal_session(skey, reason="tests green", now=600)
                 self.assertEqual(sealed["status"], "sealed")
                 self.assertTrue(wt_path.exists())
-                self.assertEqual(ch.sent[-1]["thread_id"], "thread-101")
+                # v3: Topic seal pushes Chinese summary to main window (thread_id=None) and appends to today.md
+                self.assertIsNone(ch.sent[-1]["thread_id"])
+                self.assertIn("✅ 任务 auto-close 已完成", ch.sent[-1]["text"])
+                self.assertIn("hq/auto-close", ch.sent[-1]["text"])
                 self.assertIn("tests green", ch.sent[-1]["text"])
+                today_text = (hq_dir / "notes" / "today.md").read_text(encoding="utf-8")
+                self.assertIn("[WIP] Topic auto-close 已封口", today_text)
+                self.assertIn("hq/auto-close", today_text)
             finally:
                 daemon.close()
 

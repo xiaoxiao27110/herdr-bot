@@ -259,12 +259,17 @@ class TestMemoryFourSlots(unittest.TestCase):
                     payload={"text": "status?", "thread_id": None},
                     now=1100,
                 )
-                # 2) Channel event on #Topic -> loads both Active WIP index AND Task Progress (rate-limit)
+                # 2) Timer wake on #Topic -> loads both Active WIP index AND Task Progress (rate-limit)
                 daemon.db.enqueue_event(
-                    source="channel",
-                    dedupe_key="ch-topic-1",
-                    priority=10,
-                    payload={"text": "continue work", "thread_id": thread_id},
+                    source="timer_wake",
+                    dedupe_key="tw-topic-1",
+                    priority=20,
+                    payload={
+                        "timer_id": 1,
+                        "kind": "once",
+                        "session_key": sess["session_key"],
+                        "reason": "continue work",
+                    },
                     now=1101,
                 )
 

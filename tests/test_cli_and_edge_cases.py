@@ -140,10 +140,17 @@ class TestCLIAndEdgeCases(unittest.TestCase):
             )
             try:
                 daemon.run_once(now=1000)
-                # After 2 turns, next tick seals general:1
+                # After 2 turns, next tick (+10s) marks due="size" without interrupting active chat
                 daemon.run_once(now=1010)
-                s1 = daemon.db.get_session("general:1")
-                self.assertEqual(s1["status"], "sealed")
+                self.assertEqual(daemon.db.get_meta("general_rotation_due"), "size")
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
+
+                # After 30m continuous quiet -> rotates with handoff summary to general:2
+                s_rot = daemon.run_once(now=1000 + 30 * 60)
+                self.assertTrue(s_rot.general_rotated)
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "sealed")
+                self.assertEqual(daemon.db.get_session("general:2")["status"], "active")
+                self.assertEqual(daemon.db.get_meta("general_handoff_pending"), "1")
             finally:
                 daemon.close()
 
@@ -159,6 +166,25 @@ class TestCLIAndEdgeCases(unittest.TestCase):
             self.assertFalse(res.ok)
             self.assertTrue(any("AGENTS.md exceeds max lines" in v for v in res.violations))
             self.assertTrue(any("notes/today.md exceeds max lines" in v for v in res.violations))
+
+            # Task session_key `task:<repo>:<slug>:<ts>` must not false-positive as logical path,
+            # while real broken `<repo>:<relpath>` references are still caught.
+            (hq_dir / "AGENTS.md").write_text("# Index\n", encoding="utf-8")
+            (hq_dir / "notes" / "today.md").write_text("# Today\n", encoding="utf-8")
+            (hq_dir / "tasks" / "demo-slug.md").write_text(
+                "# Task: demo-slug\n\n- session_key: task:gateway-svc:demo-slug:1700000000\n",
+                encoding="utf-8",
+            )
+            res_ok = run_memory_guard(hq_dir)
+            self.assertTrue(res_ok.ok, msg=res_ok.violations)
+
+            (hq_dir / "tasks" / "demo-slug.md").write_text(
+                "# Task: demo-slug\n\n- see `gateway-svc:missing/file.py`\n",
+                encoding="utf-8",
+            )
+            res_broken = run_memory_guard(hq_dir)
+            self.assertFalse(res_broken.ok)
+            self.assertTrue(any("broken logical path 'gateway-svc:missing/file.py'" in v for v in res_broken.violations))
 
     def test_cli_pin_unpin_status_doctor_sync_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

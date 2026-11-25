@@ -189,12 +189,18 @@ def handle_hook_event(
             and (event_type == "PreInvocation" or bool(user_prompt))
         ):
             handoff_text = (db.get_meta("general_handoff_summary") or "").strip()
+            handoff_reason = (db.get_meta("general_handoff_reason") or "night").strip()
             db.delete_meta("general_handoff_pending")
             if handoff_text:
+                header = (
+                    "[昨日会话交接摘要]"
+                    if handoff_reason in {"night", "1", ""}
+                    else "[上一轮会话交接摘要]"
+                )
                 inject_steps.append(
                     {
                         "systemMessage": {
-                            "systemMessage": f"[昨日会话交接摘要]\n{handoff_text}"
+                            "systemMessage": f"{header}\n{handoff_text}"
                         }
                     }
                 )

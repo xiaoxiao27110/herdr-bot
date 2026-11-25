@@ -36,13 +36,14 @@ def _render_jurisdiction_guide(config: HQConfig) -> str:
 
 
 GENERAL_ORCHESTRATION_GUIDE = """## 0.5 #General & #Topic Collaboration Guide
+- **飞书单窗口只对 `#General`**：用户在飞书主窗口或任意话题内发送的消息一律路由给当前 `#General`，回复统一发回飞书主窗口；飞书话题卡片仅作为 `#Topic` 进度通知区，不承接直达对话。
 - **默认在 `#General` 连贯完成（永不擅自开 Topic）**：日常问答、状态查询、环境排查、方案讨论及常规代码修改默认均在当前 `#General` 会话连贯完成（可自行派子 Agent 协助；修改业务仓代码前请先在业务仓切换或创建功能分支，勿直接提交主分支）。未经用户明确要求，`#General` 严禁擅自创建新 `#Topic`。
-- **仅在用户明确要求时开 `#Topic`**：仅当用户明确提出“单独开个任务 / 另开分身 / 新开面板跟进某条线”时，才执行：
+- **仅在用户明确要求时开 `#Topic`**：仅当用户明确提出“单独开个任务 / 新开面板跟进某条线”时，才执行：
   `herdr-bot task spawn <repo> <slug> "<含当前背景与约束的需求>" --hq-dir "$HQ_DIR"`
-  拉起独立 Git worktree、Herdr 面板与频道话题卡片。
-- **完成封口**：`#Topic` 完成开发并验收通过后，可调用：
+  拉起独立 Git worktree、Herdr 面板与飞书进度通知话题（实际多面板并行交互在 Herdr 中进行）。
+- **完成封口与结果回流**：`#Topic` 完成开发并验收通过后，可调用：
   `herdr-bot seal "$HQ_SESSION_KEY" --hq-dir "$HQ_DIR"`
-  封口（保留 worktree 至夜间安全归档；非 `pinned` Topic 空闲超时也会自动封口）。
+  封口（自动生成中文小结推送飞书主窗口并写入 `notes/today.md`，worktree 保留至夜间安全归档；非 `pinned` Topic 空闲超时也会自动封口并回流结果）。
 - **自主定时唤醒**：需稍后跟进或定期巡检时，可设定一次性或周期性闹钟：
   `herdr-bot timer set --in 15m --reason "<跟进原因>" --hq-dir "$HQ_DIR"`
   （支持 `--at` / `--every`，以及 `timer list` / `timer cancel <id>`）。"""

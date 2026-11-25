@@ -1,8 +1,10 @@
-"""Tests for v2 interaction design: General-first UX, busy queue & fork card,
-60-minute quiet daily rotation + timer migration + handoff summary, and pane recovery."""
+"""Tests for v3 interaction design: Feishu single-window routing to #General,
+button-less busy batch queuing & merging, Topic seal result reflow,
+daytime + nightly quiet rotation with handoff summary, and pane recovery."""
 
 from __future__ import annotations
 
+from datetime import datetime
 import io
 import json
 import os
@@ -14,8 +16,9 @@ from unittest.mock import patch
 
 from hq_pilot.channels.base import InboundMessage
 from hq_pilot.cli import main as hq_main
-from hq_pilot.config import load_config
+from hq_pilot.config import load_config, update_tuning_value
 from hq_pilot.daemon import GENERAL_PANE_NAME, HQDaemon
+from hq_pilot.guards import run_memory_guard
 from hq_pilot.hook_cli import handle_hook_event
 from hq_pilot.prompt_builder import build_prompt
 
@@ -57,7 +60,7 @@ class IndicatorFakeChannel(FakeChannel):
 
 
 class TestV2InteractionFlows(unittest.TestCase):
-    def test_guides_forbid_unsolicited_auto_topic(self) -> None:
+    def test_guides_forbid_unsolicited_auto_topic_and_state_single_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "demo-hq"
             hq_main(["init", str(hq_dir)])
@@ -65,9 +68,13 @@ class TestV2InteractionFlows(unittest.TestCase):
             prompt = build_prompt(hq_dir, cfg, {"text": "hello"})
             self.assertIn("未经用户明确要求", prompt)
             self.assertIn("严禁擅自创建新 `#Topic`", prompt)
+            self.assertIn("飞书单窗口只对 `#General`", prompt)
+            self.assertIn("进度通知区", prompt)
 
             agents_md = (hq_dir / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("未经用户明确要求永不擅自新开 `#Topic`", agents_md)
+            self.assertIn("飞书单窗口只对 `#General`", agents_md)
+            self.assertIn("进度通知区", agents_md)
 
     def test_jurisdiction_guide_in_prompt_and_agents_scaffolds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,7 +134,7 @@ class TestV2InteractionFlows(unittest.TestCase):
             self.assertIn("严禁越界修改或自我迭代", init_agents)
             self.assertIn("`herdr-bot` / `herdr`", init_agents)
 
-            # 4) `hq setup --non-interactive` scaffold AGENTS.md includes Role & Jurisdiction
+            # 4) `hq setup --non-interactive` scaffold AGENTS.md includes Role & Jurisdiction + single-window guide
             repo_a = Path(tmp) / "svc-a"
             _init_git_repo(repo_a)
             setup_hq = Path(tmp) / "setup-hq"
@@ -154,12 +161,98 @@ class TestV2InteractionFlows(unittest.TestCase):
             self.assertIn("管辖范围外只读参考", setup_agents)
             self.assertIn("严禁越界修改或自我迭代", setup_agents)
             self.assertIn("`herdr-bot` / `herdr`", setup_agents)
+            self.assertIn("飞书单窗口只对 `#General`", setup_agents)
 
-    def test_busy_general_parks_fifo_and_updates_card_when_idle(self) -> None:
+    def test_feishu_single_window_routes_all_topic_replies_to_general_main_window(self) -> None:
+        """Replies inside active/sealed/archived/unknown Feishu threads all route to #General and reply in main window."""
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "demo-hq"
             hq_main(["init", str(hq_dir)])
-            term = StatusAwareTerminal(reply_fn=lambda name, text: f"DONE:{text[:24]}")
+            term = StatusAwareTerminal(reply_fn=lambda name, text: f"GEN_OK:{name}")
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                # Seed active, sealed, and archived Topic sessions with Feishu thread_ids
+                daemon.db.create_session(
+                    "task:gw:active-t:100",
+                    "TOPIC",
+                    "agy",
+                    status="active",
+                    channel_thread_id="th-active",
+                    topic_slug="active-t",
+                    pane_name="hq-active-t",
+                    now=100,
+                )
+                daemon.db.create_session(
+                    "task:gw:sealed-t:100",
+                    "TOPIC",
+                    "agy",
+                    status="sealed",
+                    channel_thread_id="th-sealed",
+                    topic_slug="sealed-t",
+                    pane_name="hq-sealed-t",
+                    now=100,
+                )
+                daemon.db.create_session(
+                    "task:gw:arch-t:100",
+                    "TOPIC",
+                    "agy",
+                    status="sealed",
+                    channel_thread_id="th-archived",
+                    topic_slug="arch-t",
+                    branch_name="hq/arch-t",
+                    pane_name="hq-arch-t",
+                    now=100,
+                )
+                daemon.db.archive_session("task:gw:arch-t:100", now=150)
+
+                cases = [
+                    (1, "th-active", "活跃话题里回一句"),
+                    (2, "th-sealed", "已封口话题里回一句"),
+                    (3, "th-archived", "已归档话题里回一句"),
+                    (4, "th-unknown", "未知话题里回一句"),
+                ]
+                for uid, tid, text in cases:
+                    ch.inbound.append(
+                        InboundMessage(uid, "c1", tid, "u1", text, message_id=f"m-sw-{uid}")
+                    )
+                    s = daemon.run_once(now=1000 + uid * 10)
+                    self.assertEqual(s.events_processed, 1)
+                    self.assertEqual(term.prompt_calls[-1]["name"], GENERAL_PANE_NAME)
+                    self.assertIn(text, term.prompt_calls[-1]["text"])
+                    # Indicator and final card update both target main window (thread_id=None)
+                    self.assertIsNone(ch.card_updates[-1]["thread_id"])
+                    self.assertEqual(ch.card_updates[-1]["text"], f"GEN_OK:{GENERAL_PANE_NAME}")
+
+                # Zero orphan thread:* sessions created, zero sealed/archived interception cards sent
+                self.assertEqual(ch.sent, [])
+                self.assertFalse(
+                    any(s["session_key"].startswith("thread:") for s in daemon.db.list_sessions())
+                )
+                self.assertEqual(daemon.db.get_session("task:gw:sealed-t:100")["status"], "sealed")
+                self.assertEqual(daemon.db.get_session("task:gw:arch-t:100")["status"], "archived")
+            finally:
+                daemon.close()
+
+    def test_feishu_and_local_tty_concurrent_input_queues_feishu_without_pushing_tty(self) -> None:
+        """When local Herdr TTY user is chatting with General, Feishu messages queue & merge; TTY Stop stays silent in Feishu."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            tfile = Path(tmp) / "gen_tty.jsonl"
+            tfile.write_text(
+                json.dumps({"type": "USER_INPUT", "content": "<USER_REQUEST>终端现场查一下日志</USER_REQUEST>"}, ensure_ascii=False)
+                + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "content": "终端本地回复，不推飞书"}, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+            term = StatusAwareTerminal(reply_fn=lambda name, text: "已合并处理你的飞书消息")
             ch = IndicatorFakeChannel()
             daemon = HQDaemon(
                 hq_dir,
@@ -169,56 +262,368 @@ class TestV2InteractionFlows(unittest.TestCase):
             )
             try:
                 sess = daemon._ensure_general_session(1000)
+                daemon.db.update_session(
+                    sess["session_key"],
+                    agent_session_id="conv-tty-1",
+                    transcript_path=str(tfile),
+                    turn_count=1,
+                )
+                # Local TTY user starts a turn -> pane becomes working
+                term.set_pane(GENERAL_PANE_NAME, status="working")
+                with patch.dict(os.environ, {"HQ_SESSION_KEY": sess["session_key"]}):
+                    pre = handle_hook_event(
+                        "agy",
+                        {
+                            "hookEventName": "PreInvocation",
+                            "conversationId": "conv-tty-1",
+                            "lastUserInput": "<USER_REQUEST>终端现场查一下日志</USER_REQUEST>",
+                        },
+                        hq_dir=hq_dir,
+                        channel=ch,
+                        now=1005,
+                    )
+                self.assertEqual(pre["pinned_reason"], "manual_input")
+
+                # Concurrent Feishu messages arrive while TTY turn is working -> queued in 1 batch card
+                ch.inbound.append(InboundMessage(1, "c1", None, "u1", "飞书消息 A", message_id="m-tty-1"))
+                ch.inbound.append(InboundMessage(2, "c1", None, "u1", "飞书消息 B", message_id="m-tty-2"))
+                s1 = daemon.run_once(now=1010)
+                self.assertEqual(s1.events_parked, 2)
+                self.assertEqual(len(ch.sent), 1)
+                self.assertIsNone(ch.sent[0]["buttons"])
+                self.assertEqual(len(term.prompt_calls), 0)
+
+                # Local TTY turn finishes -> Stop hook must NOT push TTY reply to Feishu
+                with patch.dict(os.environ, {"HQ_SESSION_KEY": sess["session_key"]}):
+                    stop = handle_hook_event(
+                        "agy",
+                        {
+                            "hookEventName": "Stop",
+                            "conversationId": "conv-tty-1",
+                            "transcriptPath": str(tfile),
+                        },
+                        hq_dir=hq_dir,
+                        channel=ch,
+                        now=1020,
+                    )
+                self.assertFalse(stop["reply_pushed"])
+                self.assertEqual(len(ch.sent), 1)  # Still only the 1 queuing card
+
+                # Pane returns idle & transcript quiet -> Feishu batch merges and dispatches in 1 turn
+                term.set_pane(GENERAL_PANE_NAME, status="idle")
+                daemon.db.set_meta(f"transcript_mtime:{sess['session_key']}", "1020", now=1020)
+                s2 = daemon.run_once(now=1200)
+                self.assertEqual(s2.events_processed, 2)
+                self.assertEqual(len(term.prompt_calls), 1)
+                merged_prompt = term.prompt_calls[0]["text"]
+                self.assertIn("[排队期间你陆续发来以下 2 条消息，请一并回复]", merged_prompt)
+                self.assertIn("飞书消息 A", merged_prompt)
+                self.assertIn("飞书消息 B", merged_prompt)
+                self.assertEqual(ch.card_updates[-1]["message_id"], ch.sent[0]["id"])
+                self.assertEqual(ch.card_updates[-1]["text"], "已合并处理你的飞书消息")
+                self.assertIsNone(ch.card_updates[-1]["thread_id"])
+            finally:
+                daemon.close()
+
+    def test_busy_general_batches_messages_in_single_card_and_merges_when_idle(self) -> None:
+        """Busy General sends 1 button-less card, updates count in-place, persists across daemon restart,
+        merges chronologically (no prefix if single), never shows '轮到你了', and keeps timers separate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            term = StatusAwareTerminal(reply_fn=lambda name, text: f"DONE:{text[:40]}")
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                sess = daemon._ensure_general_session(1000)
+                daemon.db.update_session(sess["session_key"], turn_count=1)
                 daemon.db.set_meta(f"current_work_hint:{sess['session_key']}", "v38 镜像注册", now=1000)
                 term.set_pane(GENERAL_PANE_NAME, status="working")
 
-                # Two messages arrive while General is working
+                t1 = 1700000400  # deterministic timestamp
+                t2 = t1 + 120
+                t3 = t1 + 180
+
+                # Msg 1 arrives -> 1 button-less card in main window
                 ch.inbound.append(InboundMessage(1, "c1", None, "u1", "第一条排队消息", message_id="m1"))
-                ch.inbound.append(InboundMessage(2, "c1", None, "u1", "第二条排队消息", message_id="m2"))
-                s1 = daemon.run_once(now=1010)
-                self.assertEqual(s1.events_parked, 2)
-                self.assertEqual(len(term.prompt_calls), 0)
+                s1 = daemon.run_once(now=t1)
+                self.assertEqual(s1.events_parked, 1)
+                self.assertEqual(len(ch.sent), 1)
+                self.assertIsNone(ch.sent[0]["buttons"])
+                self.assertIsNone(ch.sent[0]["thread_id"])
+                self.assertEqual(
+                    ch.sent[0]["text"],
+                    "⏳ 总管正在处理「v38 镜像注册」，你的消息已排队，忙完后一并回复",
+                )
+                card1_id = ch.sent[0]["id"]
 
-                waiting = daemon.db.list_waiting_events()
-                self.assertEqual(len(waiting), 2)
+                # Msg 2 arrives -> same batch, updates card1 in-place with count=2
+                ch.inbound.append(InboundMessage(2, "c1", "th-any", "u1", "第二条排队消息", message_id="m2"))
+                s2 = daemon.run_once(now=t2)
+                self.assertEqual(s2.events_parked, 1)
+                self.assertEqual(len(ch.sent), 1)  # Still only 1 card!
+                self.assertEqual(ch.card_updates[-1]["message_id"], card1_id)
+                self.assertEqual(
+                    ch.card_updates[-1]["text"],
+                    "⏳ 总管正在处理「v38 镜像注册」，已收到 2 条，忙完后一并回复",
+                )
+
+                # Timer event also arrives while busy -> parked independently, NOT mixed into user batch
+                daemon.db.create_timer(
+                    reason="后台巡检定时任务",
+                    fire_at=t2 + 10,
+                    kind="once",
+                    session_key=sess["session_key"],
+                    now=t2,
+                )
+                daemon.run_once(now=t2 + 10)
+                self.assertEqual(len(ch.sent), 1)  # Timer never sends user queuing card
+            finally:
+                daemon.close()
+
+            # Simulate daemon restart -> Msg 3 joins persisted batch & refreshes SAME card1_id in-place!
+            daemon2 = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                ch.inbound.append(InboundMessage(3, "c1", None, "u1", "第三条排队消息", message_id="m3"))
+                s3 = daemon2.run_once(now=t3)
+                self.assertEqual(s3.events_parked, 1)
+                self.assertEqual(len(ch.sent), 1)
+                self.assertEqual(ch.card_updates[-1]["message_id"], card1_id)
+                self.assertEqual(
+                    ch.card_updates[-1]["text"],
+                    "⏳ 总管正在处理「v38 镜像注册」，已收到 3 条，忙完后一并回复",
+                )
+
+                # General becomes idle -> entire 3-msg batch merges into 1 turn & refreshes card1 in-place
+                term.set_pane(GENERAL_PANE_NAME, status="idle")
+                s4 = daemon2.run_once(now=t3 + 30)
+                self.assertEqual(s4.events_processed, 3)
+                self.assertEqual(len(term.prompt_calls), 1)
+                expected_merged = "\n".join(
+                    [
+                        "[排队期间你陆续发来以下 3 条消息，请一并回复]",
+                        f"1. ({datetime.fromtimestamp(t1).strftime('%H:%M')}) 第一条排队消息",
+                        f"2. ({datetime.fromtimestamp(t2).strftime('%H:%M')}) 第二条排队消息",
+                        f"3. ({datetime.fromtimestamp(t3).strftime('%H:%M')}) 第三条排队消息",
+                    ]
+                )
+                self.assertEqual(term.prompt_calls[0]["text"], expected_merged)
+                self.assertNotIn("后台巡检定时任务", term.prompt_calls[0]["text"])
+
+                # Card1 refreshed directly to final reply, NEVER "轮到你了"
+                card1_texts = [u["text"] for u in ch.card_updates if u["message_id"] == card1_id]
+                self.assertFalse(any("轮到你了" in txt for txt in card1_texts))
+                self.assertTrue(card1_texts[-1].startswith("DONE:"))
+
+                # All 3 channel events are done; timer_wake is still waiting independently
+                waiting_after = daemon2.db.list_waiting_events()
+                self.assertEqual(len(waiting_after), 1)
+                self.assertEqual(waiting_after[0].source, "timer_wake")
+
+                # Next tick processes the independent timer_wake (sends timer reply to main window)
+                s5 = daemon2.run_once(now=t3 + 60)
+                self.assertEqual(s5.events_processed, 1)
+                self.assertIn("后台巡检定时任务", term.prompt_calls[-1]["text"])
+                self.assertEqual(daemon2.db.list_waiting_events(), [])
+                self.assertEqual(len(ch.sent), 2)  # card1 + timer_wake reply
+
+                # Single-message batch sends raw user text WITHOUT merge prefix
+                term.set_pane(GENERAL_PANE_NAME, status="working")
+                ch.inbound.append(InboundMessage(4, "c1", None, "u1", "单独一条排队消息", message_id="m4"))
+                daemon2.run_once(now=t3 + 90)
+                self.assertEqual(len(ch.sent), 3)
+                card2_id = ch.sent[-1]["id"]
+                self.assertIsNone(ch.sent[-1]["buttons"])
+                term.set_pane(GENERAL_PANE_NAME, status="idle")
+                daemon2.run_once(now=t3 + 100)
+                self.assertEqual(term.prompt_calls[-1]["text"], "单独一条排队消息")
+                self.assertNotIn("排队期间你陆续发来", term.prompt_calls[-1]["text"])
+                self.assertEqual(ch.card_updates[-1]["message_id"], card2_id)
+                self.assertTrue(ch.card_updates[-1]["text"].startswith("DONE:单独一条排队消息"))
+            finally:
+                daemon2.close()
+
+    def test_new_message_during_batch_dispatch_opens_new_batch_and_card(self) -> None:
+        """Once batch 1 starts dispatching, a new message arriving while General is still busy opens batch 2 + card 2."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            ch = IndicatorFakeChannel()
+            daemon_ref = {}
+            injected = {"done": False}
+
+            class MidDispatchArrivalTerminal(StatusAwareTerminal):
+                def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+                    if not injected["done"] and "批次一消息A" in text:
+                        injected["done"] = True
+                        # While batch 1 is actively executing (daemon_waiting=1), msg 3 arrives!
+                        d = daemon_ref["daemon"]
+                        d._handle_inbound(
+                            InboundMessage(3, "c1", None, "u1", "投递期间新消息", message_id="m-mid"),
+                            now=1035,
+                        )
+                        evs = d.db.claim_next_events(limit=5, now=1035)
+                        for ev in evs:
+                            try:
+                                d._process_event(ev, 1035)
+                            except Exception:
+                                pass
+                    return super().prompt_agent(name, text, wait=wait, timeout_ms=timeout_ms)
+
+            term = MidDispatchArrivalTerminal(reply_fn=lambda name, text: f"OK:{text[:24]}")
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            daemon_ref["daemon"] = daemon
+            try:
+                sess = daemon._ensure_general_session(1000)
+                daemon.db.update_session(sess["session_key"], turn_count=1)
+                term.set_pane(GENERAL_PANE_NAME, status="working")
+
+                # Batch 1: 2 messages parked -> card 1
+                ch.inbound.append(InboundMessage(1, "c1", None, "u1", "批次一消息A", message_id="m-b1-a"))
+                ch.inbound.append(InboundMessage(2, "c1", None, "u1", "批次一消息B", message_id="m-b1-b"))
+                daemon.run_once(now=1010)
+                self.assertEqual(len(ch.sent), 1)
+                card1_id = ch.sent[0]["id"]
+
+                # Batch 1 dispatches; mid-dispatch msg 3 arrives -> opens NEW batch 2 & NEW card 2!
+                term.set_pane(GENERAL_PANE_NAME, status="idle")
+                s_dispatch = daemon.run_once(now=1030)
+                self.assertEqual(s_dispatch.events_processed, 2)
                 self.assertEqual(len(ch.sent), 2)
-                self.assertIn("v38 镜像注册", ch.sent[0]["text"])
-                btn_labels = [b.text for b in ch.sent[0]["buttons"][0]]
-                self.assertEqual(btn_labels, ["等它忙完", "另开分身并行"])
+                card2_id = ch.sent[1]["id"]
+                self.assertNotEqual(card2_id, card1_id)
+                self.assertIsNone(ch.sent[1]["buttons"])
 
-                # User clicks "等它忙完" on message 1 -> updates card in-place, stays parked while working
-                ev1_id = waiting[0].id
-                card1_id = waiting[0].payload["busy_card_msg_id"]
+                # Batch 1 events are done; msg 3 is parked in a distinct waiting batch
+                waiting = daemon.db.list_waiting_events()
+                self.assertEqual(len(waiting), 1)
+                self.assertEqual(waiting[0].payload["text"], "投递期间新消息")
+                self.assertEqual(waiting[0].payload["busy_card_msg_id"], card2_id)
+
+                # Next tick dispatches batch 2 and refreshes card 2 in-place
+                s_next = daemon.run_once(now=1050)
+                self.assertEqual(s_next.events_processed, 1)
+                self.assertEqual(term.prompt_calls[-1]["text"], "投递期间新消息")
+                self.assertEqual(ch.card_updates[-1]["message_id"], card2_id)
+                self.assertEqual(ch.card_updates[-1]["text"], "OK:投递期间新消息")
+            finally:
+                daemon.close()
+
+    def test_blocked_general_sends_approval_queue_card_without_buttons(self) -> None:
+        """When agy is blocked awaiting approval, queuing card prompts opening herdr with no buttons."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            term = StatusAwareTerminal(reply_fn=lambda name, text: "已继续完成")
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                daemon._ensure_general_session(1000)
+                term.set_pane(GENERAL_PANE_NAME, status="blocked")
+
+                ch.inbound.append(InboundMessage(1, "c1", None, "u1", "查一下状态", message_id="m-blk-1"))
+                s1 = daemon.run_once(now=1010)
+                self.assertEqual(s1.events_parked, 1)
+                self.assertEqual(len(ch.sent), 1)
+                self.assertIsNone(ch.sent[0]["buttons"])
+                self.assertIsNone(ch.sent[0]["thread_id"])
+                self.assertIn("总管正在等待审批，请打开 herdr 处理；你的消息已排队", ch.sent[0]["text"])
+                card_id = ch.sent[0]["id"]
+
+                # Second message while still blocked updates card count in-place
+                ch.inbound.append(InboundMessage(2, "c1", None, "u1", "顺便看下日志", message_id="m-blk-2"))
+                daemon.run_once(now=1020)
+                self.assertEqual(len(ch.sent), 1)
+                self.assertEqual(ch.card_updates[-1]["message_id"], card_id)
+                self.assertIn("总管正在等待审批，请打开 herdr 处理", ch.card_updates[-1]["text"])
+                self.assertIn("已收到 2 条", ch.card_updates[-1]["text"])
+            finally:
+                daemon.close()
+
+    def test_legacy_busy_wait_and_busy_fork_callbacks_reply_deprecated_without_fork(self) -> None:
+        """Clicking legacy busy_wait/busy_fork buttons replies deprecated notice and NEVER spawns a fork."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            term = StatusAwareTerminal()
+            term.set_pane(GENERAL_PANE_NAME, status="working")
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                daemon._ensure_general_session(3000)
+                self.assertFalse(hasattr(daemon, "_spawn_fork_from_general"))
+
+                ch.inbound.append(
+                    InboundMessage(1, "c1", None, "u1", "帮我查一下接口", message_id="m-leg")
+                )
+                daemon.run_once(now=3010)
+                waiting = daemon.db.list_waiting_events()
+                self.assertEqual(len(waiting), 1)
+                ev_id = waiting[0].id
+
+                # Click legacy busy_wait and busy_fork callbacks
+                ch.inbound.append(
+                    InboundMessage(
+                        2,
+                        "c1",
+                        "th-old",
+                        "u1",
+                        "",
+                        is_callback=True,
+                        callback_id="cb-w",
+                        callback_data=f"busy_wait:{ev_id}",
+                        message_id="old-card-1",
+                    )
+                )
                 ch.inbound.append(
                     InboundMessage(
                         3,
                         "c1",
-                        None,
+                        "th-old",
                         "u1",
                         "",
                         is_callback=True,
-                        callback_data=f"busy_wait:{ev1_id}",
-                        message_id=card1_id,
+                        callback_id="cb-f",
+                        callback_data=f"busy_fork:{ev_id}",
+                        message_id="old-card-1",
                     )
                 )
-                daemon.run_once(now=1020)
-                self.assertTrue(any("已确认排队" in u["text"] for u in ch.card_updates))
-                self.assertEqual(len(daemon.db.list_waiting_events()), 2)
+                daemon.run_once(now=3020)
 
-                # General becomes idle -> strictly 1 FIFO message promoted & processed per tick!
-                term.set_pane(GENERAL_PANE_NAME, status="idle")
-                s2 = daemon.run_once(now=1030)
-                self.assertEqual(s2.events_processed, 1)
+                self.assertEqual(ch.sent[-2]["text"], "该按钮已失效，消息已在排队")
+                self.assertIsNone(ch.sent[-2]["thread_id"])
+                self.assertEqual(ch.sent[-1]["text"], "该按钮已失效，消息已在排队")
+                self.assertIsNone(ch.sent[-1]["thread_id"])
+
+                # Zero TOPIC sessions spawned; waiting event still intact in queue
+                topics = [s for s in daemon.db.list_sessions() if s["track"] == "TOPIC"]
+                self.assertEqual(topics, [])
                 self.assertEqual(len(daemon.db.list_waiting_events()), 1)
-                # Card 1 updated in-place first with "轮到你了" then with final reply
-                card1_updates = [u["text"] for u in ch.card_updates if u["message_id"] == card1_id]
-                self.assertTrue(any("轮到你了" in t for t in card1_updates))
-                self.assertTrue(card1_updates[-1].startswith("DONE:"))
-
-                # Next tick processes the 2nd queued message
-                s3 = daemon.run_once(now=1040)
-                self.assertEqual(s3.events_processed, 1)
-                self.assertEqual(len(daemon.db.list_waiting_events()), 0)
             finally:
                 daemon.close()
 
@@ -268,32 +673,20 @@ class TestV2InteractionFlows(unittest.TestCase):
             finally:
                 daemon.close()
 
-    def test_busy_fork_callback_spawns_parallel_topic_with_general_context(self) -> None:
+    def test_daytime_rotation_by_turns_and_transcript_size_waits_30m_quiet(self) -> None:
+        """Daytime turns>=60 or transcript>=8MB marks due='size', does not interrupt active chat,
+        waits 30m quiet, rotates with handoff summary & timer migration, and supports config set hot-reload."""
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "demo-hq"
             hq_main(["init", str(hq_dir)])
-            repo_dir = Path(tmp) / "gateway-svc"
-            _init_git_repo(repo_dir)
-            (hq_dir / "hq.yaml").write_text(
-                "version: 1\nproject_name: demo\nrepos:\n  gateway-svc:\n    git_url: ''\n    default_branch: main\n",
+            tfile1 = Path(tmp) / "gen_turns.jsonl"
+            tfile1.write_text(
+                json.dumps({"type": "USER_INPUT", "content": "白天推进方案"}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "content": "已完成第一阶段排查"}) + "\n",
                 encoding="utf-8",
             )
-            (hq_dir / ".hq" / "local.yaml").write_text(
-                f"python_bin: {sys.executable}\nrepo_paths:\n  gateway-svc: {repo_dir}\n",
-                encoding="utf-8",
-            )
-            (hq_dir / "memory" / "user-notes.md").write_text(
-                "# User Notes\n- 只允许单向升级，禁止降级\n", encoding="utf-8"
-            )
-            gen_tfile = Path(tmp) / "gen_ctx.jsonl"
-            gen_tfile.write_text(
-                json.dumps({"type": "USER_INPUT", "content": "容器无状态幂等"}) + "\n"
-                + json.dumps({"type": "PLANNER_RESPONSE", "content": "已确认容器丢失自动重建方案"}) + "\n",
-                encoding="utf-8",
-            )
-
-            term = StatusAwareTerminal()
-            term.set_pane(GENERAL_PANE_NAME, status="working")
+            term = StatusAwareTerminal(reply_fn=lambda name, text: f"REPLY:{text[:24]}")
+            term.set_pane(GENERAL_PANE_NAME, status="idle")
             ch = IndicatorFakeChannel()
             daemon = HQDaemon(
                 hq_dir,
@@ -302,63 +695,240 @@ class TestV2InteractionFlows(unittest.TestCase):
                 channel=ch,
             )
             try:
-                gen = daemon._ensure_general_session(3000)
+                # --- Part A: Turn count reaches default general_max_turns (60) ---
+                self.assertEqual(daemon.config.tuning.general_max_turns, 60)
+                self.assertEqual(daemon.config.tuning.general_rotate_transcript_mb, 8)
+                self.assertEqual(daemon.config.tuning.general_rotate_quiet_minutes, 30)
+
+                gen1 = daemon._ensure_general_session(1000)
                 daemon.db.update_session(
-                    gen["session_key"],
-                    agent_session_id="conv-g1",
-                    transcript_path=str(gen_tfile),
+                    gen1["session_key"],
+                    agent_session_id="conv-day-turns",
+                    transcript_path=str(tfile1),
+                    reply_line_offset=2,
+                    turn_count=60,
+                    last_active_at=1000,
+                )
+                tm = daemon.db.create_timer(
+                    reason="跟进构建进度",
+                    fire_at=99999,
+                    kind="once",
+                    session_key="general:1",
+                    now=1000,
                 )
 
-                ch.inbound.append(
-                    InboundMessage(
-                        1,
-                        "c1",
-                        None,
-                        "u1",
-                        "帮我把 gateway-svc 的健康检查接口补上单测",
-                        message_id="m-fork",
-                    )
-                )
-                daemon.run_once(now=3010)
-                waiting = daemon.db.list_waiting_events()
-                self.assertEqual(len(waiting), 1)
-                ev_id = waiting[0].id
-                card_id = waiting[0].payload["busy_card_msg_id"]
+                # User keeps chatting at t=1000 + 10m -> marked due='size' but NOT rotated!
+                daemon.run_once(now=1000 + 10 * 60)
+                self.assertEqual(daemon.db.get_meta("general_rotation_due"), "size")
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
 
-                # User clicks "另开分身并行"
-                ch.inbound.append(
-                    InboundMessage(
-                        2,
-                        "c1",
-                        None,
-                        "u1",
-                        "",
-                        is_callback=True,
-                        callback_data=f"busy_fork:{ev_id}",
-                        message_id=card_id,
-                    )
-                )
-                daemon.run_once(now=3020)
+                ch.inbound.append(InboundMessage(1, "c1", None, "u1", "我还在继续聊", message_id="m-chat"))
+                daemon.run_once(now=1000 + 25 * 60)
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
 
-                # Original waiting event marked done, new TOPIC spawned with context + constraints
-                self.assertEqual(daemon.db.get_event(ev_id)["status"], "done")
-                topics = [
-                    s for s in daemon.db.list_sessions() if s["track"] == "TOPIC"
-                ]
-                self.assertEqual(len(topics), 1)
-                self.assertEqual(topics[0]["repo_name"], "gateway-svc")
-                self.assertTrue(Path(topics[0]["worktree_path"]).exists())
-                # Verify fork prompt carried General's recent context & user-notes constraint
-                fork_prompt_sent = term.prompt_calls[-1]["text"]
-                if "请读取并执行指令文件" in fork_prompt_sent:
-                    # Read materialized file
-                    pfiles = list((hq_dir / ".hq" / "prompts").glob("*.md"))
-                    self.assertTrue(len(pfiles) >= 1)
-                    fork_prompt_sent = pfiles[-1].read_text(encoding="utf-8")
-                self.assertIn("已确认容器丢失自动重建方案", fork_prompt_sent)
-                self.assertIn("只允许单向升级，禁止降级", fork_prompt_sent)
-                self.assertIn("健康检查接口补上单测", fork_prompt_sent)
-                self.assertTrue(any("已另开并行分身" in u["text"] for u in ch.card_updates))
+                # 29m after last chat (t=1000+25m+29m) -> still active!
+                daemon.run_once(now=1000 + 54 * 60)
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
+
+                # 30m continuous quiet after last chat (t=1000+25m+30m) -> rotates!
+                s_rot = daemon.run_once(now=1000 + 55 * 60)
+                self.assertTrue(s_rot.general_rotated)
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "sealed")
+                self.assertEqual(daemon.db.get_session("general:2")["status"], "active")
+                self.assertEqual(daemon.db.get_timer(tm["id"])["session_key"], "general:2")
+                self.assertIsNone(daemon.db.get_meta("general_rotation_due"))
+
+                # First Feishu message after daytime rotation carries handoff summary + 1-time subtle notice
+                ch.inbound.append(InboundMessage(2, "c1", None, "u1", "继续刚才的", message_id="m-after-day"))
+                daemon.run_once(now=1000 + 56 * 60)
+                self.assertIn("上一轮会话交接摘要", term.prompt_calls[-1]["text"])
+                self.assertIn("已完成第一阶段排查", term.prompt_calls[-1]["text"])
+                self.assertIn("当前对话上下文较长", ch.card_updates[-1]["text"])
+
+                # --- Part B: Transcript file size >= 8MB triggers daytime rotation after hot-adjusted quiet window ---
+                big_tfile = Path(tmp) / "gen_big.jsonl"
+                with big_tfile.open("wb") as fh:
+                    fh.truncate(8 * 1024 * 1024 + 64)
+                os.utime(big_tfile, (1000 + 56 * 60, 1000 + 56 * 60))
+
+                daemon.db.update_session(
+                    "general:2",
+                    agent_session_id="conv-day-size",
+                    transcript_path=str(big_tfile),
+                    turn_count=5,
+                    last_active_at=1000 + 56 * 60,
+                )
+                # Hot-adjust general_rotate_quiet_minutes -> 15 via config set
+                update_tuning_value(hq_dir, "general_rotate_quiet_minutes", "15")
+
+                # At +10m -> marked due='size', still active
+                daemon.run_once(now=1000 + 66 * 60)
+                self.assertEqual(daemon.db.get_meta("general_rotation_due"), "size")
+                self.assertEqual(daemon.db.get_session("general:2")["status"], "active")
+
+                # At +15m -> rotates general:2 -> general:3!
+                s_rot2 = daemon.run_once(now=1000 + 71 * 60)
+                self.assertTrue(s_rot2.general_rotated)
+                self.assertEqual(daemon.db.get_session("general:2")["status"], "sealed")
+                self.assertEqual(daemon.db.get_session("general:3")["status"], "active")
+            finally:
+                daemon.close()
+
+    def test_general_rotation_deferred_when_channel_messages_queued(self) -> None:
+        """Rotation must be deferred whenever Feishu channel messages are queued/pending."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            term = StatusAwareTerminal(reply_fn=lambda name, text: "已先处理排队消息")
+            term.set_pane(GENERAL_PANE_NAME, status="idle")
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                gen = daemon._ensure_general_session(1000)
+                daemon.db.update_session(gen["session_key"], turn_count=65, last_active_at=1000)
+                daemon.db.set_meta("general_rotation_due", "size", now=1000)
+
+                # Seed a queued channel event in waiting_general (simulating queued message before rotation)
+                ev_id = daemon.db.enqueue_event(
+                    source="channel",
+                    dedupe_key="ch:queued:1",
+                    priority=10,
+                    available_at=1000,
+                    payload={"text": "先处理我再换新", "thread_id": None, "received_at": 1000},
+                    now=1000,
+                )
+                daemon.db.park_event_waiting(
+                    ev_id,
+                    payload_updates={
+                        "busy_batch_id": f"batch:{ev_id}",
+                        "busy_card_msg_id": "card-q-1",
+                        "wait_session_key": gen["session_key"],
+                    },
+                )
+
+                # Direct rotation check at +40m quiet MUST defer while channel message is queued!
+                self.assertFalse(daemon._maybe_run_due_general_rotation(now=1000 + 40 * 60))
+                self.assertFalse(daemon.rotate_general_session(now=1000 + 40 * 60, force=False))
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
+
+                # run_once processes the queued message first (updating last_active_at) and STILL defers rotation
+                s1 = daemon.run_once(now=1000 + 40 * 60)
+                self.assertEqual(s1.events_processed, 1)
+                self.assertFalse(s1.general_rotated)
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
+
+                # 30m quiet after message processed -> now rotates cleanly!
+                s2 = daemon.run_once(now=1000 + 70 * 60)
+                self.assertTrue(s2.general_rotated)
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "sealed")
+                self.assertEqual(daemon.db.get_session("general:2")["status"], "active")
+            finally:
+                daemon.close()
+
+    def test_topic_seal_manual_and_idle_timeout_reflows_summary_to_main_and_today_wal(self) -> None:
+        """Topic seal (manual or idle timeout) pushes 0-LLM Chinese summary (<=600 chars + branch) to main window
+        and upserts `[WIP]` to `notes/today.md` without violating the 60-line memory guard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            update_tuning_value(hq_dir, "topic_idle_seal_minutes", "30")
+
+            # Pre-fill notes/today.md to exactly 60 lines to verify line cap preservation
+            today_path = hq_dir / "notes" / "today.md"
+            prefill = ["# Today WAL [UNVERIFIED / TODAY ONLY]", ""] + [
+                f"- [WIP] earlier item {i}" for i in range(1, 59)
+            ]
+            self.assertEqual(len(prefill), 60)
+            today_path.write_text("\n".join(prefill) + "\n", encoding="utf-8")
+
+            ch = IndicatorFakeChannel()
+            term = StatusAwareTerminal()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                # 1. Manual seal with >600-char last_reply -> truncated to 600 chars, main window push, today.md updated
+                s1 = daemon.db.create_session(
+                    "task:gw:fix-auth:100",
+                    "TOPIC",
+                    "agy",
+                    status="active",
+                    channel_thread_id="th-auth",
+                    topic_slug="fix-auth",
+                    repo_name="gateway-svc",
+                    branch_name="hq/fix-auth",
+                    pane_name="hq-fix-auth",
+                    now=100,
+                )
+                long_reply = "已完成认证竞态修复并补齐回归单测。" + ("细节" * 400)
+                daemon.db.set_meta(f"last_reply:{s1['session_key']}", long_reply, now=120)
+
+                daemon.seal_session(s1["session_key"], now=200)
+                self.assertEqual(len(ch.sent), 1)
+                self.assertIsNone(ch.sent[0]["thread_id"])
+                pushed1 = ch.sent[0]["text"]
+                self.assertTrue(pushed1.startswith("✅ 任务 fix-auth 已完成："))
+                self.assertIn("（分支 hq/fix-auth）", pushed1)
+                self.assertIn("已完成认证竞态修复", pushed1)
+                self.assertIn("...", pushed1)
+                # Body inside prefix+suffix is capped at 600 chars
+                body1 = pushed1.split("已完成：", 1)[1].rsplit("（分支 hq/fix-auth）", 1)[0]
+                self.assertLessEqual(len(body1), 600)
+
+                # Idempotent: sealing again does NOT send a duplicate summary
+                daemon.seal_session(s1["session_key"], now=210)
+                self.assertEqual(len(ch.sent), 1)
+
+                # 2. Idle timeout auto-seal reads fallback reply from transcript and reflows to main window & today.md
+                tfile = Path(tmp) / "topic_idle.jsonl"
+                tfile.write_text(
+                    json.dumps({"type": "USER_INPUT", "content": "修一下超时"}, ensure_ascii=False)
+                    + "\n"
+                    + json.dumps({"type": "PLANNER_RESPONSE", "content": "已调大连接池超时并通过全部单测"}, ensure_ascii=False)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                daemon.db.create_session(
+                    "task:gw:pool-timeout:300",
+                    "TOPIC",
+                    "agy",
+                    status="active",
+                    channel_thread_id="th-pool",
+                    topic_slug="pool-timeout",
+                    repo_name="gateway-svc",
+                    branch_name="hq/pool-timeout",
+                    pane_name="hq-pool-timeout",
+                    transcript_path=str(tfile),
+                    now=300,
+                )
+                daemon._seal_idle_topic_sessions(now=300 + 30 * 60)
+                self.assertEqual(daemon.db.get_session("task:gw:pool-timeout:300")["status"], "sealed")
+                self.assertEqual(len(ch.sent), 2)
+                self.assertIsNone(ch.sent[1]["thread_id"])
+                self.assertIn("✅ 任务 pool-timeout 已完成：", ch.sent[1]["text"])
+                self.assertIn("已调大连接池超时并通过全部单测", ch.sent[1]["text"])
+                self.assertIn("（分支 hq/pool-timeout）", ch.sent[1]["text"])
+
+                # Verify notes/today.md contains both [WIP] entries AND stays <= 60 lines (memory_guard PASS)
+                today_lines = today_path.read_text(encoding="utf-8").splitlines()
+                self.assertLessEqual(len(today_lines), 60)
+                today_text = "\n".join(today_lines)
+                self.assertIn("- [WIP] Topic fix-auth 已封口：", today_text)
+                self.assertIn("（分支 hq/fix-auth）", today_text)
+                self.assertIn("- [WIP] Topic pool-timeout 已封口：", today_text)
+                self.assertIn("（分支 hq/pool-timeout）", today_text)
+                # Ensure no broken logical path or line violation in memory_guard
+                (hq_dir / "AGENTS.md").write_text("# Index\n", encoding="utf-8")
+                guard_res = run_memory_guard(hq_dir)
+                self.assertTrue(guard_res.ok, msg=guard_res.violations)
             finally:
                 daemon.close()
 
@@ -394,16 +964,16 @@ class TestV2InteractionFlows(unittest.TestCase):
                 )
                 # Bind an active timer to general:1
                 tm = daemon.db.create_timer(
-                    reason="检查 147 验收容器状态",
+                    reason="检查远端验收容器状态",
                     fire_at=9000,
                     kind="once",
                     session_key="general:1",
                     now=1000,
                 )
 
-                # 23:30 nightly closeout runs at t=2000 -> sets general_rotation_due=1
+                # 23:30 nightly closeout runs at t=2000 -> sets general_rotation_due=night
                 daemon.run_nightly_pipeline(now=2000)
-                self.assertEqual(daemon.db.get_meta("general_rotation_due"), "1")
+                self.assertEqual(daemon.db.get_meta("general_rotation_due"), "night")
                 self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
 
                 # Transcript write at t=3000 delays quiet window until 3000 + 3600 = 6600
@@ -463,7 +1033,7 @@ class TestV2InteractionFlows(unittest.TestCase):
                 hook_res["inject_steps"][0]["systemMessage"]["systemMessage"],
             )
 
-    def test_pane_loss_restores_conversation_id_and_archived_thread_prompts_resume(self) -> None:
+    def test_pane_loss_restores_conversation_id_and_topic_worktree_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "demo-hq"
             hq_main(["init", str(hq_dir)])
@@ -497,7 +1067,7 @@ class TestV2InteractionFlows(unittest.TestCase):
                 self.assertIn("--conversation", term.start_agent_calls[0]["agent_args"])
                 self.assertIn("conv-keep-99", term.start_agent_calls[0]["agent_args"])
 
-                # 2. Topic worktree + pane lost while active -> recreates worktree on branch & restores conversation
+                # 2. Topic worktree + pane lost while active -> daemon timer_wake recreates worktree & restores conversation
                 missing_wt = hq_dir / ".hq" / "worktrees" / "wt-lost"
                 daemon.db.create_session(
                     "task:gw-repo:lost-wt:700",
@@ -512,14 +1082,24 @@ class TestV2InteractionFlows(unittest.TestCase):
                     topic_slug="lost-wt",
                     now=700,
                 )
-                ch.inbound.append(
-                    InboundMessage(2, "c1", "thread-active-77", "u1", "继续修复", message_id="m-wt-rec")
+                daemon.db.enqueue_event(
+                    source="timer_wake",
+                    dedupe_key="tw:wt-rec:1",
+                    priority=20,
+                    available_at=1015,
+                    payload={
+                        "timer_id": 1,
+                        "kind": "once",
+                        "session_key": "task:gw-repo:lost-wt:700",
+                        "reason": "继续修复",
+                    },
+                    now=1015,
                 )
                 daemon.run_once(now=1015)
                 self.assertTrue(missing_wt.exists())
                 self.assertIn("conv-topic-77", term.start_agent_calls[-1]["agent_args"])
 
-                # 3. Archived Topic thread reply prompts `herdr-bot resume` instead of creating orphan topic
+                # 3. Archived Topic thread reply in Feishu routes to General & replies in main window (not archived notice)
                 daemon.db.create_session(
                     "task:gw:old-feat:500",
                     "TOPIC",
@@ -536,8 +1116,9 @@ class TestV2InteractionFlows(unittest.TestCase):
                     InboundMessage(3, "c1", "thread-arch-1", "u1", "这个旧任务还能接着改吗", message_id="m-arch")
                 )
                 daemon.run_once(now=1020)
-                self.assertIn("已归档", ch.sent[-1]["text"])
-                self.assertIn("herdr-bot resume task:gw:old-feat:500", ch.sent[-1]["text"])
+                self.assertEqual(term.prompt_calls[-1]["name"], GENERAL_PANE_NAME)
+                self.assertEqual(ch.card_updates[-1]["text"], "restored ok")
+                self.assertIsNone(ch.card_updates[-1]["thread_id"])
             finally:
                 daemon.close()
 

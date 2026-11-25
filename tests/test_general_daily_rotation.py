@@ -423,10 +423,10 @@ class TestGeneralDailyRotation(unittest.TestCase):
                 daemon._ensure_general_session(1000)
                 term.set_pane(GENERAL_PANE_NAME, status="idle")
 
-                # Default general_nightly_reset=True -> nightly pipeline marks due, waits 60m quiet, then rotates
+                # Default general_nightly_reset=True -> nightly pipeline marks due="night", waits 60m quiet, then rotates
                 self.assertTrue(daemon.config.tuning.general_nightly_reset)
                 daemon.run_nightly_pipeline(now=2000)
-                self.assertEqual(daemon.db.get_meta("general_rotation_due"), "1")
+                self.assertEqual(daemon.db.get_meta("general_rotation_due"), "night")
                 self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
 
                 # Before 60m quiet (e.g. +59m) -> still active

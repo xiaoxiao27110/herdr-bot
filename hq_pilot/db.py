@@ -369,6 +369,180 @@ class HQDatabase:
         )
         return cur.rowcount > 0
 
+    def update_event_payload(
+        self,
+        event_id: int,
+        payload_updates: Dict[str, Any],
+    ) -> bool:
+        row = self.conn.execute("SELECT payload_json FROM events WHERE id = ?", (int(event_id),)).fetchone()
+        if not row:
+            return False
+        payload = json.loads(row["payload_json"])
+        payload.update(payload_updates)
+        self.conn.execute(
+            "UPDATE events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True, ensure_ascii=False), int(event_id)),
+        )
+        return True
+
+    def list_open_busy_batch_events(self) -> List[EventRow]:
+        """List waiting channel events belonging to the currently open (unclosed) busy batch."""
+        rows = self.conn.execute(
+            """
+            SELECT * FROM events
+            WHERE source = 'channel' AND status = 'waiting_general'
+            ORDER BY created_at ASC, id ASC
+            """
+        ).fetchall()
+        result: List[EventRow] = []
+        for r in rows:
+            payload = json.loads(r["payload_json"])
+            if payload.get("batch_closed"):
+                continue
+            result.append(
+                EventRow(
+                    id=int(r["id"]),
+                    source=str(r["source"]),
+                    dedupe_key=str(r["dedupe_key"]),
+                    priority=int(r["priority"]),
+                    available_at=int(r["available_at"]),
+                    payload=payload,
+                    status=str(r["status"]),
+                    lease_until=int(r["lease_until"] or 0),
+                    attempts=int(r["attempts"]),
+                    created_at=int(r["created_at"]),
+                )
+            )
+        return result
+
+    def close_busy_batch_for_dispatch(self, leader_id: int) -> List[EventRow]:
+        """
+        Atomically freeze a channel busy batch at dispatch time so subsequent arrivals
+        start a new batch/card, while followers are marked `batch_leased` and tracked on leader.
+        Idempotent on leader retry / lease recovery after daemon restart.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            leader_row = self.conn.execute(
+                "SELECT * FROM events WHERE id = ?", (int(leader_id),)
+            ).fetchone()
+            if not leader_row:
+                self.conn.execute("COMMIT")
+                return []
+
+            leader_payload = json.loads(leader_row["payload_json"])
+            if leader_payload.get("batch_closed") and leader_payload.get("batch_member_ids"):
+                member_ids = [int(i) for i in leader_payload["batch_member_ids"]]
+                placeholders = ",".join("?" for _ in member_ids)
+                member_rows = self.conn.execute(
+                    f"SELECT * FROM events WHERE id IN ({placeholders}) ORDER BY created_at ASC, id ASC",
+                    tuple(member_ids),
+                ).fetchall()
+                self.conn.execute("COMMIT")
+                return [
+                    EventRow(
+                        id=int(r["id"]),
+                        source=str(r["source"]),
+                        dedupe_key=str(r["dedupe_key"]),
+                        priority=int(r["priority"]),
+                        available_at=int(r["available_at"]),
+                        payload=json.loads(r["payload_json"]),
+                        status=str(r["status"]),
+                        lease_until=int(r["lease_until"] or 0),
+                        attempts=int(r["attempts"]),
+                        created_at=int(r["created_at"]),
+                    )
+                    for r in member_rows
+                ]
+
+            batch_id = str(leader_payload.get("busy_batch_id") or "").strip()
+            collected_rows = [leader_row]
+            if batch_id:
+                waiting_rows = self.conn.execute(
+                    """
+                    SELECT * FROM events
+                    WHERE source = 'channel' AND status = 'waiting_general' AND id != ?
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (int(leader_id),),
+                ).fetchall()
+                for wr in waiting_rows:
+                    wp = json.loads(wr["payload_json"])
+                    if str(wp.get("busy_batch_id") or "").strip() == batch_id and not wp.get("batch_closed"):
+                        collected_rows.append(wr)
+
+            collected_rows.sort(key=lambda r: (int(r["created_at"]), int(r["id"])))
+            member_ids = [int(r["id"]) for r in collected_rows]
+            follower_ids = [eid for eid in member_ids if eid != int(leader_id)]
+
+            if follower_ids:
+                placeholders = ",".join("?" for _ in follower_ids)
+                self.conn.execute(
+                    f"UPDATE events SET status = 'batch_leased', lease_until = 0 WHERE id IN ({placeholders})",
+                    tuple(follower_ids),
+                )
+
+            leader_payload["batch_closed"] = True
+            leader_payload["batch_member_ids"] = member_ids
+            self.conn.execute(
+                "UPDATE events SET payload_json = ? WHERE id = ?",
+                (json.dumps(leader_payload, sort_keys=True, ensure_ascii=False), int(leader_id)),
+            )
+            self.conn.execute("COMMIT")
+
+            out: List[EventRow] = []
+            for r in collected_rows:
+                eid = int(r["id"])
+                p_obj = leader_payload if eid == int(leader_id) else json.loads(r["payload_json"])
+                st = str(r["status"]) if eid == int(leader_id) else "batch_leased"
+                out.append(
+                    EventRow(
+                        id=eid,
+                        source=str(r["source"]),
+                        dedupe_key=str(r["dedupe_key"]),
+                        priority=int(r["priority"]),
+                        available_at=int(r["available_at"]),
+                        payload=p_obj,
+                        status=st,
+                        lease_until=int(r["lease_until"] or 0),
+                        attempts=int(r["attempts"]),
+                        created_at=int(r["created_at"]),
+                    )
+                )
+            return out
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def complete_events(self, event_ids: List[int]) -> None:
+        if not event_ids:
+            return
+        placeholders = ",".join("?" for _ in event_ids)
+        self.conn.execute(
+            f"UPDATE events SET status = 'done', lease_until = 0 WHERE id IN ({placeholders})",
+            tuple(int(i) for i in event_ids),
+        )
+
+    def mark_events_dead(self, event_ids: List[int]) -> None:
+        if not event_ids:
+            return
+        placeholders = ",".join("?" for _ in event_ids)
+        self.conn.execute(
+            f"UPDATE events SET status = 'dead', lease_until = 0 WHERE id IN ({placeholders})",
+            tuple(int(i) for i in event_ids),
+        )
+
+    def has_queued_channel_events(self) -> bool:
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM events
+            WHERE source = 'channel'
+              AND status IN ('pending', 'leased', 'waiting_general', 'batch_leased')
+            LIMIT 1
+            """
+        ).fetchone()
+        return row is not None
+
     # ------------------------------------------------------------------
     # Sessions (4-state: active | sealed | pinned | archived)
     # ------------------------------------------------------------------

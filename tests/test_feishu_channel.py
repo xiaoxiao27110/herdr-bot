@@ -61,8 +61,48 @@ class TestFeishuChannel(unittest.TestCase):
         self.assertEqual(reply_call[0], "POST")
         self.assertEqual(reply_call[3]["Authorization"], "Bearer t-cached-001")
         self.assertTrue(reply_call[2]["reply_in_thread"])
-        self.assertEqual(reply_call[2]["msg_type"], "text")
-        self.assertEqual(json.loads(reply_call[2]["content"]), {"text": "Progress update"})
+        self.assertEqual(reply_call[2]["msg_type"], "interactive")
+        reply_card = json.loads(reply_call[2]["content"])
+        self.assertEqual(reply_card["schema"], "2.0")
+        self.assertEqual(
+            reply_card["body"]["elements"],
+            [{"tag": "markdown", "content": "Progress update"}],
+        )
+
+    def test_send_message_without_buttons_uses_schema2_markdown_card(self) -> None:
+        captured = []
+
+        def mock_req(method, url, body, headers, timeout):
+            captured.append((method, url, body))
+            if "tenant_access_token" in url:
+                return {"code": 0, "tenant_access_token": "t-md", "expire": 7200}
+            return {"code": 0, "data": {"message_id": "om_md_1"}}
+
+        ch = FeishuChannel(
+            app_id="cli_abc",
+            app_secret="sec_xyz",
+            allowed_chat_id="oc_target_1",
+            request_fn=mock_req,
+        )
+        md_text = (
+            "### 发布检查报告\n\n"
+            "- 状态：**全部通过**\n\n"
+            "| 检查项 | 结果 |\n"
+            "| --- | --- |\n"
+            "| 单元测试 | PASS |\n"
+        )
+        mid = ch.send_message(md_text)
+        self.assertEqual(mid, "om_md_1")
+
+        send_call = [c for c in captured if "im/v1/messages" in c[1]][0]
+        self.assertEqual(send_call[2]["msg_type"], "interactive")
+        card = json.loads(send_call[2]["content"])
+        self.assertEqual(card["schema"], "2.0")
+        self.assertTrue(card["config"]["wide_screen_mode"])
+        self.assertEqual(
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": md_text}],
+        )
 
     def test_send_message_with_buttons_builds_interactive_card(self) -> None:
         captured = []

@@ -431,7 +431,8 @@ class TestHerdrInteractiveMode(unittest.TestCase):
                 self.assertIsNone(daemon.db.get_meta("daemon_waiting:general:1"))
                 self.assertIsNone(daemon.db.get_meta("last_reply:general:1"))
 
-                # Now simulate manual user prompt in Herdr (daemon_waiting NOT set) -> Stop hook pushes to channel
+                # Now simulate manual user prompt in Herdr (daemon_waiting NOT set) ->
+                # Stop hook must NOT push local TTY chat to channel, while still recording last_reply
                 with tfile.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps({"role": "user", "content": "manual input"}) + "\n")
                     fh.write(json.dumps({"role": "assistant", "content": "Manual reply from Herdr"}) + "\n")
@@ -447,9 +448,31 @@ class TestHerdrInteractiveMode(unittest.TestCase):
                         channel=ch,
                         now=1050,
                     )
-                self.assertTrue(res_manual["reply_pushed"])
-                self.assertEqual(ch.sent[-1]["text"], "Manual reply from Herdr")
+                self.assertFalse(res_manual["reply_pushed"])
+                self.assertEqual(ch.sent, [])
                 self.assertEqual(daemon.db.get_meta("last_reply:general:1"), "Manual reply from Herdr")
+
+                # A subsequent daemon-dispatched async turn (daemon_waiting NOT set) SHOULD push to channel
+                daemon.db.record_dispatch("general:1", "conv-gen-1", "async daemon prompt", now=1060)
+                daemon.db.set_meta("last_input_origin:general:1", "daemon", now=1060)
+                with tfile.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"role": "user", "content": "async daemon prompt"}) + "\n")
+                    fh.write(json.dumps({"role": "assistant", "content": "Async daemon reply"}) + "\n")
+                with patch.dict(os.environ, {"HQ_SESSION_KEY": "general:1"}):
+                    res_async = handle_hook_event(
+                        "agy",
+                        {
+                            "hookEventName": "Stop",
+                            "conversationId": "conv-gen-1",
+                            "transcriptPath": str(tfile),
+                        },
+                        hq_dir=hq_dir,
+                        channel=ch,
+                        now=1070,
+                    )
+                self.assertTrue(res_async["reply_pushed"])
+                self.assertEqual(ch.sent[-1]["text"], "Async daemon reply")
+                self.assertEqual(daemon.db.get_meta("last_reply:general:1"), "Async daemon reply")
             finally:
                 daemon.close()
 

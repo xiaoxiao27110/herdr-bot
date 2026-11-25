@@ -451,12 +451,8 @@ class FeishuChannel(MessagingChannel):
         if not self.allowed_chat_id:
             raise RuntimeError("Feishu allowed_chat_id is not configured (fail-closed)")
 
-        if buttons:
-            msg_type = "interactive"
-            content_obj = _build_interactive_card(text, buttons=buttons)
-        else:
-            msg_type = "text"
-            content_obj = {"text": text}
+        msg_type = "interactive"
+        content_obj = _build_interactive_card(text, buttons=buttons)
         content_str = json.dumps(content_obj, ensure_ascii=False)
 
         tid = str(thread_id).strip() if thread_id is not None else ""

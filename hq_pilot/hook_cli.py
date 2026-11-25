@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -39,6 +40,17 @@ def _hook_stdout_response(event_type: str) -> Dict[str, Any]:
     if event_type == "Stop":
         return {"decision": "allow_stop"}
     return {"injectSteps": []}
+
+
+_USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", flags=re.DOTALL)
+
+
+def _extract_user_request_text(raw: str) -> str:
+    text = raw or ""
+    m = _USER_REQUEST_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
 
 
 def handle_hook_event(
@@ -126,12 +138,16 @@ def handle_hook_event(
 
         pinned_reason = None
         if event_type in {"PreInvocation", "UserPromptSubmit", "SessionStart"} and user_prompt:
+            cleaned_prompt = _extract_user_request_text(str(user_prompt))
             pinned_reason = detect_manual_touch(
                 db,
                 sess,
-                input_text=str(user_prompt),
+                input_text=cleaned_prompt,
                 now=ts,
             )
+            if event_type in {"PreInvocation", "UserPromptSubmit"}:
+                origin = "local_tty" if pinned_reason == "manual_input" else "daemon"
+                db.set_meta(f"last_input_origin:{skey}", origin, now=ts)
 
         if event_type == "Stop":
             tpath = transcript_path or sess.get("transcript_path")
@@ -139,10 +155,9 @@ def handle_hook_event(
             if tpath and Path(str(tpath)).exists():
                 offset = int(sess.get("reply_line_offset") or 0)
                 turns, total_lines = adapter.read_transcript_slice(str(tpath), from_line=offset)
+                user_msgs = [t.text for t in turns if t.role == "user"]
                 assistant_msgs = [t.text for t in turns if t.role == "assistant"]
-                new_turns = int(sess.get("turn_count") or 0) + sum(
-                    1 for t in turns if t.role == "user"
-                )
+                new_turns = int(sess.get("turn_count") or 0) + len(user_msgs)
                 db.update_session(
                     skey,
                     reply_line_offset=total_lines,
@@ -161,7 +176,44 @@ def handle_hook_event(
                     )
                     thread_id = sess.get("channel_thread_id")
                     is_general = str(sess.get("track") or "") in {"GENERAL", "B"}
+                    last_origin = db.get_meta(f"last_input_origin:{skey}")
+                    sess_agent_sid = str(sess.get("agent_session_id") or "") or None
+                    has_new_user_msg = bool(user_msgs)
+                    last_user_is_daemon = False
+                    if has_new_user_msg:
+                        cleaned_last_user = _extract_user_request_text(user_msgs[-1])
+                        if cleaned_last_user:
+                            last_user_is_daemon = db.is_daemon_dispatch(
+                                text=cleaned_last_user,
+                                session_key=skey,
+                                agent_session_id=sess_agent_sid,
+                            )
+
+                    allow_push = False
                     if not daemon_waiting and (thread_id or is_general):
+                        if last_origin == "local_tty":
+                            allow_push = False
+                        elif is_general and not thread_id:
+                            if has_new_user_msg and not last_user_is_daemon:
+                                db.set_meta(f"last_input_origin:{skey}", "local_tty", now=ts)
+                                allow_push = False
+                            else:
+                                allow_push = last_origin == "daemon"
+                        else:
+                            # #Topic with thread_id
+                            if has_new_user_msg and not last_user_is_daemon:
+                                if (
+                                    last_origin == "daemon"
+                                    or str(sess.get("pinned_reason") or "") == "manual_input"
+                                ):
+                                    db.set_meta(f"last_input_origin:{skey}", "local_tty", now=ts)
+                                    allow_push = False
+                                else:
+                                    allow_push = True
+                            else:
+                                allow_push = True
+
+                    if allow_push:
                         ch = channel
                         if ch is None:
                             secrets = load_secrets_env(cfg.hq_dir)

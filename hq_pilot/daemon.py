@@ -431,6 +431,7 @@ class HQDaemon:
         )
         self.agent_adapter.ensure_hooks_installed(wt_path, self._hook_bin_path())
         self.db.record_dispatch(skey, None, delivery_prompt, now=ts)
+        self.db.set_meta(f"last_input_origin:{skey}", "daemon", now=ts)
         _upsert_task_progress_file(
             self.hq_dir, slug, repo_name, branch_name, skey, prompt, status="active"
         )
@@ -683,6 +684,7 @@ class HQDaemon:
             else 0
         )
         self.db.record_dispatch(skey, agent_sid, delivery_prompt, now=now)
+        self.db.set_meta(f"last_input_origin:{skey}", "daemon", now=now)
         self.db.delete_meta(f"last_reply:{skey}")
         self.db.delete_meta(f"last_reply_pane:{pane_name}")
         self.db.set_meta(f"daemon_waiting:{skey}", "1", now=now)

@@ -457,6 +457,184 @@ class TestReliabilityAndTurbo(unittest.TestCase):
             finally:
                 daemon.close()
 
+    def test_herdr_local_direct_chat_in_general_does_not_push_to_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "acme-hq"
+            hq_main(["init", str(hq_dir)])
+            tfile = Path(tmp) / "general_local.jsonl"
+            tfile.write_text(
+                json.dumps(
+                    {
+                        "type": "USER_INPUT",
+                        "content": "<USER_REQUEST>\n帮我本地看下当前目录结构\n</USER_REQUEST>",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+                + json.dumps(
+                    {"type": "PLANNER_RESPONSE", "content": "这是本地终端直接对话的回复"},
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            ch = FakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=RecordingTerminal(),
+                channel=ch,
+            )
+            try:
+                daemon.db.create_session(
+                    "general:1",
+                    "GENERAL",
+                    "agy",
+                    status="active",
+                    agent_session_id="conv-gen-local",
+                    pane_name=GENERAL_PANE_NAME,
+                    transcript_path=str(tfile),
+                    now=1000,
+                )
+                # Even if an earlier turn came from daemon, this new USER_INPUT is NOT in daemon_dispatches
+                daemon.db.set_meta("last_input_origin:general:1", "daemon", now=1000)
+            finally:
+                daemon.close()
+
+            with patch.dict(os.environ, {"HQ_SESSION_KEY": "general:1"}):
+                res = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "Stop",
+                        "conversationId": "conv-gen-local",
+                        "transcriptPath": str(tfile),
+                    },
+                    hq_dir=hq_dir,
+                    channel=ch,
+                    now=1020,
+                )
+
+            self.assertEqual(res["status"], "ok")
+            self.assertFalse(res["reply_pushed"])
+            self.assertEqual(ch.sent, [])
+
+            daemon2 = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=RecordingTerminal(),
+                channel=ch,
+            )
+            try:
+                sess = daemon2.db.get_session("general:1")
+                self.assertEqual(sess["reply_line_offset"], 2)
+                self.assertEqual(sess["turn_count"], 1)
+                self.assertEqual(
+                    daemon2.db.get_meta("last_reply:general:1"),
+                    "这是本地终端直接对话的回复",
+                )
+                self.assertEqual(
+                    daemon2.db.get_meta("last_input_origin:general:1"),
+                    "local_tty",
+                )
+            finally:
+                daemon2.close()
+
+    def test_preinvocation_manual_input_suppresses_subsequent_stop_push(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "acme-hq"
+            hq_main(["init", str(hq_dir)])
+            tfile = Path(tmp) / "topic_local.jsonl"
+            tfile.write_text(
+                json.dumps(
+                    {
+                        "type": "USER_INPUT",
+                        "content": "<USER_REQUEST>直接在终端追问一个细节</USER_REQUEST>",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+                + json.dumps(
+                    {"type": "PLANNER_RESPONSE", "content": "终端追问的本地回复"},
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            ch = FakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=RecordingTerminal(),
+                channel=ch,
+            )
+            try:
+                daemon.db.create_session(
+                    "task:repo:demo:1000",
+                    "TOPIC",
+                    "agy",
+                    status="active",
+                    channel_thread_id="om_thread_demo",
+                    agent_session_id="conv-topic-1",
+                    pane_name="hq-demo",
+                    transcript_path=str(tfile),
+                    now=1000,
+                )
+                daemon.db.set_meta("last_input_origin:task:repo:demo:1000", "daemon", now=1000)
+            finally:
+                daemon.close()
+
+            with patch.dict(os.environ, {"HQ_SESSION_KEY": "task:repo:demo:1000"}):
+                pre_res = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "PreInvocation",
+                        "conversationId": "conv-topic-1",
+                        "lastUserInput": "<USER_REQUEST>直接在终端追问一个细节</USER_REQUEST>",
+                    },
+                    hq_dir=hq_dir,
+                    channel=ch,
+                    now=1010,
+                )
+                stop_res = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "Stop",
+                        "conversationId": "conv-topic-1",
+                        "transcriptPath": str(tfile),
+                    },
+                    hq_dir=hq_dir,
+                    channel=ch,
+                    now=1020,
+                )
+
+            self.assertEqual(pre_res["pinned_reason"], "manual_input")
+            self.assertEqual(stop_res["status"], "ok")
+            self.assertFalse(stop_res["reply_pushed"])
+            self.assertEqual(ch.sent, [])
+
+            daemon2 = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=RecordingTerminal(),
+                channel=ch,
+            )
+            try:
+                sess = daemon2.db.get_session("task:repo:demo:1000")
+                self.assertEqual(sess["reply_line_offset"], 2)
+                self.assertEqual(sess["turn_count"], 1)
+                self.assertEqual(
+                    daemon2.db.get_meta("last_input_origin:task:repo:demo:1000"),
+                    "local_tty",
+                )
+                self.assertEqual(
+                    daemon2.db.get_meta("last_reply:task:repo:demo:1000"),
+                    "终端追问的本地回复",
+                )
+            finally:
+                daemon2.close()
+
 
 if __name__ == "__main__":
     unittest.main()

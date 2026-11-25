@@ -111,6 +111,11 @@ def _build_agents_md(
         "",
         "> Keep this index concise (`<= 200` lines, `<= 25600` bytes). Use `<repo>:<relpath>` logical paths.",
         "",
+        "## Role & Jurisdiction",
+        f"- **身份定位与充分授权**：你是项目 `{project_name}` 的专属研发总控 Agent，对 `hq.yaml` 已注册仓库及当前 `$HQ_DIR` 记忆工作区（`AGENTS.md`、`memory/`、`tasks/`、`notes/`）拥有完整的排查、开发（改代码前先切功能分支，勿直接提交主分支）、测试与记忆维护权限。",
+        "- **管辖范围外只读参考**：排障时允许只读查看系统其他文件、运行日志或外部工具状态作为参考依据。",
+        "- **严禁越界修改或自我迭代**：严禁修改、也严禁主动提议或声称要去修改任何未在 `hq.yaml` 注册的仓库、外部系统工具或编排器自身（如 `herdr-bot` / `herdr`，严禁自我迭代）；遇到属于编排器或未注册仓库的问题时，仅客观说明现象与建议，提醒用户在对应独立工作区自行处理。",
+        "",
         "## Repositories",
     ]
     if repo_meta:

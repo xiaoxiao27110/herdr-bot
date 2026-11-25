@@ -2,6 +2,11 @@
 
 > Keep this index concise (`<= 200` lines, `<= 25600` bytes). Use `<repo>:<relpath>` logical paths.
 
+## Role & Jurisdiction
+- **管辖范围内充分授权**：仅管辖 `hq.yaml` 已注册仓库与当前 `$HQ_DIR` 记忆工作区（`AGENTS.md`、`memory/`、`tasks/`、`notes/`），拥有完整的排查、开发（改代码前先切功能分支，勿直接提交主分支）、测试与记忆维护权限。
+- **管辖范围外只读参考**：排障时允许只读查看系统其他文件、运行日志或外部工具状态作为参考依据。
+- **严禁越界修改或自我迭代**：严禁修改、也严禁主动提议或声称要去修改任何未在 `hq.yaml` 注册的仓库、外部系统工具或编排器自身（如 `herdr-bot` / `herdr`，严禁自我迭代）；遇到属于编排器或未注册仓库的问题时，仅客观说明现象与建议，提醒用户在对应独立工作区自行处理。
+
 ## Repositories
 - `gateway-svc`: Edge HTTP/gRPC gateway (`gateway-svc:api/router.py`)
 - `worker-svc`: Background job processor (`worker-svc:jobs/runner.py`)

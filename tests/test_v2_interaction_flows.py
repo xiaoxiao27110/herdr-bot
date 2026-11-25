@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -67,6 +68,92 @@ class TestV2InteractionFlows(unittest.TestCase):
 
             agents_md = (hq_dir / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("未经用户明确要求永不擅自新开 `#Topic`", agents_md)
+
+    def test_jurisdiction_guide_in_prompt_and_agents_scaffolds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1) Multi-repo config: dynamic project_name + sorted repos + strict jurisdiction rules
+            hq_dir = Path(tmp) / "acme-hq"
+            hq_main(["init", str(hq_dir)])
+            (hq_dir / "hq.yaml").write_text(
+                "version: 1\n"
+                "project_name: acme-platform\n"
+                "repos:\n"
+                "  zebra-svc:\n"
+                "    git_url: ''\n"
+                "    default_branch: main\n"
+                "  alpha-api:\n"
+                "    git_url: ''\n"
+                "    default_branch: main\n",
+                encoding="utf-8",
+            )
+            cfg = load_config(hq_dir)
+            prompt = build_prompt(hq_dir, cfg, {"text": "check status"})
+
+            self.assertIn("## 0. Role & Jurisdiction", prompt)
+            self.assertIn("`acme-platform`", prompt)
+            self.assertIn("`alpha-api`、`zebra-svc`", prompt)
+            self.assertIn("管辖范围内充分授权", prompt)
+            self.assertIn("管辖范围外只读参考", prompt)
+            self.assertIn("严禁修改、也严禁主动提议或声称要去修改", prompt)
+            self.assertIn("`herdr-bot` / `herdr`", prompt)
+            self.assertIn("严禁自我迭代", prompt)
+            self.assertLess(
+                prompt.index("## 0. Role & Jurisdiction"),
+                prompt.index("## 0.5 #General & #Topic Collaboration Guide"),
+            )
+            self.assertLess(
+                prompt.index("## 0.5 #General & #Topic Collaboration Guide"),
+                prompt.index("## 1. Repo Boundaries"),
+            )
+
+            # 2) Empty repos config: clarifies HQ memory workspace only
+            (hq_dir / "hq.yaml").write_text(
+                "version: 1\nproject_name: solo-memory\nrepos: {}\n",
+                encoding="utf-8",
+            )
+            empty_cfg = load_config(hq_dir)
+            empty_prompt = build_prompt(hq_dir, empty_cfg, {"text": "hello"})
+            self.assertIn("`solo-memory`", empty_prompt)
+            self.assertIn("尚未在 `hq.yaml` 注册业务仓", empty_prompt)
+            self.assertIn("仅管辖本 `$HQ_DIR` 记忆工作区", empty_prompt)
+            self.assertIn("严禁修改、也严禁主动提议或声称要去修改", empty_prompt)
+            self.assertIn("`herdr-bot` / `herdr`", empty_prompt)
+
+            # 3) `hq init` scaffold AGENTS.md includes Role & Jurisdiction
+            init_agents = (hq_dir / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("## Role & Jurisdiction", init_agents)
+            self.assertIn("管辖范围内充分授权", init_agents)
+            self.assertIn("管辖范围外只读参考", init_agents)
+            self.assertIn("严禁越界修改或自我迭代", init_agents)
+            self.assertIn("`herdr-bot` / `herdr`", init_agents)
+
+            # 4) `hq setup --non-interactive` scaffold AGENTS.md includes Role & Jurisdiction
+            repo_a = Path(tmp) / "svc-a"
+            _init_git_repo(repo_a)
+            setup_hq = Path(tmp) / "setup-hq"
+            with patch("sys.stdout", io.StringIO()):
+                rc = hq_main(
+                    [
+                        "setup",
+                        "--non-interactive",
+                        "--hq-dir",
+                        str(setup_hq),
+                        "--project-name",
+                        "beta-suite",
+                        "--repo",
+                        f"svc-a={repo_a}",
+                        "--channel",
+                        "local",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            setup_agents = (setup_hq / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("## Role & Jurisdiction", setup_agents)
+            self.assertIn("`beta-suite`", setup_agents)
+            self.assertIn("身份定位与充分授权", setup_agents)
+            self.assertIn("管辖范围外只读参考", setup_agents)
+            self.assertIn("严禁越界修改或自我迭代", setup_agents)
+            self.assertIn("`herdr-bot` / `herdr`", setup_agents)
 
     def test_busy_general_parks_fifo_and_updates_card_when_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -9,7 +9,33 @@ import json
 from hq_pilot.config import HQConfig
 
 
-GENERAL_ORCHESTRATION_GUIDE = """## 0. #General & #Topic Collaboration Guide
+def _render_jurisdiction_guide(config: HQConfig) -> str:
+    project_name = (config.project_name or "").strip() or "current-project"
+    managed_repos = sorted(config.repos.keys())
+    if managed_repos:
+        repos_desc = "、".join(f"`{name}`" for name in managed_repos)
+        scope_line = (
+            f"- **管辖范围内充分授权**：你对 `hq.yaml` 已注册仓库（{repos_desc}）"
+            "以及当前 `$HQ_DIR` 记忆工作区（`AGENTS.md`、`memory/`、`tasks/`、`notes/`）"
+            "拥有完整的排查、开发（修改业务仓代码前先切功能分支，勿直接提交主分支）、测试与记忆维护权限。"
+        )
+    else:
+        scope_line = (
+            "- **管辖范围内充分授权**：当前尚未在 `hq.yaml` 注册业务仓，你当前仅管辖本 `$HQ_DIR` 记忆工作区"
+            "（`AGENTS.md`、`memory/`、`tasks/`、`notes/`），拥有完整的记忆维护与工作区排查权限。"
+        )
+    return "\n".join(
+        [
+            "## 0. Role & Jurisdiction",
+            f"- **身份定位**：你是项目 `{project_name}` 的专属研发总控 Agent（`#General` 与 `#Topic` 会话均遵守本边界）。",
+            scope_line,
+            "- **管辖范围外只读参考**：排障时允许**只读**查看系统其他文件、运行日志或外部工具状态作为参考依据。",
+            "- **严禁越界修改或自我迭代**：**严禁修改、也严禁主动提议或声称要去修改**任何未在 `hq.yaml` 注册的仓库、外部系统工具或编排器自身（如 `herdr-bot` / `herdr`，严禁自我迭代）。遇到属于编排器或未注册仓库的问题时，仅客观说明现象与建议，提醒用户在对应独立工作区自行处理。",
+        ]
+    )
+
+
+GENERAL_ORCHESTRATION_GUIDE = """## 0.5 #General & #Topic Collaboration Guide
 - **默认在 `#General` 连贯完成（永不擅自开 Topic）**：日常问答、状态查询、环境排查、方案讨论及常规代码修改默认均在当前 `#General` 会话连贯完成（可自行派子 Agent 协助；修改业务仓代码前请先在业务仓切换或创建功能分支，勿直接提交主分支）。未经用户明确要求，`#General` 严禁擅自创建新 `#Topic`。
 - **仅在用户明确要求时开 `#Topic`**：仅当用户明确提出“单独开个任务 / 另开分身 / 新开面板跟进某条线”时，才执行：
   `herdr-bot task spawn <repo> <slug> "<含当前背景与约束的需求>" --hq-dir "$HQ_DIR"`
@@ -72,6 +98,7 @@ def build_prompt(
 ) -> str:
     """
     Deterministically assemble the initial user prompt in strict Prefix-Cache order:
+      0. Role & Jurisdiction + #General & #Topic Collaboration Guide
       1. repo-boundaries.yaml (+ optional memory/user-notes.md static block)
       2. Sorted matching memory/contracts/*.md
       3. tasks/active-wip.md (+ optional on-demand tasks/<topic_slug>.md)
@@ -79,7 +106,10 @@ def build_prompt(
       5. event_payload (canonical JSON)
     """
     root = Path(hq_dir).resolve()
-    sections: List[str] = [GENERAL_ORCHESTRATION_GUIDE]
+    sections: List[str] = [
+        _render_jurisdiction_guide(config),
+        GENERAL_ORCHESTRATION_GUIDE,
+    ]
 
     boundaries_text = _read_optional(root / "repo-boundaries.yaml").rstrip()
     sections.append("## 1. Repo Boundaries\n```yaml\n" + boundaries_text + "\n```")

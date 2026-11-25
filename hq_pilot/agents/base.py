@@ -68,6 +68,8 @@ class CodingAgentAdapter(ABC):
     ) -> Path:
         """Install lifecycle hooks for this coding agent in `workspace_dir`."""
 
-    def extra_trust_args(self, trusted_dirs: List[Path]) -> List[str]:
+    def extra_trust_args(
+        self, trusted_dirs: List[Path], permission_mode: str = "default"
+    ) -> List[str]:
         """Optional per-session CLI flags to trust managed workspaces/worktrees."""
         return []

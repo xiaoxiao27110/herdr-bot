@@ -84,6 +84,17 @@ def handle_hook_event(
         env_session_key = os.environ.get("HQ_SESSION_KEY", "").strip()
         if env_session_key:
             sess = db.get_session(env_session_key)
+            if (
+                sess is not None
+                and agent_sid
+                and sess.get("agent_session_id")
+                and str(sess["agent_session_id"]) != agent_sid
+            ):
+                return {
+                    "status": "ignored",
+                    "reason": "subagent_session_mismatch",
+                    "event": event_type,
+                }
         if sess is None and agent_sid:
             sess = db.get_session_by_agent_id(agent_sid)
         if sess is None and agent_sid:

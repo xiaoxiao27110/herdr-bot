@@ -49,7 +49,13 @@ def archive_eligible_sessions(
         thread_id = sess.get("channel_thread_id")
 
         if terminal_driver is not None and pane_name:
-            terminal_driver.kill_pane(str(pane_name))
+            active_panes = {
+                str(s["pane_name"])
+                for s in db.list_sessions(statuses=["active", "pinned"])
+                if s.get("pane_name") and str(s["session_key"]) != skey
+            }
+            if str(pane_name) not in active_panes:
+                terminal_driver.kill_pane(str(pane_name))
 
         if worktree_str:
             wt_path = Path(str(worktree_str))

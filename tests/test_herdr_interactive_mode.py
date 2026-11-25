@@ -205,13 +205,8 @@ class TestHerdrInteractiveMode(unittest.TestCase):
         self.assertEqual(prompt_calls[1], ["agent", "prompt", "hq-general", "fire and forget"])
 
         read_calls = [c for c in calls if c[:2] == ["agent", "read"]]
-        self.assertEqual(len(read_calls), 1)
-        self.assertEqual(
-            read_calls[0],
-            ["agent", "read", "hq-general", "--source", "recent-unwrapped", "--lines", "120"],
-        )
-        self.assertNotIn("--raw", read_calls[0])
-        self.assertEqual(out_wait, "Agent screen reply")
+        self.assertEqual(len(read_calls), 0)
+        self.assertEqual(out_wait, "")
         self.assertEqual(out_nowait, "")
         self.assertEqual(len(panes), 1)
         self.assertEqual(panes[0].name, "hq-general")

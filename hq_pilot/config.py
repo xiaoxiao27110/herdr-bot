@@ -98,6 +98,7 @@ class AgentConfig:
     default_effort: str = "high"
     light_effort: str = "low"
     model: Optional[str] = None
+    permission_mode: str = "default"
 
 
 @dataclass
@@ -249,6 +250,7 @@ def load_config(hq_dir: str | Path) -> HQConfig:
         default_effort=str(agent_raw.get("default_effort", "high")),
         light_effort=str(agent_raw.get("light_effort", "low")),
         model=agent_raw.get("model"),
+        permission_mode=str(agent_raw.get("permission_mode", "default") or "default").strip(),
     )
     term_cfg = TerminalConfig(backend=str(term_raw.get("backend", "auto")))
     chan_cfg = ChannelConfig(

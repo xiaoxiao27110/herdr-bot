@@ -10,7 +10,7 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
-from hq_pilot.terminals.base import PaneInfo, TerminalDriver, shell_join
+from hq_pilot.terminals.base import AgentBlockedError, PaneInfo, TerminalDriver, shell_join
 
 
 _HERDR_AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -236,6 +236,62 @@ class HerdrDriver(TerminalDriver):
                 f"Herdr agent start failed for {agent_name!r} (rc={res.returncode}): {err_detail}"
             )
 
+    @staticmethod
+    def _parse_json_payload(raw: str) -> Dict[str, Any]:
+        text = (raw or "").strip()
+        if not text:
+            return {}
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                continue
+        return {}
+
+    @classmethod
+    def _extract_blocked_detail(cls, stdout: str, stderr: str) -> Optional[str]:
+        for raw in (stdout, stderr):
+            data = cls._parse_json_payload(raw)
+            if not data:
+                continue
+            err = data.get("error")
+            err_code = ""
+            err_msg = ""
+            if isinstance(err, dict):
+                err_code = str(err.get("code") or err.get("error_code") or "").strip().lower()
+                err_msg = str(err.get("message") or err.get("detail") or "").strip()
+            elif isinstance(err, str):
+                err_code = err.strip().lower()
+                err_msg = err.strip()
+            if not err_code:
+                err_code = str(data.get("code") or data.get("error_code") or "").strip().lower()
+
+            result = data.get("result") if isinstance(data.get("result"), dict) else {}
+            agent_obj = result.get("agent") if isinstance(result.get("agent"), dict) else {}
+            if not agent_obj and isinstance(data.get("agent"), dict):
+                agent_obj = data["agent"]
+            agent_status = str(
+                agent_obj.get("agent_status")
+                or result.get("agent_status")
+                or data.get("agent_status")
+                or ""
+            ).strip().lower()
+
+            if err_code == "agent_blocked" or agent_status == "blocked":
+                return err_msg or (raw or "").strip()
+        return None
+
     def prompt_agent(
         self,
         name: str,
@@ -248,20 +304,15 @@ class HerdrDriver(TerminalDriver):
         if wait:
             cmd.extend(["--wait", "--timeout", str(int(timeout_ms))])
         res = self._run(cmd, check=False)
+        blocked_detail = self._extract_blocked_detail(res.stdout, res.stderr)
+        if blocked_detail is not None:
+            raise AgentBlockedError(pane_name=agent_name, detail=blocked_detail)
         if res.returncode != 0:
             err_detail = (res.stderr or res.stdout or "").strip()
             raise RuntimeError(
                 f"Herdr agent prompt failed for {agent_name!r} (rc={res.returncode}): {err_detail}"
             )
-        if not wait:
-            return ""
-        read_res = self._run(
-            ["agent", "read", agent_name, "--source", "recent-unwrapped", "--lines", "120"],
-            check=False,
-        )
-        if read_res.returncode == 0 and read_res.stdout.strip():
-            return clean_agent_terminal_output(read_res.stdout)
-        return clean_agent_terminal_output(self.read_pane(name, lines=120))
+        return ""
 
     def list_panes(self) -> List[PaneInfo]:
         if not self._server_running():

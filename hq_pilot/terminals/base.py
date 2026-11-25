@@ -10,6 +10,18 @@ import shlex
 import subprocess
 
 
+class AgentBlockedError(RuntimeError):
+    """Raised when an interactive agent pane enters `blocked` status (awaiting approval)."""
+
+    def __init__(self, pane_name: str, detail: str = "") -> None:
+        self.pane_name = pane_name
+        self.detail = detail
+        msg = f"Agent pane {pane_name!r} is blocked"
+        if detail:
+            msg = f"{msg}: {detail}"
+        super().__init__(msg)
+
+
 @dataclass
 class PaneInfo:
     name: str

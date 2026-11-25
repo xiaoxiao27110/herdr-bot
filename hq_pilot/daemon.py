@@ -28,7 +28,7 @@ from hq_pilot.gatekeeper import (
 )
 from hq_pilot.prompt_builder import build_prompt
 from hq_pilot.syncer import sync_hq_repo
-from hq_pilot.terminals.base import TerminalDriver, git_worktree_add
+from hq_pilot.terminals.base import AgentBlockedError, TerminalDriver, git_worktree_add
 from hq_pilot.terminals.registry import get_terminal_driver
 
 
@@ -424,8 +424,13 @@ class HQDaemon:
             now=ts,
         )
 
+        delivery_prompt = (
+            self._materialize_long_prompt(prompt, tag=f"task-{slug}", now=ts)
+            if prompt
+            else ""
+        )
         self.agent_adapter.ensure_hooks_installed(wt_path, self._hook_bin_path())
-        self.db.record_dispatch(skey, None, prompt, now=ts)
+        self.db.record_dispatch(skey, None, delivery_prompt, now=ts)
         _upsert_task_progress_file(
             self.hq_dir, slug, repo_name, branch_name, skey, prompt, status="active"
         )
@@ -438,7 +443,10 @@ class HQDaemon:
             model=self.config.agent.model,
             effort=self.config.agent.default_effort,
         )
-        trust_args = self.agent_adapter.extra_trust_args([wt_path, self.hq_dir])
+        trust_args = self.agent_adapter.extra_trust_args(
+            [wt_path, self.hq_dir],
+            permission_mode=self.config.agent.permission_mode,
+        )
         self.terminal_driver.start_agent(
             name=pane_name,
             cwd=wt_path,
@@ -449,8 +457,8 @@ class HQDaemon:
                 "HQ_SESSION_KEY": skey,
             },
         )
-        if prompt:
-            self.terminal_driver.prompt_agent(pane_name, prompt, wait=False)
+        if delivery_prompt:
+            self.terminal_driver.prompt_agent(pane_name, delivery_prompt, wait=False)
         return sess
 
     # ------------------------------------------------------------------
@@ -596,7 +604,10 @@ class HQDaemon:
                 effort=effort,
                 add_dirs=add_dirs,
             )
-            trust_args = self.agent_adapter.extra_trust_args([cwd, *(add_dirs or [])])
+            trust_args = self.agent_adapter.extra_trust_args(
+                [cwd, *(add_dirs or [])],
+                permission_mode=self.config.agent.permission_mode,
+            )
             self.terminal_driver.start_agent(
                 name=pane_name,
                 cwd=cwd,
@@ -620,6 +631,25 @@ class HQDaemon:
         )
         return sess
 
+    def _materialize_long_prompt(self, prompt: str, tag: str, now: int) -> str:
+        """Persist long prompts (>2KB) or distill prompts to a file and return a short instruction."""
+        if len(prompt.encode("utf-8")) <= 2048 and not tag.startswith("distill"):
+            return prompt
+        prompts_dir = self.hq_dir / ".hq" / "prompts"
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        safe_tag = (
+            "".join(c if (c.isalnum() or c in "-_") else "-" for c in (tag or "prompt")).strip("-")
+            or "prompt"
+        )
+        prompt_file = prompts_dir / f"{safe_tag}-{now}.md"
+        if prompt_file.exists():
+            seq = 1
+            while (prompts_dir / f"{safe_tag}-{now}-{seq}.md").exists():
+                seq += 1
+            prompt_file = prompts_dir / f"{safe_tag}-{now}-{seq}.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        return f"请读取并执行指令文件 `{prompt_file}` 中的全部要求，完成后直接给出简洁结论。"
+
     def _dispatch_interactive(
         self,
         session: Dict[str, Any],
@@ -628,6 +658,7 @@ class HQDaemon:
         now: int,
         cwd: Optional[Path] = None,
         wait: bool = True,
+        prompt_tag: str = "prompt",
     ) -> str:
         skey = str(session["session_key"])
         target_cwd = cwd or (
@@ -635,16 +666,35 @@ class HQDaemon:
         )
         pane_name = self._ensure_session_pane(session, cwd=target_cwd, effort=effort)
 
+        if (
+            self.terminal_driver.name == "herdr"
+            or prompt_tag.startswith("distill")
+            or len(prompt.encode("utf-8")) > 8192
+        ):
+            delivery_prompt = self._materialize_long_prompt(prompt, tag=prompt_tag, now=now)
+        else:
+            delivery_prompt = prompt
         agent_sid = session.get("agent_session_id")
         prev_turns = int(session.get("turn_count") or 0)
-        self.db.record_dispatch(skey, agent_sid, prompt, now=now)
+        tpath_before = session.get("transcript_path")
+        offset_before = (
+            self.agent_adapter.count_transcript_lines(str(tpath_before))
+            if tpath_before
+            else 0
+        )
+        self.db.record_dispatch(skey, agent_sid, delivery_prompt, now=now)
         self.db.delete_meta(f"last_reply:{skey}")
         self.db.delete_meta(f"last_reply_pane:{pane_name}")
         self.db.set_meta(f"daemon_waiting:{skey}", "1", now=now)
         self.db.set_meta(f"daemon_waiting_pane:{pane_name}", "1", now=now)
         try:
             fallback_reply = self.terminal_driver.prompt_agent(
-                pane_name, prompt, wait=wait
+                pane_name, delivery_prompt, wait=wait
+            )
+        except AgentBlockedError:
+            return (
+                "⏸️ Agent 正在等待工具或操作审批（状态：blocked），"
+                "请打开 herdr 面板确认，或在 hq.yaml 中开启 agent.permission_mode: turbo。"
             )
         finally:
             self.db.delete_meta(f"daemon_waiting:{skey}")
@@ -657,13 +707,35 @@ class HQDaemon:
         if pane_reply is not None:
             self.db.delete_meta(f"last_reply_pane:{pane_name}")
 
+        fresh = self.db.get_session(skey) or session
         if hook_reply and hook_reply.strip():
             reply = hook_reply
         elif pane_reply and pane_reply.strip():
             reply = pane_reply
         else:
-            reply = fallback_reply or ""
-        fresh = self.db.get_session(skey) or session
+            transcript_reply = ""
+            tpath_after = fresh.get("transcript_path") or tpath_before
+            if tpath_after and Path(str(tpath_after)).exists():
+                turns, _ = self.agent_adapter.read_transcript_slice(
+                    str(tpath_after), from_line=offset_before
+                )
+                assistant_msgs = [
+                    t.text for t in turns if t.role == "assistant" and t.text.strip()
+                ]
+                if assistant_msgs:
+                    transcript_reply = assistant_msgs[-1]
+            if transcript_reply:
+                reply = transcript_reply
+            elif self.terminal_driver.name != "herdr":
+                reply = fallback_reply or ""
+            elif wait:
+                reply = (
+                    "⏳ 请求已送达交互式会话，但本轮尚未产出最终文本回复（可能仍在执行后台任务），"
+                    "可打开 herdr 查看实时进度。"
+                )
+            else:
+                reply = ""
+
         cur_turns = int(fresh.get("turn_count") or 0)
         new_turns = cur_turns if cur_turns > prev_turns else prev_turns + 1
         self.db.update_session(
@@ -805,6 +877,7 @@ class HQDaemon:
                 now=now,
                 cwd=self.hq_dir,
                 wait=True,
+                prompt_tag="distill",
             )
 
             if reply.strip():

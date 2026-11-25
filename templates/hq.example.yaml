@@ -6,6 +6,8 @@ agent:
   index_file: AGENTS.md
   default_effort: high
   light_effort: low
+  # Permission mode: default | turbo (always-proceed) | accept-edits | skip-all
+  permission_mode: "default"
 
 terminal:
   backend: auto

@@ -120,7 +120,9 @@ class AgyAdapter(CodingAgentAdapter):
             cmd.extend(["-i", initial_prompt])
         return cmd
 
-    def extra_trust_args(self, trusted_dirs: List[Path]) -> List[str]:
+    def extra_trust_args(
+        self, trusted_dirs: List[Path], permission_mode: str = "default"
+    ) -> List[str]:
         unique: List[str] = []
         for d in trusted_dirs:
             if not d:
@@ -128,12 +130,23 @@ class AgyAdapter(CodingAgentAdapter):
             resolved = str(Path(d).expanduser().resolve())
             if resolved not in unique:
                 unique.append(resolved)
-        if not unique:
-            return []
-        return [
-            "--settings",
-            json.dumps({"trustedWorkspaces": unique}, ensure_ascii=False),
-        ]
+
+        settings: Dict[str, Any] = {}
+        if unique:
+            settings["trustedWorkspaces"] = unique
+
+        mode = (permission_mode or "default").strip().lower()
+        if mode in {"turbo", "always-proceed"}:
+            settings["toolPermission"] = "always-proceed"
+        elif mode == "accept-edits":
+            settings["agentMode"] = "accept-edits"
+
+        args: List[str] = []
+        if settings:
+            args.extend(["--settings", json.dumps(settings, ensure_ascii=False)])
+        if mode == "skip-all":
+            args.append("--dangerously-skip-permissions")
+        return args
 
     def parse_headless_output(self, stdout: str) -> HeadlessResult:
         raw = (stdout or "").strip()

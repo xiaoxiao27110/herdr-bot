@@ -37,6 +37,24 @@ GENERAL_TRACKS = {"GENERAL", "B"}
 TOPIC_TRACKS = {"TOPIC", "C"}
 GENERAL_ROTATABLE_STATUSES = {"idle", "done", "unknown", "running", ""}
 OUTBOX_BACKOFF_SCHEDULE = [10, 30, 120, 300, 600]
+DIGEST_CATEGORY_LABELS: Dict[str, str] = {
+    "dead_event": "失败事件",
+    "dream_error": "夜间整理异常",
+    "outbox_dead": "外发投递失败",
+    "dirty_worktree": "脏工作区提醒",
+    "dirty_stale": "滞留脏工作区",
+    "quiet_hours_downgrade": "夜间免打扰汇总",
+    "agent_digest": "进展汇总",
+}
+
+
+def _format_digest_category(category: str) -> str:
+    raw = (category or "").strip()
+    if raw in DIGEST_CATEGORY_LABELS:
+        return DIGEST_CATEGORY_LABELS[raw]
+    if raw and any(ord(ch) > 127 for ch in raw):
+        return raw
+    return "系统提醒"
 
 
 def _upsert_task_progress_file(
@@ -222,8 +240,7 @@ class HQDaemon:
                 sess = self.spawn_task(repo_name, slug, task_prompt, now=now)
                 if self.channel:
                     self.channel.send_message(
-                        f"Spawned #Topic task `{sess['session_key']}` in pane `{sess['pane_name']}` "
-                        f"(branch `{sess['branch_name']}`, thread `{sess.get('channel_thread_id') or '-'}`)."
+                        f"已启动任务 `{sess['session_key']}`（面板 `{sess['pane_name']}`，分支 `{sess['branch_name']}`）。"
                     )
                 return
 
@@ -250,7 +267,7 @@ class HQDaemon:
                         ]
                     ]
                     self.channel.send_message(
-                        f"Session `{sess['session_key']}` is sealed. Choose how to proceed:",
+                        f"会话 `{sess['session_key']}` 已封口，请选择继续方式：",
                         thread_id=msg.thread_id,
                         buttons=buttons,
                     )
@@ -276,7 +293,7 @@ class HQDaemon:
     def _handle_callback(self, msg: InboundMessage, now: int) -> None:
         data = msg.callback_data or ""
         if self.channel and msg.callback_id:
-            self.channel.answer_callback(msg.callback_id, "Received")
+            self.channel.answer_callback(msg.callback_id, "已收到")
 
         if data.startswith("seal_new:"):
             old_key = data.split(":", 1)[1]
@@ -286,7 +303,7 @@ class HQDaemon:
                 self.db.get_meta(f"pending_sealed_msg:{thread_id}")
                 if thread_id
                 else None
-            ) or "Continue work on current branch."
+            ) or "继续当前分支的工作。"
             new_key = f"thread:{thread_id or 'main'}:{now}"
             topic_slug = old_sess.get("topic_slug") if old_sess else None
             pane_name = (
@@ -353,6 +370,32 @@ class HQDaemon:
             else:
                 skey, choice_idx = rest, ""
             choice_label = choice_idx
+            existing_action = (
+                self.db.get_deferred_action(msg.message_id) if msg.message_id else None
+            )
+            if msg.message_id and existing_action is None:
+                sess_check = self.db.get_session(skey) if skey else None
+                if not sess_check or not sess_check.get("suspended_msg_id"):
+                    if self.channel:
+                        self.channel.send_message(
+                            "该操作卡片已过期或已处理，请直接回复最新消息。",
+                            thread_id=msg.thread_id
+                            or (sess_check.get("channel_thread_id") if sess_check else None),
+                        )
+                    return
+            if existing_action is not None and (
+                existing_action.get("resolved_at") is not None
+                or int(existing_action.get("expires_at") or 0) <= now
+            ):
+                orig = self.db.get_session(str(existing_action["session_key"]))
+                if self.channel:
+                    self.channel.send_message(
+                        "该操作卡片已过期或已处理，请直接回复最新消息。",
+                        thread_id=msg.thread_id
+                        or (orig.get("channel_thread_id") if orig else None),
+                    )
+                return
+
             action = (
                 self.db.resolve_deferred_action(msg.message_id, now=now)
                 if msg.message_id
@@ -367,6 +410,16 @@ class HQDaemon:
             elif skey:
                 self.db.update_session(skey, suspended_msg_id=None)
 
+            orig = self.db.get_session(skey) if skey else None
+            reply_thread_id = msg.thread_id or (
+                orig.get("channel_thread_id") if orig else None
+            )
+            if self.channel:
+                self.channel.send_message(
+                    f"已收到你的选择：{choice_label}",
+                    thread_id=reply_thread_id,
+                )
+
             if skey:
                 self.db.enqueue_event(
                     source="deferred_resume",
@@ -377,10 +430,46 @@ class HQDaemon:
                         "session_key": skey,
                         "choice_id": choice_idx,
                         "choice_label": choice_label,
-                        "thread_id": msg.thread_id,
+                        "thread_id": reply_thread_id,
                     },
                     now=now,
                 )
+            return
+
+        if data.startswith("pane_continue:") or data.startswith("pane_seal:"):
+            is_seal = data.startswith("pane_seal:")
+            skey = data.split(":", 1)[1]
+            label = "封口结束" if is_seal else "继续执行"
+            existing_action = (
+                self.db.get_deferred_action(msg.message_id) if msg.message_id else None
+            )
+            if existing_action is not None and (
+                existing_action.get("resolved_at") is not None
+                or int(existing_action.get("expires_at") or 0) <= now
+            ):
+                orig = self.db.get_session(str(existing_action["session_key"]))
+                if self.channel:
+                    self.channel.send_message(
+                        "该操作卡片已过期或已处理，请直接回复最新消息。",
+                        thread_id=msg.thread_id
+                        or (orig.get("channel_thread_id") if orig else None),
+                    )
+                return
+            if msg.message_id and existing_action is not None:
+                self.db.resolve_deferred_action(msg.message_id, now=now)
+            elif skey:
+                self.db.update_session(skey, suspended_msg_id=None)
+            orig = self.db.get_session(skey) if skey else None
+            reply_thread_id = msg.thread_id or (
+                orig.get("channel_thread_id") if orig else None
+            )
+            if self.channel:
+                self.channel.send_message(
+                    f"已收到你的选择：{label}",
+                    thread_id=reply_thread_id,
+                )
+            if is_seal and orig:
+                self.seal_session(str(orig["session_key"]), now=now)
             return
 
         if msg.message_id:
@@ -622,10 +711,10 @@ class HQDaemon:
             )
         thread_id = updated.get("channel_thread_id")
         if not was_sealed and thread_id and self.channel is not None:
-            reason_note = f" ({reason.strip()})" if reason and reason.strip() else ""
+            reason_note = f"（原因：{reason.strip()}）" if reason and reason.strip() else ""
             try:
                 self.channel.send_message(
-                    f"Session `{skey}` sealed{reason_note}. Worktree preserved until nightly archive.",
+                    f"会话 `{skey}` 已封口（工作树保留至夜间安全归档）{reason_note}。",
                     thread_id=str(thread_id),
                 )
             except Exception:
@@ -1042,12 +1131,12 @@ class HQDaemon:
             thread_id = ev.payload.get("channel_thread_id")
             if self.channel:
                 msg_id = self.channel.send_message(
-                    f"[Review] Managed pane for session `{skey}` appears blocked. Choose action:",
+                    f"⏸️ 任务 `{skey}` 当前处于阻塞状态，等待你处理：",
                     thread_id=thread_id,
                     buttons=[
                         [
-                            InlineButton(text="Continue", callback_data=f"pane_continue:{skey}"),
-                            InlineButton(text="Seal", callback_data=f"pane_seal:{skey}"),
+                            InlineButton(text="继续执行", callback_data=f"pane_continue:{skey}"),
+                            InlineButton(text="封口结束", callback_data=f"pane_seal:{skey}"),
                         ]
                     ],
                 )
@@ -1057,8 +1146,8 @@ class HQDaemon:
                         session_key=skey,
                         level="review",
                         options=[
-                            {"id": "continue", "label": "Continue"},
-                            {"id": "seal", "label": "Seal"},
+                            {"id": "continue", "label": "继续执行"},
+                            {"id": "seal", "label": "封口结束"},
                         ],
                         ttl_hours=self.config.tuning.deferred_approval_ttl_hours,
                         now=now,
@@ -1125,7 +1214,7 @@ class HQDaemon:
                 self.db.add_digest_item(
                     level="alert",
                     category="dream_error",
-                    message=f"Nightly dreaming failed: {exc}",
+                    message=f"夜间记忆整理失败：{exc}",
                     now=ts,
                 )
 
@@ -1165,16 +1254,19 @@ class HQDaemon:
         ts = int(now if now is not None else time.time())
         items = self.db.list_pending_digest_items()
         warn_sec = self.config.tuning.dirty_worktree_warn_hours * 3600
-        lines: List[str] = ["[L0 Morning Digest]"]
+        lines: List[str] = ["### 🌅 每日晨报"]
         for it in items:
-            lines.append(f"- [{it['category']}] {it['message']}")
+            cat_label = _format_digest_category(str(it.get("category") or ""))
+            lines.append(f"- 【{cat_label}】{it['message']}")
         for sess in self.db.list_sessions(statuses=["sealed", "pinned"]):
             if sess.get("archive_blocked_reason") and (ts - int(sess["last_active_at"])) >= warn_sec:
                 lines.append(
-                    f"- [dirty_stale] `{sess['session_key']}` blocked > {self.config.tuning.dirty_worktree_warn_hours}h at `{sess.get('worktree_path')}`"
+                    f"- 【滞留脏工作区】会话 `{sess['session_key']}` 已有超过 "
+                    f"{self.config.tuning.dirty_worktree_warn_hours} 小时未清理"
+                    f"（路径：`{sess.get('worktree_path')}`）"
                 )
         if len(lines) == 1:
-            lines.append("- All clear. No pending alerts or blocked worktrees.")
+            lines.append("- 一切正常，暂无待处理告警或滞留工作区。")
         if self.channel:
             self.channel.send_message("\n".join(lines))
         self.db.mark_digest_items_sent([int(i["id"]) for i in items], now=ts)

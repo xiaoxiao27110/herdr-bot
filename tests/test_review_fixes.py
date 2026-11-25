@@ -280,7 +280,29 @@ class TestReviewFixes(unittest.TestCase):
                 sess_after = daemon.db.get_session("event:triage:1")
                 self.assertIsNone(sess_after["suspended_msg_id"])
                 self.assertEqual(sess_after["status"], "sealed")
+                self.assertTrue(any(m["text"] == "已收到你的选择：Accept" for m in ch.sent))
                 self.assertEqual(ch.sent[-1]["text"], "Applied choice!")
+
+                # Clicking the same card again returns expired/processed notice without re-enqueuing
+                ch.updates.append(
+                    InboundMessage(
+                        update_id=51,
+                        chat_id="c1",
+                        thread_id="thread-55",
+                        sender_id="u1",
+                        text="",
+                        is_callback=True,
+                        callback_id="cb-defer-dup",
+                        callback_data="defer:event:triage:1:1",
+                        message_id=msg_id,
+                    )
+                )
+                summary2 = daemon.run_once(now=125)
+                self.assertEqual(summary2.events_processed, 0)
+                self.assertEqual(
+                    ch.sent[-1]["text"],
+                    "该操作卡片已过期或已处理，请直接回复最新消息。",
+                )
             finally:
                 daemon.close()
 

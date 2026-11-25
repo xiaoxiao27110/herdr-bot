@@ -70,9 +70,11 @@ def archive_eligible_sessions(
                 if not clean or unpushed:
                     reason_detail = []
                     if not clean:
-                        reason_detail.append(f"uncommitted changes: {status_out}")
+                        reason_detail.append(f"存在未提交修改：{status_out}")
                     if unpushed:
-                        reason_detail.append(f"unpushed commits: {unpushed_out}")
+                        reason_detail.append(f"存在未推送提交：{unpushed_out}")
+                    slug_label = str(sess.get("topic_slug") or skey)
+                    reason_text = "；".join(reason_detail)
                     db.update_session(
                         skey,
                         archive_blocked_reason="dirty_or_unpushed",
@@ -81,9 +83,8 @@ def archive_eligible_sessions(
                         level="alert",
                         category="dirty_worktree",
                         message=(
-                            f"[ALERT] Session `{skey}` (branch `{branch_name}`) "
-                            f"blocked from nightly archive: {'; '.join(reason_detail)}. "
-                            f"Worktree preserved at `{wt_path}`."
+                            f"工作区 `{slug_label}` 存在未提交修改/未推送提交，"
+                            f"已跳过夜间清理（原因：{reason_text}）"
                         ),
                         now=ts,
                     )
@@ -103,9 +104,9 @@ def archive_eligible_sessions(
 
         if channel is not None and thread_id:
             receipt = (
-                f"Archived session `{skey}`.\n"
-                f"Branch preserved: `{branch_name or '(none)'}`\n"
-                f"Resume anytime with: `hq resume {skey}`"
+                f"会话 `{skey}` 已完成夜间归档。\n"
+                f"已保留分支：`{branch_name or '无'}`\n"
+                f"随时可通过以下命令恢复：`hq resume {skey}`"
             )
             try:
                 channel.send_message(receipt, thread_id=str(thread_id))

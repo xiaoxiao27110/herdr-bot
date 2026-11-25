@@ -15,6 +15,13 @@ from hq_pilot.config import load_config, load_secrets_env
 from hq_pilot.db import HQDatabase
 
 
+LEVEL_PREFIXES = {
+    "notify": "【提醒】",
+    "question": "【待确认】",
+    "review": "【待审批】",
+}
+
+
 def _parse_hhmm(value: str) -> Optional[int]:
     parts = value.strip().split(":")
     if len(parts) != 2:
@@ -101,7 +108,7 @@ def deliver_notification(
                 opt_objs.append({"id": str(idx), "label": opt})
             buttons = [row]
 
-        prefix = f"[{lvl.upper()}] "
+        prefix = LEVEL_PREFIXES.get(lvl, "【通知】")
         full_text = prefix + message
         msg_id: Optional[str] = None
         if ch is not None:

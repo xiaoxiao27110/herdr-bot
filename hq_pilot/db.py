@@ -285,10 +285,14 @@ class HQDatabase:
                 "UPDATE events SET status = 'dead', lease_until = 0 WHERE id = ?",
                 (event_id,),
             )
+            error_detail = (error_msg or "").strip() or "未知错误"
             self.add_digest_item(
                 level="alert",
                 category="dead_event",
-                message=f"Event #{event_id} ({row['source']}:{row['dedupe_key']}) moved to dead after {attempts} attempts. {error_msg}".strip(),
+                message=(
+                    f"任务事件 #{event_id}（{row['source']}）连续重试 {attempts} 次失败，"
+                    f"已转入死信：{error_detail}"
+                ),
                 now=ts,
             )
             return "dead"
@@ -914,13 +918,13 @@ class HQDatabase:
                 """,
                 (new_attempts, error, int(outbox_id)),
             )
+            error_detail = (error or "").strip() or "未知错误"
             self.add_digest_item(
                 level="alert",
                 category="outbox_dead",
                 message=(
-                    f"Outbox #{outbox_id} ({row['level']}) moved to dead after "
-                    f"{new_attempts} attempts: {error}"
-                ).strip(),
+                    f"消息 #{outbox_id}（{row['level']}）连续重试 {new_attempts} 次投递失败：{error_detail}"
+                ),
                 now=ts,
             )
             return "dead"

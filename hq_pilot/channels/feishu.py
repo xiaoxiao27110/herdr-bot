@@ -380,12 +380,12 @@ class FeishuChannel(MessagingChannel):
                 {
                     "toast": {
                         "type": "info" if inbound is not None else "warning",
-                        "content": "Received" if inbound is not None else "Unauthorized chat",
+                        "content": "已收到" if inbound is not None else "未授权的会话",
                     }
                 }
             )
         except ImportError:
-            return {"toast": {"type": "info", "content": "Received"}}
+            return {"toast": {"type": "info", "content": "已收到"}}
 
     def start(self) -> None:
         """Lazily start the background lark_oapi WebSocket client thread."""
@@ -546,7 +546,7 @@ class FeishuChannel(MessagingChannel):
             raise RuntimeError("Feishu allowed_chat_id is not configured (fail-closed)")
 
         card = _build_interactive_card(
-            text=f"Task thread created: **{title}**",
+            text=f"已创建任务话题：**{title}**",
             title=title,
         )
         try:

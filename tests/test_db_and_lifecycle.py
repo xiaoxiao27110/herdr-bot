@@ -76,6 +76,8 @@ class TestDBAndLifecycle(unittest.TestCase):
                 alerts = db.list_pending_digest_items()
                 self.assertEqual(len(alerts), 1)
                 self.assertEqual(alerts[0]["category"], "dead_event")
+                self.assertIn(f"任务事件 #{eid}（git_commit）连续重试 3 次失败，已转入死信：", alerts[0]["message"])
+                self.assertNotIn("moved to dead", alerts[0]["message"])
             finally:
                 db.close()
 

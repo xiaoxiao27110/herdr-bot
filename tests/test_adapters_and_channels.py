@@ -272,6 +272,10 @@ class TestAdaptersAndChannels(unittest.TestCase):
                 daemon.run_once(now=1010)
                 sess = daemon.db.get_session_by_thread("77")
                 self.assertEqual(sess["status"], "sealed")
+                self.assertEqual(
+                    ch.sent[-1]["text"],
+                    f"会话 `{sess['session_key']}` 已封口（工作树保留至夜间安全归档）。",
+                )
 
                 # Posting to sealed topic triggers 2-option inline keyboard instead of running agent
                 ch.updates.append(
@@ -279,6 +283,11 @@ class TestAdaptersAndChannels(unittest.TestCase):
                 )
                 s2 = daemon.run_once(now=1020)
                 self.assertEqual(s2.events_processed, 0)
+                self.assertEqual(
+                    ch.sent[-1]["text"],
+                    f"会话 `{sess['session_key']}` 已封口，请选择继续方式：",
+                )
+                self.assertNotIn("is sealed", ch.sent[-1]["text"])
                 self.assertIsNotNone(ch.sent[-1]["buttons"])
                 self.assertEqual(len(ch.sent[-1]["buttons"][0]), 2)
 

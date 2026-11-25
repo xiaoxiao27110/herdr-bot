@@ -101,6 +101,10 @@ class TestArchiverResumeCursors(unittest.TestCase):
                 # Digest buffer has red alerts for dirty & unpushed
                 alerts = db.list_pending_digest_items()
                 self.assertEqual(len(alerts), 2)
+                for al in alerts:
+                    self.assertEqual(al["category"], "dirty_worktree")
+                    self.assertIn("存在未提交修改/未推送提交，已跳过夜间清理（原因：", al["message"])
+                    self.assertNotIn("[ALERT]", al["message"])
 
                 # Pinned session untouched
                 self.assertTrue(wt_pinned.exists())
@@ -109,6 +113,7 @@ class TestArchiverResumeCursors(unittest.TestCase):
                 # Clean session archived, worktree removed, receipt sent, thread closed
                 self.assertFalse(wt_clean.exists())
                 self.assertEqual(db.get_session("s-clean")["status"], "archived")
+                self.assertIn("已完成夜间归档", ch.sent[-1]["text"])
                 self.assertIn("hq resume s-clean", ch.sent[-1]["text"])
                 self.assertIn("901", ch.closed_threads)
             finally:

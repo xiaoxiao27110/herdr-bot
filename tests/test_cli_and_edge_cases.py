@@ -50,6 +50,8 @@ class TestCLIAndEdgeCases(unittest.TestCase):
             m_not = deliver_notification(hq_dir, "notify", "build green", channel=ch, now=105)
             self.assertIsNotNone(m_not)
             self.assertEqual(len(ch.sent), 1)
+            self.assertEqual(ch.sent[0]["text"], "【提醒】build green")
+            self.assertNotIn("[NOTIFY]", ch.sent[0]["text"])
 
             # Question -> creates deferred_action & suspends session
             db = HQDatabase(hq_dir / ".hq" / "runtime.sqlite")
@@ -61,6 +63,16 @@ class TestCLIAndEdgeCases(unittest.TestCase):
                 options=["Yes", "No"], channel=ch, now=110,
             )
             self.assertIsNotNone(m_q)
+            self.assertEqual(ch.sent[1]["text"], "【待确认】Proceed?")
+            self.assertNotIn("[QUESTION]", ch.sent[1]["text"])
+
+            # Review -> uses 【待审批】 prefix
+            m_rev = deliver_notification(
+                hq_dir, "review", "Check release", channel=ch, now=115,
+            )
+            self.assertIsNotNone(m_rev)
+            self.assertEqual(ch.sent[2]["text"], "【待审批】Check release")
+            self.assertNotIn("[REVIEW]", ch.sent[2]["text"])
             db2 = HQDatabase(hq_dir / ".hq" / "runtime.sqlite")
             try:
                 self.assertEqual(db2.get_session("s-q")["suspended_msg_id"], m_q)
@@ -235,10 +247,173 @@ class TestCLIAndEdgeCases(unittest.TestCase):
             )
             try:
                 daemon.db.add_digest_item("alert", "dirty_worktree", "wt-1 dirty", now=100)
+                daemon.db.add_digest_item("alert", "dead_event", "任务事件 #1（channel）连续重试 3 次失败，已转入死信：boom", now=101)
+                daemon.db.add_digest_item("alert", "dream_error", "夜间记忆整理失败：timeout", now=102)
+                daemon.db.add_digest_item("alert", "outbox_dead", "消息 #2（notify）连续重试 5 次投递失败：502", now=103)
+                daemon.db.add_digest_item("digest", "quiet_hours_downgrade", "构建已完成", now=104)
+                daemon.db.add_digest_item("digest", "agent_digest", "夜间巡检无异常", now=105)
                 daemon.run_morning_digest(now=200)
                 self.assertEqual(len(ch.sent), 1)
-                self.assertIn("wt-1 dirty", ch.sent[0]["text"])
+                digest_text = ch.sent[0]["text"]
+                self.assertTrue(digest_text.startswith("### 🌅 每日晨报"))
+                self.assertIn("【脏工作区提醒】wt-1 dirty", digest_text)
+                self.assertIn("【失败事件】任务事件 #1", digest_text)
+                self.assertIn("【夜间整理异常】夜间记忆整理失败：timeout", digest_text)
+                self.assertIn("【外发投递失败】消息 #2", digest_text)
+                self.assertIn("【夜间免打扰汇总】构建已完成", digest_text)
+                self.assertIn("【进展汇总】夜间巡检无异常", digest_text)
+                for forbidden in (
+                    "[L0 Morning Digest]",
+                    "[dead_event]",
+                    "[dream_error]",
+                    "[outbox_dead]",
+                    "[dirty_worktree]",
+                    "[quiet_hours_downgrade]",
+                    "[agent_digest]",
+                ):
+                    self.assertNotIn(forbidden, digest_text)
                 self.assertEqual(daemon.db.list_pending_digest_items(), [])
+
+                # Empty digest outputs Chinese all-clear
+                daemon.run_morning_digest(now=300)
+                self.assertEqual(len(ch.sent), 2)
+                empty_digest = ch.sent[1]["text"]
+                self.assertTrue(empty_digest.startswith("### 🌅 每日晨报"))
+                self.assertIn("一切正常，暂无待处理告警或滞留工作区。", empty_digest)
+                self.assertNotIn("All clear", empty_digest)
+            finally:
+                daemon.close()
+
+    def test_localized_system_notifications_and_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "acme-hq"
+            hq_main(["init", str(hq_dir)])
+            repo_dir = Path(tmp) / "gateway-svc"
+            _init_git_repo(repo_dir)
+            (hq_dir / ".hq" / "local.yaml").write_text(
+                f"repo_paths:\n  gateway-svc: {repo_dir}\n", encoding="utf-8"
+            )
+            ch = FakeChannel()
+
+            class FailingDreamTerminal(DummyTerminal):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.fail_prompt = False
+
+                def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+                    if self.fail_prompt:
+                        raise RuntimeError("agent crashed")
+                    return super().prompt_agent(name, text, wait=wait, timeout_ms=timeout_ms)
+
+            term = FailingDreamTerminal()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=AgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                # 1. /task command receipt is Chinese
+                daemon._handle_inbound(
+                    InboundMessage(
+                        update_id=1,
+                        chat_id="c1",
+                        thread_id=None,
+                        sender_id="u1",
+                        text="/task gateway-svc fix-zh 修复文案",
+                    ),
+                    now=1000,
+                )
+                self.assertIn("已启动任务 `task:gateway-svc:fix-zh:1000`", ch.sent[-1]["text"])
+                self.assertIn("面板 `hq-fix-zh`", ch.sent[-1]["text"])
+                self.assertIn("分支 `hq/fix-zh`", ch.sent[-1]["text"])
+                self.assertNotIn("Spawned #Topic", ch.sent[-1]["text"])
+
+                # 2. pane_blocked card & buttons are Chinese
+                daemon.db.enqueue_event(
+                    source="pane_blocked",
+                    dedupe_key="pb:1",
+                    priority=10,
+                    available_at=1010,
+                    payload={
+                        "session_key": "task:gateway-svc:fix-zh:1000",
+                        "channel_thread_id": "thread-101",
+                    },
+                    now=1010,
+                )
+                evs = daemon.db.claim_next_events(limit=5, now=1010)
+                self.assertEqual(len(evs), 1)
+                daemon._process_event(evs[0], now=1010)
+                pb_msg = ch.sent[-1]
+                self.assertEqual(
+                    pb_msg["text"],
+                    "⏸️ 任务 `task:gateway-svc:fix-zh:1000` 当前处于阻塞状态，等待你处理：",
+                )
+                self.assertNotIn("appears blocked", pb_msg["text"])
+                btn_texts = [b.text for b in pb_msg["buttons"][0]]
+                self.assertEqual(btn_texts, ["继续执行", "封口结束"])
+
+                # 3. Clicking pane_continue sends confirmation receipt; clicking again reports expired/processed
+                daemon._handle_callback(
+                    InboundMessage(
+                        update_id=2,
+                        chat_id="c1",
+                        thread_id="thread-101",
+                        sender_id="u1",
+                        text="",
+                        is_callback=True,
+                        callback_id="cb-pb-1",
+                        callback_data="pane_continue:task:gateway-svc:fix-zh:1000",
+                        message_id=pb_msg["id"],
+                    ),
+                    now=1015,
+                )
+                self.assertEqual(ch.sent[-1]["text"], "已收到你的选择：继续执行")
+
+                daemon._handle_callback(
+                    InboundMessage(
+                        update_id=3,
+                        chat_id="c1",
+                        thread_id="thread-101",
+                        sender_id="u1",
+                        text="",
+                        is_callback=True,
+                        callback_id="cb-pb-2",
+                        callback_data="pane_continue:task:gateway-svc:fix-zh:1000",
+                        message_id=pb_msg["id"],
+                    ),
+                    now=1016,
+                )
+                self.assertEqual(
+                    ch.sent[-1]["text"],
+                    "该操作卡片已过期或已处理，请直接回复最新消息。",
+                )
+
+                # 4. Nightly dreaming failure writes Chinese dream_error digest item
+                term.fail_prompt = True
+                daemon.run_nightly_pipeline(now=2000)
+                dream_items = [
+                    it
+                    for it in daemon.db.list_pending_digest_items()
+                    if it["category"] == "dream_error"
+                ]
+                self.assertEqual(len(dream_items), 1)
+                self.assertEqual(dream_items[0]["message"], "夜间记忆整理失败：agent crashed")
+                self.assertNotIn("Nightly dreaming failed", dream_items[0]["message"])
+
+                # 5. Stale blocked dirty worktree shows Chinese label in morning digest
+                daemon.db.update_session(
+                    "task:gateway-svc:fix-zh:1000",
+                    status="sealed",
+                    archive_blocked_reason="dirty_or_unpushed",
+                    last_active_at=1000,
+                )
+                daemon.run_morning_digest(now=1000 + 50 * 3600)
+                digest_text = ch.sent[-1]["text"]
+                self.assertTrue(digest_text.startswith("### 🌅 每日晨报"))
+                self.assertIn("【滞留脏工作区】", digest_text)
+                self.assertNotIn("[dirty_stale]", digest_text)
+                self.assertNotIn("[L0 Morning Digest]", digest_text)
             finally:
                 daemon.close()
 

@@ -365,7 +365,8 @@ class TestOutboxResilience(unittest.TestCase):
                 ]
                 self.assertEqual(len(alerts), 1)
                 self.assertEqual(alerts[0]["level"], "alert")
-                self.assertIn(f"Outbox #{outbox_id}", alerts[0]["message"])
+                self.assertIn(f"消息 #{outbox_id}（notify）连续重试 3 次投递失败：", alerts[0]["message"])
+                self.assertNotIn("Outbox #", alerts[0]["message"])
             finally:
                 daemon.close()
 

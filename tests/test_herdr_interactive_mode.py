@@ -326,18 +326,37 @@ class TestHerdrInteractiveMode(unittest.TestCase):
                 self.assertEqual(summary.events_processed, 4)
                 self.assertEqual(summary.events_failed, 0)
 
-                # All 4 routed to hq-general, started once, NEVER with -p
-                self.assertEqual(len(term.start_agent_calls), 1)
-                self.assertEqual(term.start_agent_calls[0]["name"], GENERAL_PANE_NAME)
-                self.assertEqual(term.start_agent_calls[0]["kind"], "agy")
-                self.assertNotIn("-p", term.start_agent_calls[0]["agent_args"])
-                self.assertNotIn("--print", term.start_agent_calls[0]["agent_args"])
-                self.assertEqual(term.start_agent_calls[0]["env"]["HQ_DIR"], str(hq_dir.resolve()))
-                self.assertEqual(term.start_agent_calls[0]["env"]["HQ_SESSION_KEY"], "general:1")
+                # channel + deferred_resume -> hq-general (started once);
+                # git_commit + session_distill -> isolated ephemeral hq-bg-* panes (started & closed);
+                # NEVER with -p / --print
+                self.assertEqual(len(term.start_agent_calls), 3)
+                for call in term.start_agent_calls:
+                    self.assertEqual(call["kind"], "agy")
+                    self.assertNotIn("-p", call["agent_args"])
+                    self.assertNotIn("--print", call["agent_args"])
+                    self.assertEqual(call["env"]["HQ_DIR"], str(hq_dir.resolve()))
+
+                gen_starts = [c for c in term.start_agent_calls if c["name"] == GENERAL_PANE_NAME]
+                bg_starts = [c for c in term.start_agent_calls if c["name"].startswith("hq-bg-")]
+                self.assertEqual(len(gen_starts), 1)
+                self.assertEqual(gen_starts[0]["env"]["HQ_SESSION_KEY"], "general:1")
+                self.assertEqual(len(bg_starts), 2)
+                for bg in bg_starts:
+                    self.assertEqual(bg["env"]["HQ_EPHEMERAL"], "1")
+                    self.assertEqual(
+                        bg["env"]["HQ_EPHEMERAL_REPLY_KEY"],
+                        f"ephemeral_reply:{bg['name']}",
+                    )
+                    self.assertNotIn("HQ_SESSION_KEY", bg["env"])
+                    self.assertNotIn(bg["name"], term.panes)
+                self.assertIn(GENERAL_PANE_NAME, term.panes)
                 self.assertTrue((hq_dir / ".agents" / "hooks.json").exists())
 
                 self.assertEqual(len(term.prompt_calls), 4)
-                self.assertTrue(all(p["name"] == GENERAL_PANE_NAME for p in term.prompt_calls))
+                gen_prompts = [p for p in term.prompt_calls if p["name"] == GENERAL_PANE_NAME]
+                bg_prompts = [p for p in term.prompt_calls if p["name"].startswith("hq-bg-")]
+                self.assertEqual(len(gen_prompts), 2)
+                self.assertEqual(len(bg_prompts), 2)
 
                 # General session track is GENERAL
                 gen = daemon.db.get_session("general:1")
@@ -349,14 +368,19 @@ class TestHerdrInteractiveMode(unittest.TestCase):
                 self.assertEqual(ch.finished_indicators[0]["id"], ch.indicators[0]["id"])
                 self.assertEqual(ch.finished_indicators[0]["text"], "interactive-reply@hq-general")
 
-                # Distill wrote to notes/today.md and advanced cursor
-                self.assertIn("interactive-reply@hq-general", (hq_dir / "notes" / "today.md").read_text(encoding="utf-8"))
+                # Distill wrote ephemeral pane reply to notes/today.md and advanced cursor
+                today_text = (hq_dir / "notes" / "today.md").read_text(encoding="utf-8")
+                self.assertIn("interactive-reply@hq-bg-distill-", today_text)
                 self.assertEqual(daemon.cursors.get_transcript_cursor("conv-distill-1")["last_summarized_line"], 2)
 
-                # 5. Nightly dream_consolidate also routes to hq-general with zero -p
+                # 5. Nightly dream-consolidate runs in isolated ephemeral hq-bg-dream-* pane with zero -p
                 daemon.run_nightly_pipeline(now=2000)
-                self.assertEqual(term.prompt_calls[-1]["name"], GENERAL_PANE_NAME)
-                self.assertIn("dream-consolidate", term.prompt_calls[-1]["text"])
+                dream_call = term.prompt_calls[-1]
+                self.assertTrue(dream_call["name"].startswith("hq-bg-dream-"))
+                self.assertNotIn(dream_call["name"], term.panes)
+                dream_prompt_file = hq_dir / ".hq" / "prompts" / "dream-2000.md"
+                self.assertTrue(dream_prompt_file.exists())
+                self.assertIn("dream-consolidate", dream_prompt_file.read_text(encoding="utf-8"))
             finally:
                 daemon.close()
 

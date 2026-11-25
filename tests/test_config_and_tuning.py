@@ -22,7 +22,7 @@ class TestConfigAndTuning(unittest.TestCase):
         self.assertEqual(t.digest_cron, "09:30")
         self.assertEqual(t.inbox_lease_ttl_sec, 900)
         self.assertEqual(t.inbox_max_attempts, 3)
-        self.assertEqual(t.commit_debounce_sec, 300)
+        self.assertEqual(t.commit_debounce_sec, 900)
         self.assertEqual(t.active_repo_quiet_minutes, 15)
         self.assertEqual(t.pane_blocked_notify_sec, 0)
         self.assertEqual(t.deferred_approval_ttl_hours, 24)
@@ -34,8 +34,8 @@ class TestConfigAndTuning(unittest.TestCase):
         self.assertEqual(t.general_rotation_quiet_minutes, 60)
         self.assertEqual(t.transcript_busy_window_sec, 120)
         self.assertFalse(hasattr(t, "topic_idle_seal_minutes"))
-        self.assertEqual(t.distill_idle_minutes, 20)
-        self.assertEqual(t.distill_min_new_turns, 3)
+        self.assertEqual(t.distill_idle_minutes, 60)
+        self.assertEqual(t.distill_min_new_turns, 8)
         self.assertEqual(t.dirty_worktree_warn_hours, 48)
         self.assertEqual(t.git_sync_debounce_minutes, 120)
 
@@ -60,7 +60,7 @@ class TestConfigAndTuning(unittest.TestCase):
             self.assertEqual(hq_main(["config", "list", "--hq-dir", str(hq_dir)]), 0)
 
             cfg = load_config(hq_dir)
-            self.assertEqual(cfg.tuning.commit_debounce_sec, 300)
+            self.assertEqual(cfg.tuning.commit_debounce_sec, 900)
             self.assertTrue(cfg.tuning.dream_force_nightly)
 
             # Ensure mtime advances deterministically

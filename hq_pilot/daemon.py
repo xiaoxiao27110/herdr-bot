@@ -231,6 +231,7 @@ class HQDaemon:
         # Retained only for constructor compatibility; daemon never invokes headless CLI runs.
         self.cmd_runner: CmdRunner = cmd_runner or default_cmd_runner
         self._stop_requested = False
+        self._ephemeral_panes_used: Set[str] = set()
 
     def close(self) -> None:
         self.db.close()
@@ -1029,8 +1030,8 @@ class HQDaemon:
         return sess
 
     def _materialize_long_prompt(self, prompt: str, tag: str, now: int) -> str:
-        """Persist long prompts (>2KB) or distill prompts to a file and return a short instruction."""
-        if len(prompt.encode("utf-8")) <= 2048 and not tag.startswith("distill"):
+        """Persist long prompts (>2KB) or distill/dream prompts to a file and return a short instruction."""
+        if len(prompt.encode("utf-8")) <= 2048 and not tag.startswith(("distill", "dream")):
             return prompt
         prompts_dir = self.hq_dir / ".hq" / "prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -1046,6 +1047,84 @@ class HQDaemon:
             prompt_file = prompts_dir / f"{safe_tag}-{now}-{seq}.md"
         prompt_file.write_text(prompt, encoding="utf-8")
         return f"请读取并执行指令文件 `{prompt_file}` 中的全部要求，完成后直接给出简洁结论。"
+
+    def _allocate_ephemeral_pane_name(self, tag: str, now: int) -> str:
+        clean_tag = (
+            "".join(c if (c.isalnum() or c in "-_") else "-" for c in (tag or "bg").lower()).strip("-")
+            or "bg"
+        )
+        base = f"hq-bg-{clean_tag}-{int(now) % 100000}"
+        live_panes = {p.name for p in self.terminal_driver.list_panes()}
+        if len(self._ephemeral_panes_used) > 128:
+            self._ephemeral_panes_used.clear()
+        candidate = base
+        seq = 1
+        while candidate in live_panes or candidate in self._ephemeral_panes_used:
+            candidate = f"{base}-{seq}"
+            seq += 1
+        self._ephemeral_panes_used.add(candidate)
+        return candidate
+
+    def _run_ephemeral_background_task(
+        self,
+        prompt: str,
+        *,
+        effort: str,
+        now: int,
+        tag: str = "bg",
+    ) -> str:
+        """Run a background task in a disposable `hq-bg-*` pane and close it immediately."""
+        pane_name = self._allocate_ephemeral_pane_name(tag=tag, now=now)
+        reply_key = f"ephemeral_reply:{pane_name}"
+        delivery_prompt = self._materialize_long_prompt(prompt, tag=tag, now=now)
+
+        self.hq_dir.mkdir(parents=True, exist_ok=True)
+        self.agent_adapter.ensure_hooks_installed(self.hq_dir, self._hook_bin_path())
+        repo_paths = [
+            self.config.get_repo_path(r)
+            for r in sorted(self.config.repos.keys())
+            if self.config.get_repo_path(r).exists()
+        ]
+        interactive_cmd = self.agent_adapter.build_interactive_cmd(
+            initial_prompt=None,
+            model=self.config.agent.model,
+            effort=effort,
+            add_dirs=repo_paths or None,
+        )
+        trust_args = self.agent_adapter.extra_trust_args(
+            [self.hq_dir, *repo_paths],
+            permission_mode=self.config.agent.permission_mode,
+        )
+
+        self.db.delete_meta(reply_key)
+        try:
+            self.terminal_driver.start_agent(
+                name=pane_name,
+                cwd=self.hq_dir,
+                kind=self.agent_adapter.name,
+                agent_args=[*interactive_cmd[1:], *trust_args],
+                env={
+                    "HQ_DIR": str(self.hq_dir),
+                    "HQ_EPHEMERAL": "1",
+                    "HQ_EPHEMERAL_REPLY_KEY": reply_key,
+                },
+            )
+            fallback_reply = self.terminal_driver.prompt_agent(
+                pane_name, delivery_prompt, wait=True
+            )
+            hook_reply = self.db.get_meta(reply_key)
+            if hook_reply and hook_reply.strip():
+                return hook_reply.strip()
+            return (fallback_reply or "").strip()
+        finally:
+            self.db.delete_meta(reply_key)
+            try:
+                self.terminal_driver.kill_pane(pane_name)
+            except Exception as exc:
+                print(
+                    f"[hq-daemon] warn: failed to close ephemeral pane {pane_name}: {exc}",
+                    flush=True,
+                )
 
     def _ensure_pane_approval_card(
         self,
@@ -1454,29 +1533,19 @@ class HQDaemon:
 
         if ev.source == "git_commit":
             repo_name = str(ev.payload.get("repo", ""))
-            sess = self._ensure_general_session(now)
-            is_busy, _, _ = self._inspect_session_busy(sess, now)
-            if is_busy:
-                self.db.park_event_waiting(
-                    ev.id, payload_updates={"wait_session_key": str(sess["session_key"])}
-                )
-                raise _EventParked()
             recent_outbound = self._get_recent_outbound()
-            handoff_prefix = self._consume_general_handoff_prefix(sess)
-            prompt = handoff_prefix + build_prompt(
+            prompt = build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
                 matched_repos=[repo_name] if repo_name else None,
                 recent_outbound=recent_outbound,
             )
-            self._dispatch_interactive(
-                sess,
+            self._run_ephemeral_background_task(
                 prompt,
                 effort=self.config.agent.light_effort,
                 now=now,
-                cwd=self.hq_dir,
-                wait=True,
+                tag="commit",
             )
             return
 
@@ -1486,29 +1555,18 @@ class HQDaemon:
             tpath = str(ev.payload.get("transcript_path", ""))
             to_line = int(ev.payload.get("to_line", 0))
 
-            sess = self._ensure_general_session(now)
-            is_busy, _, _ = self._inspect_session_busy(sess, now)
-            if is_busy:
-                self.db.park_event_waiting(
-                    ev.id, payload_updates={"wait_session_key": str(sess["session_key"])}
-                )
-                raise _EventParked()
             recent_outbound = self._get_recent_outbound()
-            handoff_prefix = self._consume_general_handoff_prefix(sess)
-            prompt = handoff_prefix + build_prompt(
+            prompt = build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
                 recent_outbound=recent_outbound,
             )
-            reply = self._dispatch_interactive(
-                sess,
+            reply = self._run_ephemeral_background_task(
                 prompt,
                 effort=self.config.agent.light_effort,
                 now=now,
-                cwd=self.hq_dir,
-                wait=True,
-                prompt_tag="distill",
+                tag="distill",
             )
 
             if reply.strip():
@@ -1663,27 +1721,24 @@ class HQDaemon:
                     (ev.id,),
                 )
 
-        # Step 1: Dreaming (routed to #General interactive pane)
+        # Step 1: Dreaming (isolated ephemeral background pane)
         last_dream_at = int(self.db.get_meta("last_dream_at", "0") or "0")
         sessions_since = int(self.db.get_meta("sessions_since_dream", "0") or "0")
         interval_ok = (ts - last_dream_at) >= self.config.tuning.dream_min_interval_hours * 3600
         sessions_ok = sessions_since >= self.config.tuning.dream_min_sessions
 
         if self.config.tuning.dream_force_nightly or (interval_ok and sessions_ok):
-            dream_sess = self._ensure_general_session(ts)
             prompt = build_prompt(
                 self.hq_dir,
                 self.config,
                 {"task": "dream-consolidate", "timestamp": ts},
             )
             try:
-                self._dispatch_interactive(
-                    dream_sess,
+                self._run_ephemeral_background_task(
                     prompt,
                     effort=self.config.agent.default_effort,
                     now=ts,
-                    cwd=self.hq_dir,
-                    wait=True,
+                    tag="dream",
                 )
             except Exception as exc:
                 self.db.add_digest_item(

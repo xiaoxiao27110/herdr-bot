@@ -35,7 +35,7 @@ tuning:
   digest_cron: "09:30"
   inbox_lease_ttl_sec: 900
   inbox_max_attempts: 3
-  commit_debounce_sec: 300
+  commit_debounce_sec: 900
   active_repo_quiet_minutes: 15
   pane_blocked_notify_sec: 0
   deferred_approval_ttl_hours: 24
@@ -46,8 +46,8 @@ tuning:
   general_nightly_reset: true
   general_rotation_quiet_minutes: 60
   transcript_busy_window_sec: 120
-  distill_idle_minutes: 20
-  distill_min_new_turns: 3
+  distill_idle_minutes: 60
+  distill_min_new_turns: 8
   dirty_worktree_warn_hours: 48
   git_sync_debounce_minutes: 120
   past_messages_limit: 5

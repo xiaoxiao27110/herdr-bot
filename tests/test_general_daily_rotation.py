@@ -423,23 +423,27 @@ class TestGeneralDailyRotation(unittest.TestCase):
                 daemon._ensure_general_session(1000)
                 term.set_pane(GENERAL_PANE_NAME, status="idle")
 
-                # Default general_nightly_reset=True -> nightly pipeline marks due="night", waits 60m quiet, then rotates
+                # Default general_nightly_reset=True -> nightly pipeline runs dream in ephemeral pane,
+                # does NOT touch general:1's last_active_at (1000), marks due="night", waits 60m quiet, then rotates
                 self.assertTrue(daemon.config.tuning.general_nightly_reset)
                 daemon.run_nightly_pipeline(now=2000)
                 self.assertEqual(daemon.db.get_meta("general_rotation_due"), "night")
                 self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
+                self.assertEqual(daemon.db.get_session("general:1")["last_active_at"], 1000)
+                self.assertNotIn(GENERAL_PANE_NAME, term.killed_panes)
+                self.assertTrue(any(p.startswith("hq-bg-dream-") for p in term.killed_panes))
 
-                # Before 60m quiet (e.g. +59m) -> still active
-                daemon.run_once(now=2000 + 59 * 60)
+                # Before 60m quiet since general:1's last_active_at (1000 + 59m) -> still active
+                daemon.run_once(now=1000 + 59 * 60)
                 self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
 
-                # At +60m quiet -> rotates in-place with /new
-                daemon.run_once(now=2000 + 60 * 60)
+                # At +60m quiet since general:1's last_active_at (1000 + 60m) -> rotates in-place with /new
+                daemon.run_once(now=1000 + 60 * 60)
                 slash_new_calls = [
                     c for c in term.sent_texts if c["name"] == GENERAL_PANE_NAME and c["text"] == "/new"
                 ]
                 self.assertEqual(len(slash_new_calls), 1)
-                self.assertEqual(term.killed_panes, [])
+                self.assertNotIn(GENERAL_PANE_NAME, term.killed_panes)
                 self.assertEqual(daemon.db.get_session("general:1")["status"], "sealed")
                 self.assertEqual(daemon.db.get_session("general:2")["status"], "active")
                 self.assertIsNone(daemon.db.get_meta("general_rotation_due"))

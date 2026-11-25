@@ -1741,6 +1741,353 @@ class TestV2InteractionFlows(unittest.TestCase):
             finally:
                 daemon.close()
 
+    def test_background_tasks_run_in_ephemeral_panes_without_blocking_or_polluting_general(self) -> None:
+        """git_commit, session_distill, and dream-consolidate run in disposable hq-bg-* panes even when hq-general is working."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            repo_dir = Path(tmp) / "gateway-svc"
+            _init_git_repo(repo_dir)
+            (hq_dir / ".hq" / "local.yaml").write_text(
+                f"repo_paths:\n  gateway-svc: {repo_dir}\n", encoding="utf-8"
+            )
+            tfile = Path(tmp) / "sess_src.jsonl"
+            tfile.write_text(
+                json.dumps({"role": "user", "content": "u1"}) + "\n"
+                + json.dumps({"role": "assistant", "content": "a1"}) + "\n",
+                encoding="utf-8",
+            )
+
+            class FailingEphemeralTerminal(StatusAwareTerminal):
+                def __init__(self):
+                    super().__init__(reply_fn=lambda name, text: f"ephemeral-ok:{name}")
+                    self.raise_on_prompt = None
+
+                def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+                    if self.raise_on_prompt is not None:
+                        self.prompt_calls.append({"name": name, "text": text, "wait": wait, "timeout_ms": timeout_ms})
+                        raise self.raise_on_prompt
+                    return super().prompt_agent(name, text, wait=wait, timeout_ms=timeout_ms)
+
+            term = FailingEphemeralTerminal()
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                gen = daemon._ensure_general_session(1000)
+                daemon.db.update_session(gen["session_key"], turn_count=3, last_active_at=1000)
+                # General is actively working AND has pending handoff summary waiting for user!
+                term.set_pane(GENERAL_PANE_NAME, status="working")
+                daemon.db.set_meta("general_handoff_pending", "1", now=1000)
+                daemon.db.set_meta("general_handoff_summary", "昨日交接要点", now=1000)
+
+                daemon.db.enqueue_event(
+                    source="git_commit",
+                    dedupe_key="gc:bg:1",
+                    priority=20,
+                    available_at=5000,
+                    payload={"repo": "gateway-svc", "matched_files": ["api/router.py"]},
+                    now=5000,
+                )
+                daemon.db.enqueue_event(
+                    source="session_distill",
+                    dedupe_key="sd:bg:1",
+                    priority=30,
+                    available_at=5000,
+                    payload={
+                        "session_key": "general:1",
+                        "agent_session_id": "conv-bg-1",
+                        "transcript_path": str(tfile),
+                        "from_line": 0,
+                        "to_line": 2,
+                        "turns": [{"role": "user", "text": "u1"}],
+                    },
+                    now=5000,
+                )
+
+                summary = daemon.run_once(now=5000)
+                self.assertEqual(summary.events_processed, 2)
+                self.assertEqual(summary.events_parked, 0)
+                self.assertEqual(summary.events_failed, 0)
+
+                # General pane was NEVER prompted, killed, or modified; handoff pending preserved!
+                self.assertEqual(daemon.db.get_meta("general_handoff_pending"), "1")
+                gen_after = daemon.db.get_session("general:1")
+                self.assertEqual(gen_after["turn_count"], 3)
+                self.assertEqual(gen_after["last_active_at"], 1000)
+                self.assertFalse(any(p["name"] == GENERAL_PANE_NAME for p in term.prompt_calls))
+                self.assertNotIn(GENERAL_PANE_NAME, term.killed_panes)
+
+                # Both background tasks used hq-bg-* panes with HQ_EPHEMERAL=1 and closed immediately
+                started_names = [c["name"] for c in term.start_agent_calls]
+                self.assertEqual(len(started_names), 2)
+                self.assertTrue(any(n.startswith("hq-bg-commit-") for n in started_names))
+                self.assertTrue(any(n.startswith("hq-bg-distill-") for n in started_names))
+                for call in term.start_agent_calls:
+                    self.assertEqual(call["env"]["HQ_EPHEMERAL"], "1")
+                    self.assertEqual(
+                        call["env"]["HQ_EPHEMERAL_REPLY_KEY"],
+                        f"ephemeral_reply:{call['name']}",
+                    )
+                    self.assertNotIn("HQ_SESSION_KEY", call["env"])
+                    self.assertIn(call["name"], term.killed_panes)
+                    self.assertNotIn(call["name"], term.panes)
+                    self.assertIsNone(daemon.db.get_meta(f"ephemeral_reply:{call['name']}"))
+
+                # Nightly dream-consolidate also runs in hq-bg-dream-* while hq-general is still working
+                daemon.run_nightly_pipeline(now=6000)
+                dream_start = term.start_agent_calls[-1]
+                self.assertTrue(dream_start["name"].startswith("hq-bg-dream-"))
+                self.assertIn(dream_start["name"], term.killed_panes)
+                self.assertNotIn(dream_start["name"], term.panes)
+                self.assertEqual(daemon.db.get_meta("general_handoff_pending"), "1")
+                self.assertEqual(daemon.db.get_session("general:1")["turn_count"], 3)
+                self.assertNotIn(GENERAL_PANE_NAME, term.killed_panes)
+                dream_md = hq_dir / ".hq" / "prompts" / "dream-6000.md"
+                self.assertTrue(dream_md.exists())
+                self.assertIn("dream-consolidate", dream_md.read_text(encoding="utf-8"))
+
+                # Even when prompt_agent raises AgentBlockedError or RuntimeError, ephemeral pane is still closed!
+                for err in (
+                    AgentBlockedError(pane_name="hq-bg-err", detail="permission prompt"),
+                    RuntimeError("boom"),
+                ):
+                    term.raise_on_prompt = err
+                    with self.assertRaises(type(err)):
+                        daemon._run_ephemeral_background_task(
+                            "background check",
+                            effort="low",
+                            now=7000,
+                            tag="err",
+                        )
+                    failed_pane = term.start_agent_calls[-1]["name"]
+                    self.assertIn(failed_pane, term.killed_panes)
+                    self.assertNotIn(failed_pane, term.panes)
+                    self.assertIsNone(daemon.db.get_meta(f"ephemeral_reply:{failed_pane}"))
+            finally:
+                daemon.close()
+
+    def test_ephemeral_hook_never_creates_local_session_or_pushes_feishu_and_captures_distill_reply(self) -> None:
+        """HQ_EPHEMERAL=1 hooks ignore non-Stop events, never create local:* sessions or push Feishu, and return clean Stop reply for distill."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            bg_transcript = Path(tmp) / "ephemeral_bg.jsonl"
+            bg_transcript.write_text(
+                json.dumps({"type": "USER_INPUT", "content": "请读取蒸馏指令文件"}, ensure_ascii=False)
+                + "\n"
+                + json.dumps(
+                    {"type": "PLANNER_RESPONSE", "content": "[DECISION] 蒸馏结论来自 Ephemeral Stop Hook"},
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            src_transcript = Path(tmp) / "src.jsonl"
+            src_transcript.write_text(
+                json.dumps({"role": "user", "content": "q1"}) + "\n"
+                + json.dumps({"role": "assistant", "content": "a1"}) + "\n",
+                encoding="utf-8",
+            )
+
+            ch = IndicatorFakeChannel()
+            # Direct hook checks with HQ_EPHEMERAL=1
+            with patch.dict(
+                os.environ,
+                {"HQ_EPHEMERAL": "1", "HQ_EPHEMERAL_REPLY_KEY": "ephemeral_reply:hq-bg-test-1"},
+            ):
+                res_start = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "SessionStart",
+                        "conversationId": "conv-ephemeral-999",
+                        "transcriptPath": str(bg_transcript),
+                    },
+                    hq_dir=hq_dir,
+                    channel=ch,
+                    now=2000,
+                )
+                res_pre = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "PreInvocation",
+                        "conversationId": "conv-ephemeral-999",
+                        "lastUserInput": "some bg prompt",
+                    },
+                    hq_dir=hq_dir,
+                    channel=ch,
+                    now=2001,
+                )
+            self.assertEqual(
+                res_start,
+                {"status": "ignored", "reason": "ephemeral_bg_worker", "event": "SessionStart"},
+            )
+            self.assertEqual(
+                res_pre,
+                {"status": "ignored", "reason": "ephemeral_bg_worker", "event": "PreInvocation"},
+            )
+            self.assertEqual(ch.sent, [])
+
+            class EphemeralHookSimTerminal(StatusAwareTerminal):
+                def __init__(self, hq_root: Path, transcript: Path, channel_obj):
+                    super().__init__(reply_fn=lambda name, text: "")
+                    self.hq_root = hq_root
+                    self.transcript = transcript
+                    self.channel_obj = channel_obj
+                    self.stop_results = []
+                    self.pane_envs = {}
+
+                def start_agent(self, name, cwd, kind, agent_args=None, env=None, timeout_ms=60000):
+                    self.pane_envs[name] = dict(env or {})
+                    return super().start_agent(name, cwd, kind, agent_args=agent_args, env=env, timeout_ms=timeout_ms)
+
+                def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+                    env_patch = self.pane_envs.get(name, {})
+                    with patch.dict(os.environ, env_patch, clear=False):
+                        res = handle_hook_event(
+                            "agy",
+                            {
+                                "hookEventName": "Stop",
+                                "conversationId": "conv-ephemeral-distill-777",
+                                "transcriptPath": str(self.transcript),
+                            },
+                            hq_dir=self.hq_root,
+                            channel=self.channel_obj,
+                            now=3005,
+                        )
+                        self.stop_results.append(res)
+                    return super().prompt_agent(name, text, wait=wait, timeout_ms=timeout_ms)
+
+            term = EphemeralHookSimTerminal(hq_dir, bg_transcript, ch)
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                daemon.db.enqueue_event(
+                    source="session_distill",
+                    dedupe_key="sd:eph:1",
+                    priority=30,
+                    available_at=3000,
+                    payload={
+                        "session_key": "general:1",
+                        "agent_session_id": "conv-src-1",
+                        "transcript_path": str(src_transcript),
+                        "from_line": 0,
+                        "to_line": 2,
+                        "turns": [{"role": "user", "text": "q1"}],
+                    },
+                    now=3000,
+                )
+                summary = daemon.run_once(now=3000)
+                self.assertEqual(summary.events_processed, 1)
+                self.assertEqual(len(term.stop_results), 1)
+                self.assertEqual(
+                    term.stop_results[0],
+                    {"status": "ok", "event": "Stop", "ephemeral": True, "reply_pushed": False},
+                )
+                # Zero local:* sessions created, zero Feishu pushes
+                self.assertEqual(daemon.db.list_sessions(), [])
+                self.assertEqual(ch.sent, [])
+                # Clean Stop-hook reply written to notes/today.md and reply_key cleaned up
+                today_text = (hq_dir / "notes" / "today.md").read_text(encoding="utf-8")
+                self.assertIn("[DECISION] 蒸馏结论来自 Ephemeral Stop Hook", today_text)
+                pane_used = term.start_agent_calls[-1]["name"]
+                self.assertIn(pane_used, term.killed_panes)
+                self.assertIsNone(daemon.db.get_meta(f"ephemeral_reply:{pane_used}"))
+            finally:
+                daemon.close()
+
+    def test_scan_repo_commits_tracks_default_branch_and_ignores_feature_branch_switches(self) -> None:
+        """Switching to feature branches or committing watched files on feature branches must not trigger git_commit until default_branch advances."""
+        from hq_pilot.cursors import CursorStore
+        from hq_pilot.db import HQDatabase
+        from hq_pilot.gatekeeper import scan_repo_commits
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            repo_dir = Path(tmp) / "gateway-svc"
+            _init_git_repo(repo_dir)
+            (hq_dir / ".hq" / "local.yaml").write_text(
+                f"repo_paths:\n  gateway-svc: {repo_dir}\n", encoding="utf-8"
+            )
+
+            cfg = load_config(hq_dir)
+            db = HQDatabase(hq_dir / ".hq" / "runtime.sqlite")
+            cursors = CursorStore(hq_dir / ".hq" / "cursors.json")
+            try:
+                # Seed initial cursor from refs/heads/main
+                self.assertEqual(scan_repo_commits(cfg, cursors, db, now=1000), [])
+                main_sha_initial = subprocess.run(
+                    ["git", "rev-parse", "refs/heads/main"],
+                    cwd=str(repo_dir),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                self.assertEqual(cursors.get_git_head("gateway-svc"), main_sha_initial)
+
+                # Switch to feature branch and commit watched file api/router.py -> must NOT trigger!
+                subprocess.run(["git", "checkout", "-b", "feat/new-endpoint"], cwd=str(repo_dir), check=True, capture_output=True)
+                (repo_dir / "api").mkdir()
+                (repo_dir / "api" / "router.py").write_text("def v1(): pass\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+                subprocess.run(["git", "commit", "-m", "wip on feature branch"], cwd=str(repo_dir), check=True, capture_output=True)
+                self.assertEqual(scan_repo_commits(cfg, cursors, db, now=1100), [])
+                self.assertEqual(cursors.get_git_head("gateway-svc"), main_sha_initial)
+
+                # Switch back to main and to another feature branch -> still must NOT trigger!
+                subprocess.run(["git", "checkout", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+                self.assertEqual(scan_repo_commits(cfg, cursors, db, now=1200), [])
+                subprocess.run(["git", "checkout", "-b", "feat/second-branch"], cwd=str(repo_dir), check=True, capture_output=True)
+                (repo_dir / "api").mkdir(exist_ok=True)
+                (repo_dir / "api" / "schema.py").write_text("SCHEMA = 1\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+                subprocess.run(["git", "commit", "-m", "second wip"], cwd=str(repo_dir), check=True, capture_output=True)
+                self.assertEqual(scan_repo_commits(cfg, cursors, db, now=1300), [])
+                self.assertEqual(db.claim_next_events(now=5000), [])
+
+                # Now merge feat/new-endpoint into main -> refs/heads/main advances -> triggers git_commit!
+                subprocess.run(["git", "checkout", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+                subprocess.run(["git", "merge", "--ff-only", "feat/new-endpoint"], cwd=str(repo_dir), check=True, capture_output=True)
+                main_sha_after = subprocess.run(
+                    ["git", "rev-parse", "refs/heads/main"],
+                    cwd=str(repo_dir),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                self.assertNotEqual(main_sha_after, main_sha_initial)
+
+                enq = scan_repo_commits(cfg, cursors, db, now=2000)
+                self.assertEqual(enq, ["gateway-svc"])
+                self.assertEqual(cursors.get_git_head("gateway-svc"), main_sha_after)
+                # Debounced by 900s
+                self.assertEqual(db.claim_next_events(now=2899), [])
+                claimed = db.claim_next_events(now=2900)
+                self.assertEqual(len(claimed), 1)
+                self.assertEqual(claimed[0].source, "git_commit")
+                self.assertEqual(claimed[0].payload["from_sha"], main_sha_initial)
+                self.assertEqual(claimed[0].payload["to_sha"], main_sha_after)
+                self.assertEqual(claimed[0].payload["matched_files"], ["api/router.py"])
+
+                # Fallback compatibility: repo without refs/heads/main (e.g. only `trunk`) falls back to HEAD
+                subprocess.run(["git", "branch", "-m", "main", "trunk"], cwd=str(repo_dir), check=True, capture_output=True)
+                (repo_dir / "api" / "router.py").write_text("def v2(): pass\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+                subprocess.run(["git", "commit", "-m", "commit on trunk"], cwd=str(repo_dir), check=True, capture_output=True)
+                enq_fallback = scan_repo_commits(cfg, cursors, db, now=3000)
+                self.assertEqual(enq_fallback, ["gateway-svc"])
+            finally:
+                db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

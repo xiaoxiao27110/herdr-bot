@@ -146,6 +146,10 @@ class TestArchiverResumeCursors(unittest.TestCase):
                         json.dumps({"role": "assistant", "content": "ans 1"}),
                         json.dumps({"role": "user", "content": "turn 2"}),
                         json.dumps({"role": "assistant", "content": "ans 2"}),
+                        json.dumps({"role": "user", "content": "turn 3"}),
+                        json.dumps({"role": "assistant", "content": "ans 3"}),
+                        json.dumps({"role": "user", "content": "turn 4"}),
+                        json.dumps({"role": "assistant", "content": "ans 4"}),
                     ]) + "\n",
                     encoding="utf-8",
                 )
@@ -155,10 +159,11 @@ class TestArchiverResumeCursors(unittest.TestCase):
                     cmd, 0, stdout=json.dumps({"reply": "[DECISION] distilled slice", "sid": "d-1"}), stderr=""
                 )
 
+            term = DummyTerminal()
             daemon = HQDaemon(
                 hq_dir,
                 agent_adapter=AgyAdapter(),
-                terminal_driver=DummyTerminal(),
+                terminal_driver=term,
                 channel=FakeChannel(),
                 cmd_runner=fake_runner,
             )
@@ -176,14 +181,19 @@ class TestArchiverResumeCursors(unittest.TestCase):
                     agent_session_id="conv-sea", transcript_path=str(t_sealed), now=100,
                 )
 
-                # Run after 25 minutes idle -> all 3 states distilled once
-                now_later = 100 + 25 * 60
+                # Before 60m idle threshold (e.g. 25m) -> 0 enqueued
+                early = daemon.run_once(now=100 + 25 * 60)
+                self.assertEqual(early.distill_enqueued, 0)
+
+                # Run after 65 minutes idle -> all 3 states distilled once via ephemeral panes
+                now_later = 100 + 65 * 60
                 summary = daemon.run_once(now=now_later)
                 self.assertEqual(summary.distill_enqueued, 3)
                 self.assertEqual(summary.events_processed, 3)
-                self.assertEqual(daemon.cursors.get_transcript_cursor("conv-act")["last_summarized_line"], 4)
-                self.assertEqual(daemon.cursors.get_transcript_cursor("conv-pin")["last_summarized_line"], 4)
-                self.assertEqual(daemon.cursors.get_transcript_cursor("conv-sea")["last_summarized_line"], 4)
+                self.assertEqual(daemon.cursors.get_transcript_cursor("conv-act")["last_summarized_line"], 8)
+                self.assertEqual(daemon.cursors.get_transcript_cursor("conv-pin")["last_summarized_line"], 8)
+                self.assertEqual(daemon.cursors.get_transcript_cursor("conv-sea")["last_summarized_line"], 8)
+                self.assertEqual(term.panes, {})
 
                 # Re-running with no new lines -> 0 distilled (no duplicate reading)
                 enq2 = scan_distill_candidates(
@@ -195,7 +205,8 @@ class TestArchiverResumeCursors(unittest.TestCase):
                 with t_pinned.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps({"role": "user", "content": "late night fix"}) + "\n")
                 daemon.run_nightly_pipeline(now=now_later + 120)
-                self.assertEqual(daemon.cursors.get_transcript_cursor("conv-pin")["last_summarized_line"], 5)
+                self.assertEqual(daemon.cursors.get_transcript_cursor("conv-pin")["last_summarized_line"], 9)
+                self.assertEqual(term.panes, {})
                 # Pinned session remains pinned after nightly pipeline
                 self.assertEqual(daemon.db.get_session("s-pin")["status"], "pinned")
             finally:

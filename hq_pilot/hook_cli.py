@@ -74,6 +74,37 @@ def handle_hook_event(
     if root is None or not (root / "hq.yaml").exists():
         return {"status": "ignored", "reason": "no_hq_dir", "event": event_type}
 
+    if os.environ.get("HQ_EPHEMERAL") == "1":
+        if event_type != "Stop":
+            return {
+                "status": "ignored",
+                "reason": "ephemeral_bg_worker",
+                "event": event_type,
+            }
+        reply_key = os.environ.get("HQ_EPHEMERAL_REPLY_KEY", "").strip()
+        transcript_path = str(
+            payload.get("transcriptPath") or payload.get("transcript_path") or ""
+        )
+        if reply_key and transcript_path and Path(transcript_path).exists():
+            cfg = load_config(root)
+            adapter = get_agent_adapter(agent_name)
+            turns, _ = adapter.read_transcript_slice(transcript_path, from_line=0)
+            assistant_msgs = [
+                t.text for t in turns if t.role == "assistant" and t.text.strip()
+            ]
+            if assistant_msgs:
+                db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
+                try:
+                    db.set_meta(reply_key, assistant_msgs[-1], now=ts)
+                finally:
+                    db.close()
+        return {
+            "status": "ok",
+            "event": "Stop",
+            "ephemeral": True,
+            "reply_pushed": False,
+        }
+
     cfg = load_config(root)
     db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
     adapter = get_agent_adapter(agent_name)

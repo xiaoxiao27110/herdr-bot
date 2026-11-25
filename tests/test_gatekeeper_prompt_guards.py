@@ -62,10 +62,11 @@ class TestGatekeeperPromptGuards(unittest.TestCase):
                 # Clean repo -> enqueues debounced git_commit event
                 enq = scan_repo_commits(cfg, cursors, db, now=now_ts)
                 self.assertEqual(enq, ["gateway-svc"])
-                # Not claimable before debounce window
+                # Not claimable before debounce window (900s)
                 self.assertEqual(db.claim_next_events(now=now_ts + 10), [])
-                # Claimable after commit_debounce_sec (300s)
-                claimed = db.claim_next_events(now=now_ts + 305)
+                self.assertEqual(db.claim_next_events(now=now_ts + 895), [])
+                # Claimable after commit_debounce_sec (900s)
+                claimed = db.claim_next_events(now=now_ts + 905)
                 self.assertEqual(len(claimed), 1)
                 self.assertEqual(claimed[0].source, "git_commit")
             finally:

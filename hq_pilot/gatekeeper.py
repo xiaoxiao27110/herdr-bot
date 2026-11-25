@@ -127,13 +127,31 @@ def scan_repo_commits(
         if not is_repo_quiet(repo_path, config.tuning.active_repo_quiet_minutes, now=ts):
             continue
 
+        if repo_name in config.repos and config.repos[repo_name].default_branch:
+            default_branch = config.repos[repo_name].default_branch
+        elif (
+            repo_name in config.boundaries.repos
+            and config.boundaries.repos[repo_name].default_branch
+        ):
+            default_branch = config.boundaries.repos[repo_name].default_branch
+        else:
+            default_branch = "main"
+
         head_res = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{default_branch}"],
             cwd=str(repo_path),
             capture_output=True,
             text=True,
             check=False,
         )
+        if head_res.returncode != 0 or not head_res.stdout.strip():
+            head_res = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         if head_res.returncode != 0:
             continue
         head_sha = head_res.stdout.strip()

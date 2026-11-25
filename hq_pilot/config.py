@@ -54,7 +54,7 @@ class TuningConfig:
     digest_cron: str = "09:30"
     inbox_lease_ttl_sec: int = 900
     inbox_max_attempts: int = 3
-    commit_debounce_sec: int = 300
+    commit_debounce_sec: int = 900
     active_repo_quiet_minutes: int = 15
     pane_blocked_notify_sec: int = 0
     deferred_approval_ttl_hours: int = 24
@@ -65,8 +65,8 @@ class TuningConfig:
     general_nightly_reset: bool = True
     general_rotation_quiet_minutes: int = 60
     transcript_busy_window_sec: int = 120
-    distill_idle_minutes: int = 20
-    distill_min_new_turns: int = 3
+    distill_idle_minutes: int = 60
+    distill_min_new_turns: int = 8
     dirty_worktree_warn_hours: int = 48
     git_sync_debounce_minutes: int = 120
     past_messages_limit: int = 5

@@ -355,7 +355,7 @@ class TestCLIAndEdgeCases(unittest.TestCase):
                 self.assertIn("分支 `hq/fix-zh`", ch.sent[-1]["text"])
                 self.assertNotIn("Spawned #Topic", ch.sent[-1]["text"])
 
-                # 2. pane_blocked card & buttons are Chinese
+                # 2. pane_blocked card & buttons are Chinese (remote approval card)
                 daemon.db.enqueue_event(
                     source="pane_blocked",
                     dedupe_key="pb:1",
@@ -371,15 +371,29 @@ class TestCLIAndEdgeCases(unittest.TestCase):
                 self.assertEqual(len(evs), 1)
                 daemon._process_event(evs[0], now=1010)
                 pb_msg = ch.sent[-1]
-                self.assertEqual(
-                    pb_msg["text"],
-                    "⏸️ 任务 `task:gateway-svc:fix-zh:1000` 当前处于阻塞状态，等待你处理：",
-                )
+                self.assertIn("面板 `hq-fix-zh` 等待操作审批", pb_msg["text"])
                 self.assertNotIn("appears blocked", pb_msg["text"])
                 btn_texts = [b.text for b in pb_msg["buttons"][0]]
-                self.assertEqual(btn_texts, ["继续执行", "封口结束"])
+                self.assertEqual(btn_texts, ["✅ 允许", "❌ 拒绝"])
+                self.assertTrue(
+                    pb_msg["buttons"][0][0].callback_data.startswith(
+                        "approve_key:task:gateway-svc:fix-zh:1000:"
+                    )
+                )
 
-                # 3. Clicking pane_continue sends confirmation receipt; clicking again reports expired/processed
+                # 3. Legacy pane_continue callback remains compatible; clicking again reports expired/processed
+                legacy_pb_id = "legacy-pb-card-1"
+                daemon.db.create_deferred_action(
+                    channel_msg_id=legacy_pb_id,
+                    session_key="task:gateway-svc:fix-zh:1000",
+                    level="review",
+                    options=[
+                        {"id": "continue", "label": "继续执行"},
+                        {"id": "seal", "label": "封口结束"},
+                    ],
+                    ttl_hours=24,
+                    now=1010,
+                )
                 daemon._handle_callback(
                     InboundMessage(
                         update_id=2,
@@ -390,7 +404,7 @@ class TestCLIAndEdgeCases(unittest.TestCase):
                         is_callback=True,
                         callback_id="cb-pb-1",
                         callback_data="pane_continue:task:gateway-svc:fix-zh:1000",
-                        message_id=pb_msg["id"],
+                        message_id=legacy_pb_id,
                     ),
                     now=1015,
                 )
@@ -406,7 +420,7 @@ class TestCLIAndEdgeCases(unittest.TestCase):
                         is_callback=True,
                         callback_id="cb-pb-2",
                         callback_data="pane_continue:task:gateway-svc:fix-zh:1000",
-                        message_id=pb_msg["id"],
+                        message_id=legacy_pb_id,
                     ),
                     now=1016,
                 )

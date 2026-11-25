@@ -160,6 +160,14 @@ def handle_hook_event(
         if updates:
             sess = db.get_session(skey) or sess
 
+        is_general_sess = str(sess.get("track") or "") in {"GENERAL", "B"}
+        pane_name_cur = str(sess.get("pane_name") or "").strip()
+        daemon_waiting_cur = db.get_meta(f"daemon_waiting:{skey}") == "1" or (
+            bool(pane_name_cur)
+            and db.get_meta(f"daemon_waiting_pane:{pane_name_cur}") == "1"
+        )
+        pending_approval_cur = db.get_meta(f"pending_approval_reply:{skey}") == "1"
+
         pinned_reason = None
         inject_steps: List[Dict[str, Any]] = []
         if event_type in {"PreInvocation", "UserPromptSubmit", "SessionStart"} and user_prompt:
@@ -171,16 +179,13 @@ def handle_hook_event(
                 now=ts,
             )
             if event_type in {"PreInvocation", "UserPromptSubmit"}:
-                origin = "local_tty" if pinned_reason == "manual_input" else "daemon"
-                db.set_meta(f"last_input_origin:{skey}", origin, now=ts)
+                if pinned_reason == "manual_input":
+                    db.set_meta(f"last_input_origin:{skey}", "local_tty", now=ts)
+                    db.delete_meta(f"pending_approval_reply:{skey}")
+                elif daemon_waiting_cur or pending_approval_cur:
+                    db.set_meta(f"last_input_origin:{skey}", "daemon", now=ts)
 
         # Inject post-rotation handoff summary on local Herdr turn (SessionStart with user input or PreInvocation)
-        is_general_sess = str(sess.get("track") or "") in {"GENERAL", "B"}
-        pane_name_cur = str(sess.get("pane_name") or "").strip()
-        daemon_waiting_cur = db.get_meta(f"daemon_waiting:{skey}") == "1" or (
-            bool(pane_name_cur)
-            and db.get_meta(f"daemon_waiting_pane:{pane_name_cur}") == "1"
-        )
         if (
             is_general_sess
             and event_type in {"SessionStart", "PreInvocation"}
@@ -254,19 +259,35 @@ def handle_hook_event(
                                 agent_session_id=sess_agent_sid,
                             )
 
+                    pending_approval = db.get_meta(f"pending_approval_reply:{skey}") == "1"
                     allow_push = False
+                    consume_origin = False
                     if not daemon_waiting and (thread_id or is_general):
-                        if last_origin == "local_tty":
+                        if last_origin == "local_tty" and not pending_approval:
                             allow_push = False
                         elif is_general and not thread_id:
-                            if has_new_user_msg and not last_user_is_daemon:
+                            if pending_approval:
+                                allow_push = True
+                                consume_origin = True
+                            elif (
+                                has_new_user_msg
+                                and last_user_is_daemon
+                                and last_origin == "daemon"
+                            ):
+                                allow_push = True
+                                consume_origin = True
+                            elif has_new_user_msg and not last_user_is_daemon:
                                 db.set_meta(f"last_input_origin:{skey}", "local_tty", now=ts)
                                 allow_push = False
                             else:
-                                allow_push = last_origin == "daemon"
+                                # Pure background SYSTEM_MESSAGE / subagent / timer wake with no new daemon user_msg
+                                allow_push = False
                         else:
                             # #Topic with thread_id
-                            if has_new_user_msg and not last_user_is_daemon:
+                            if pending_approval:
+                                allow_push = True
+                                consume_origin = True
+                            elif has_new_user_msg and not last_user_is_daemon:
                                 if (
                                     last_origin == "daemon"
                                     or str(sess.get("pinned_reason") or "") == "manual_input"
@@ -294,6 +315,12 @@ def handle_hook_event(
                                 thread_id=str(thread_id) if thread_id else None,
                             )
                             reply_pushed = True
+                    if consume_origin or (not daemon_waiting and pending_approval):
+                        db.delete_meta(f"pending_approval_reply:{skey}")
+                        db.delete_meta(f"last_input_origin:{skey}")
+            if not daemon_waiting_cur and pending_approval_cur:
+                db.delete_meta(f"pending_approval_reply:{skey}")
+                db.delete_meta(f"last_input_origin:{skey}")
             return {"status": "ok", "event": "Stop", "session_key": skey, "reply_pushed": reply_pushed}
 
         return {

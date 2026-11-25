@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,9 @@ from hq_pilot.daemon import GENERAL_PANE_NAME, HQDaemon
 from hq_pilot.guards import run_memory_guard
 from hq_pilot.hook_cli import handle_hook_event
 from hq_pilot.prompt_builder import build_prompt
+from hq_pilot.terminals.base import AgentBlockedError
+from hq_pilot.terminals.herdr import HerdrDriver
+from hq_pilot.terminals.tmux import TmuxDriver
 
 try:
     from tests.test_adapters_and_channels import FakeChannel
@@ -525,7 +529,7 @@ class TestV2InteractionFlows(unittest.TestCase):
                 daemon.close()
 
     def test_blocked_general_sends_approval_queue_card_without_buttons(self) -> None:
-        """When agy is blocked awaiting approval, queuing card prompts opening herdr with no buttons."""
+        """When agy is blocked awaiting approval, queuing card has no buttons and approval card is pushed once."""
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "demo-hq"
             hq_main(["init", str(hq_dir)])
@@ -544,23 +548,27 @@ class TestV2InteractionFlows(unittest.TestCase):
                 ch.inbound.append(InboundMessage(1, "c1", None, "u1", "查一下状态", message_id="m-blk-1"))
                 s1 = daemon.run_once(now=1010)
                 self.assertEqual(s1.events_parked, 1)
-                self.assertEqual(len(ch.sent), 1)
-                self.assertIsNone(ch.sent[0]["buttons"])
-                self.assertIsNone(ch.sent[0]["thread_id"])
+                queue_cards = [m for m in ch.sent if m["buttons"] is None]
+                approval_cards = [m for m in ch.sent if m["buttons"] is not None]
+                self.assertEqual(len(queue_cards), 1)
+                self.assertEqual(len(approval_cards), 1)
+                self.assertIsNone(queue_cards[0]["thread_id"])
                 self.assertEqual(
-                    ch.sent[0]["text"],
-                    "⏸️ 正在等待审批，请打开 herdr 处理；消息已排队",
+                    queue_cards[0]["text"],
+                    "⏸️ 正在等待审批，请先点击审批卡片确认；消息已排队",
                 )
-                card_id = ch.sent[0]["id"]
+                self.assertIsNone(approval_cards[0]["thread_id"])
+                self.assertIn("面板 `hq-general` 等待操作审批", approval_cards[0]["text"])
+                card_id = queue_cards[0]["id"]
 
-                # Second message while still blocked updates card count in-place
+                # Second message while still blocked updates queue card count in-place & does NOT duplicate approval card
                 ch.inbound.append(InboundMessage(2, "c1", None, "u1", "顺便看下日志", message_id="m-blk-2"))
                 daemon.run_once(now=1020)
-                self.assertEqual(len(ch.sent), 1)
+                self.assertEqual(len(ch.sent), 2)
                 self.assertEqual(ch.card_updates[-1]["message_id"], card_id)
                 self.assertEqual(
                     ch.card_updates[-1]["text"],
-                    "⏸️ 正在等待审批，请打开 herdr 处理；消息已排队（共 2 条）",
+                    "⏸️ 正在等待审批，请先点击审批卡片确认；消息已排队（共 2 条）",
                 )
             finally:
                 daemon.close()
@@ -1124,6 +1132,648 @@ class TestV2InteractionFlows(unittest.TestCase):
                 self.assertEqual(term.prompt_calls[-1]["name"], GENERAL_PANE_NAME)
                 self.assertEqual(ch.card_updates[-1]["text"], "restored ok")
                 self.assertIsNone(ch.card_updates[-1]["thread_id"])
+            finally:
+                daemon.close()
+
+    def test_herdr_and_tmux_driver_send_keys_and_read_visible_pane(self) -> None:
+        """HerdrDriver send_keys (agent + pane fallback) & read_visible_pane, plus TmuxDriver key mapping."""
+        drv = HerdrDriver(bin_path="herdr", session="s-test")
+
+        # 1. HerdrDriver.send_keys succeeds via `agent send-keys`
+        calls_ok = []
+
+        def fake_run_ok(self_drv, args, check=True):
+            calls_ok.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch.object(HerdrDriver, "_run", fake_run_ok):
+            drv.send_keys("hq-general", ["down", "enter"])
+        self.assertEqual(calls_ok, [["agent", "send-keys", "hq-general", "down", "enter"]])
+
+        # 2. HerdrDriver.send_keys falls back to `pane send-keys` when `agent send-keys` returns non-0
+        calls_fb = []
+
+        def fake_run_fb(self_drv, args, check=True):
+            calls_fb.append(list(args))
+            if args[:2] == ["agent", "send-keys"]:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="agent not found")
+            if args[:2] == ["pane", "send-keys"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+
+        with patch.object(HerdrDriver, "_run", fake_run_fb), patch.object(
+            HerdrDriver, "_resolve_pane_id", return_value="w5:p1"
+        ):
+            drv.send_keys("hq-general", ["esc"])
+        self.assertEqual(
+            calls_fb,
+            [
+                ["agent", "send-keys", "hq-general", "esc"],
+                ["pane", "send-keys", "w5:p1", "esc"],
+            ],
+        )
+
+        # 3. HerdrDriver.send_keys raises RuntimeError if fallback also fails
+        def fake_run_fail(self_drv, args, check=True):
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="pane missing")
+
+        with patch.object(HerdrDriver, "_run", fake_run_fail), patch.object(
+            HerdrDriver, "_resolve_pane_id", return_value="w5:p1"
+        ):
+            with self.assertRaises(RuntimeError):
+                drv.send_keys("hq-general", ["enter"])
+
+        # 4. HerdrDriver.read_visible_pane calls `agent read --source visible --lines N --format text`
+        calls_read = []
+
+        def fake_run_read(self_drv, args, check=True):
+            calls_read.append(list(args))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Allow command?\n❯ 1. Yes\n  2. No\n", stderr=""
+            )
+
+        with patch.object(HerdrDriver, "_run", fake_run_read):
+            txt = drv.read_visible_pane("hq-general", lines=25)
+        self.assertIn("❯ 1. Yes", txt)
+        self.assertEqual(
+            calls_read,
+            [
+                [
+                    "agent",
+                    "read",
+                    "hq-general",
+                    "--source",
+                    "visible",
+                    "--lines",
+                    "25",
+                    "--format",
+                    "text",
+                ]
+            ],
+        )
+
+        # 5. HerdrDriver.read_visible_pane falls back to read_pane on non-zero rc
+        def fake_run_read_fail(self_drv, args, check=True):
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="failed")
+
+        with patch.object(HerdrDriver, "_run", fake_run_read_fail), patch.object(
+            HerdrDriver, "read_pane", return_value="fallback pane output"
+        ) as mock_rp:
+            txt_fb = drv.read_visible_pane("hq-general", lines=20)
+        self.assertEqual(txt_fb, "fallback pane output")
+        mock_rp.assert_called_once_with("hq-general", lines=20)
+
+        # 6. TmuxDriver.send_keys maps canonical key names
+        tmux_drv = TmuxDriver(bin_path="tmux")
+        tmux_calls = []
+
+        def fake_tmux_run(self_drv, args, check=True):
+            tmux_calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch.object(TmuxDriver, "_run", fake_tmux_run):
+            tmux_drv.send_keys("hq-general", ["up", "down", "tab", "space", "esc", "escape", "enter"])
+        self.assertEqual(
+            tmux_calls,
+            [["send-keys", "-t", "hq-general", "Up", "Down", "Tab", "Space", "Escape", "Escape", "Enter"]],
+        )
+
+    def test_remote_approval_default_buttons_dedupe_and_safety_guard(self) -> None:
+        """Immediate blocked approval card, same-screen dedupe, click sends ['enter'], safety blocks stale clicks."""
+
+        class ApprovalTerminal(StatusAwareTerminal):
+            def __init__(self, reply_fn=None):
+                super().__init__(reply_fn=reply_fn)
+                self.visible_screens = {}
+                self.sent_keys = []
+
+            def read_visible_pane(self, name: str, lines: int = 30) -> str:
+                return self.visible_screens.get(name, "")
+
+            def send_keys(self, name: str, keys) -> None:
+                self.sent_keys.append((name, list(keys)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            term = ApprovalTerminal()
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                sess = daemon._ensure_general_session(1000)
+                skey = sess["session_key"]
+                self.assertEqual(daemon.config.tuning.pane_blocked_notify_sec, 0)
+
+                term.set_pane(GENERAL_PANE_NAME, status="blocked")
+                term.visible_screens[GENERAL_PANE_NAME] = (
+                    "\x1b[33mRun shell command: git push origin main\x1b[0m\n"
+                    "────────────────────────────────────\n"
+                    "Confirm? (Enter to allow, Esc to deny)\n"
+                )
+
+                # Tick 1 (same timestamp as last_active=1000): pushes approval card IMMEDIATELY
+                daemon.run_once(now=1000)
+                self.assertEqual(len(ch.sent), 1)
+                card1 = ch.sent[0]
+                self.assertIsNone(card1["thread_id"])
+                self.assertIn("git push origin main", card1["text"])
+                self.assertNotIn("\x1b[33m", card1["text"])
+                flat_btns = [b for row in card1["buttons"] for b in row]
+                self.assertEqual([b.text for b in flat_btns], ["✅ 允许", "❌ 拒绝"])
+                allow_cb = flat_btns[0].callback_data
+                self.assertEqual(allow_cb, f"approve_key:{skey}:allow")
+
+                # Tick 2 (still blocked, identical screen): MUST NOT send duplicate card
+                daemon.run_once(now=1002)
+                self.assertEqual(len(ch.sent), 1)
+
+                # User clicks [✅ 允许] while pane is blocked -> sends ['enter'] and refreshes card in-place
+                ch.inbound.append(
+                    InboundMessage(
+                        update_id=10,
+                        chat_id="c1",
+                        thread_id=None,
+                        sender_id="u1",
+                        text="",
+                        is_callback=True,
+                        callback_id="cb-allow-1",
+                        callback_data=allow_cb,
+                        message_id=card1["id"],
+                    )
+                )
+                daemon.run_once(now=1005)
+                self.assertEqual(term.sent_keys, [(GENERAL_PANE_NAME, ["enter"])])
+                self.assertEqual(ch.card_updates[-1]["message_id"], card1["id"])
+                self.assertEqual(
+                    ch.card_updates[-1]["text"],
+                    "✅ 已执行审批（✅ 允许），继续执行中...",
+                )
+                # Same-tick scan_pane_blocked MUST NOT re-send the old card while terminal clears popup
+                self.assertEqual(len(ch.sent), 1)
+
+                # Clicking the same card a second time -> NO extra keys sent, replies expired/processed
+                ch.inbound.append(
+                    InboundMessage(
+                        update_id=11,
+                        chat_id="c1",
+                        thread_id=None,
+                        sender_id="u1",
+                        text="",
+                        is_callback=True,
+                        callback_id="cb-allow-2",
+                        callback_data=allow_cb,
+                        message_id=card1["id"],
+                    )
+                )
+                daemon.run_once(now=1006)
+                self.assertEqual(len(term.sent_keys), 1)
+                self.assertEqual(ch.card_updates[-1]["text"], "该审批已处理或已失效。")
+
+                # Safety guard: new approval card pushed, then pane leaves blocked before click -> ZERO keys sent!
+                term.set_pane(GENERAL_PANE_NAME, status="working")
+                daemon.run_once(now=1008)
+                term.set_pane(GENERAL_PANE_NAME, status="blocked")
+                term.visible_screens[GENERAL_PANE_NAME] = "Delete temp files?"
+                daemon.run_once(now=1010)
+                self.assertEqual(len(ch.sent), 2)
+                card2 = ch.sent[1]
+                allow_cb2 = card2["buttons"][0][0].callback_data
+
+                # Pane resolved externally (status becomes idle) before user clicks button
+                term.set_pane(GENERAL_PANE_NAME, status="idle")
+                ch.inbound.append(
+                    InboundMessage(
+                        update_id=12,
+                        chat_id="c1",
+                        thread_id=None,
+                        sender_id="u1",
+                        text="",
+                        is_callback=True,
+                        callback_id="cb-stale",
+                        callback_data=allow_cb2,
+                        message_id=card2["id"],
+                    )
+                )
+                daemon.run_once(now=1012)
+                self.assertEqual(len(term.sent_keys), 1)  # Still only the 1 valid keypress!
+                self.assertEqual(ch.card_updates[-1]["text"], "该审批已处理或已失效。")
+
+                # Explicit pane_blocked_notify_sec > 0 still enforces delay threshold
+                update_tuning_value(hq_dir, "pane_blocked_notify_sec", "60")
+                daemon.db.update_session(skey, last_active_at=2000)
+                term.set_pane(GENERAL_PANE_NAME, status="blocked")
+                term.visible_screens[GENERAL_PANE_NAME] = "Delayed prompt?"
+                daemon.run_once(now=2030)
+                self.assertEqual(len(ch.sent), 2)  # Not yet >= 60s
+                daemon.run_once(now=2060)
+                self.assertEqual(len(ch.sent), 3)  # Now >= 60s -> pushed!
+            finally:
+                daemon.close()
+
+    def test_remote_approval_numbered_menu_with_cursor_key_sequences(self) -> None:
+        """Numbered menus (cursor at item 1 or item 2) generate option buttons + cancel with exact key sequences."""
+
+        class MenuTerminal(StatusAwareTerminal):
+            def __init__(self):
+                super().__init__()
+                self.visible_screens = {}
+                self.sent_keys = []
+
+            def read_visible_pane(self, name: str, lines: int = 30) -> str:
+                return self.visible_screens.get(name, "")
+
+            def send_keys(self, name: str, keys) -> None:
+                self.sent_keys.append((name, list(keys)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            term = MenuTerminal()
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                sess = daemon._ensure_general_session(1000)
+                skey = sess["session_key"]
+                term.set_pane(GENERAL_PANE_NAME, status="blocked")
+
+                # Case A: Cursor `❯` on item 1 -> pick item 2 (down+enter), then cancel (esc)
+                term.visible_screens[GENERAL_PANE_NAME] = (
+                    "Allow running `rm -rf dist/`?\n"
+                    "❯ 1. Yes\n"
+                    "  2. Yes, always for this session\n"
+                    "  3. No, tell me what to do\n"
+                    "? for shortcuts   auto · high\n"
+                )
+                daemon.run_once(now=1000)
+                self.assertEqual(len(ch.sent), 1)
+                card_a = ch.sent[0]
+                btns_a = [b for row in card_a["buttons"] for b in row]
+                self.assertEqual(len(btns_a), 4)
+                self.assertEqual(btns_a[0].text, "1. Yes")
+                self.assertTrue(btns_a[1].text.startswith("2. Yes, always"))
+                self.assertTrue(btns_a[2].text.startswith("3. No"))
+                self.assertEqual(btns_a[3].text, "❌ 取消")
+
+                # Click option 2 -> sends ["down", "enter"]
+                ch.inbound.append(
+                    InboundMessage(
+                        1, "c1", None, "u1", "",
+                        is_callback=True,
+                        callback_id="cb-opt2",
+                        callback_data=btns_a[1].callback_data,
+                        message_id=card_a["id"],
+                    )
+                )
+                daemon.run_once(now=1005)
+                self.assertEqual(term.sent_keys[-1], (GENERAL_PANE_NAME, ["down", "enter"]))
+                self.assertTrue(ch.card_updates[-1]["text"].startswith("✅ 已执行审批"))
+
+                # Case B: Cursor `❯` on item 2 -> pick item 1 (up+enter)
+                term.visible_screens[GENERAL_PANE_NAME] = (
+                    "Choose permission scope:\n"
+                    "  1. Allow once\n"
+                    "❯ 2. Allow for this session\n"
+                    "  3. Deny\n"
+                )
+                daemon.run_once(now=1010)
+                self.assertEqual(len(ch.sent), 2)
+                card_b = ch.sent[1]
+                btns_b = [b for row in card_b["buttons"] for b in row]
+                self.assertEqual(btns_b[0].text, "1. Allow once")
+
+                ch.inbound.append(
+                    InboundMessage(
+                        2, "c1", None, "u1", "",
+                        is_callback=True,
+                        callback_id="cb-opt1",
+                        callback_data=btns_b[0].callback_data,
+                        message_id=card_b["id"],
+                    )
+                )
+                daemon.run_once(now=1012)
+                self.assertEqual(term.sent_keys[-1], (GENERAL_PANE_NAME, ["up", "enter"]))
+
+                # Case C: Click ❌ 取消 -> sends ["esc"] and updates card with ❌ 已执行操作
+                term.visible_screens[GENERAL_PANE_NAME] = (
+                    "Pick deployment target:\n"
+                    "  1. Staging\n"
+                    "❯ 2. Production\n"
+                )
+                daemon.run_once(now=1015)
+                self.assertEqual(len(ch.sent), 3)
+                card_c = ch.sent[2]
+                btns_c = [b for row in card_c["buttons"] for b in row]
+                self.assertEqual(btns_c[-1].text, "❌ 取消")
+                ch.inbound.append(
+                    InboundMessage(
+                        3, "c1", None, "u1", "",
+                        is_callback=True,
+                        callback_id="cb-cancel",
+                        callback_data=btns_c[-1].callback_data,
+                        message_id=card_c["id"],
+                    )
+                )
+                daemon.run_once(now=1016)
+                self.assertEqual(term.sent_keys[-1], (GENERAL_PANE_NAME, ["esc"]))
+                self.assertEqual(ch.card_updates[-1]["text"], "❌ 已执行操作（❌ 取消）")
+            finally:
+                daemon.close()
+
+    def test_remote_approval_consecutive_two_prompts_in_same_turn(self) -> None:
+        """Two consecutive approval popups in the same turn (unchanged last_active_at) both push cards."""
+
+        class TwoStepTerminal(StatusAwareTerminal):
+            def __init__(self):
+                super().__init__()
+                self.screen = "Step 1: Run `git fetch`?"
+                self.sent_keys = []
+
+            def read_visible_pane(self, name: str, lines: int = 30) -> str:
+                return self.screen
+
+            def send_keys(self, name: str, keys) -> None:
+                self.sent_keys.append((name, list(keys)))
+                # Immediately advance to step 2 prompt within the same turn (pane stays blocked)
+                if "Step 1" in self.screen:
+                    self.screen = "Step 2: Run `git rebase origin/main`?"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            term = TwoStepTerminal()
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                daemon._ensure_general_session(1000)
+                term.set_pane(GENERAL_PANE_NAME, status="blocked")
+
+                # Prompt 1 pushed
+                daemon.run_once(now=1000)
+                self.assertEqual(len(ch.sent), 1)
+                self.assertIn("Step 1", ch.sent[0]["text"])
+                cb1 = ch.sent[0]["buttons"][0][0].callback_data
+
+                # User approves Prompt 1 -> terminal immediately shows Prompt 2 -> Card 2 pushed!
+                ch.inbound.append(
+                    InboundMessage(
+                        1, "c1", None, "u1", "",
+                        is_callback=True,
+                        callback_id="cb-step1",
+                        callback_data=cb1,
+                        message_id=ch.sent[0]["id"],
+                    )
+                )
+                daemon.run_once(now=1005)
+                self.assertEqual(len(term.sent_keys), 1)
+                self.assertEqual(len(ch.sent), 2)
+                self.assertIn("Step 2", ch.sent[1]["text"])
+                cb2 = ch.sent[1]["buttons"][0][0].callback_data
+
+                # User approves Prompt 2
+                ch.inbound.append(
+                    InboundMessage(
+                        2, "c1", None, "u1", "",
+                        is_callback=True,
+                        callback_id="cb-step2",
+                        callback_data=cb2,
+                        message_id=ch.sent[1]["id"],
+                    )
+                )
+                daemon.run_once(now=1010)
+                self.assertEqual(len(term.sent_keys), 2)
+                self.assertEqual(term.sent_keys, [(GENERAL_PANE_NAME, ["enter"]), (GENERAL_PANE_NAME, ["enter"])])
+            finally:
+                daemon.close()
+
+    def test_agent_blocked_approval_stop_reflow_and_system_message_no_leak(self) -> None:
+        """
+        Regression covering two coupled flows:
+          1. Completed Feishu sync turn clears last_input_origin; subsequent SYSTEM_MESSAGE wake
+             (PreInvocation with stale lastUserInput + Stop with no new USER_INPUT) MUST NOT push to Feishu.
+          2. AgentBlockedError pushes approval card & sets pending_approval_reply; clicking approve sends key;
+             subsequent Stop pushes final reply to main window (thread_id=None) once, consumes flag,
+             queued messages drain automatically, and later SYSTEM_MESSAGE Stop MUST NOT leak to Feishu.
+        """
+
+        class FlowTerminal(StatusAwareTerminal):
+            name = "herdr"
+
+            def __init__(self, tfile: Path):
+                super().__init__()
+                self.tfile = tfile
+                self.should_block = False
+                self.visible_screen = "Run deploy.sh?\n❯ 1. Allow\n  2. Deny\n"
+                self.sent_keys = []
+
+            def read_visible_pane(self, name: str, lines: int = 30) -> str:
+                return self.visible_screen
+
+            def send_keys(self, name: str, keys) -> None:
+                self.sent_keys.append((name, list(keys)))
+
+            def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+                self.prompt_calls.append({"name": name, "text": text, "wait": wait, "timeout_ms": timeout_ms})
+                if self.should_block:
+                    self.set_pane(name, status="blocked")
+                    raise AgentBlockedError(pane_name=name, detail="awaiting approval")
+                with self.tfile.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"type": "USER_INPUT", "content": text}, ensure_ascii=False) + "\n")
+                    fh.write(json.dumps({"type": "PLANNER_RESPONSE", "content": f"同步回复：{text[:12]}"}, ensure_ascii=False) + "\n")
+                return ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            tfile = Path(tmp) / "gen_flow.jsonl"
+            tfile.write_text("", encoding="utf-8")
+
+            term = FlowTerminal(tfile)
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                sess = daemon._ensure_general_session(1000)
+                skey = sess["session_key"]
+                daemon.db.update_session(
+                    skey,
+                    agent_session_id="conv-gen-flow",
+                    transcript_path=str(tfile),
+                    turn_count=1,
+                )
+                term.set_pane(GENERAL_PANE_NAME, status="idle")
+
+                # --- Part 1: Normal sync Feishu turn, then background SYSTEM_MESSAGE wake ---
+                ch.inbound.append(InboundMessage(1, "c1", None, "u1", "现在在干啥", message_id="m-q1"))
+                s1 = daemon.run_once(now=1010)
+                self.assertEqual(s1.events_processed, 1)
+                self.assertEqual(ch.card_updates[-1]["text"], "同步回复：现在在干啥")
+                self.assertIsNone(daemon.db.get_meta(f"last_input_origin:{skey}"))
+                self.assertIsNone(daemon.db.get_meta(f"pending_approval_reply:{skey}"))
+                # Advance reply_line_offset as if Stop fired during sync wait
+                daemon.db.update_session(skey, reply_line_offset=2)
+
+                sent_before_bg = len(ch.sent)
+                # Background subagent / timer wakes via SYSTEM_MESSAGE:
+                # PreInvocation still carries stale lastUserInput="现在在干啥" (in daemon_dispatches!),
+                # transcript appends ONLY PLANNER_RESPONSE (no new USER_INPUT).
+                with tfile.open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(
+                            {"type": "PLANNER_RESPONSE", "content": "后台子 Agent 定时进度汇报（不应推飞书）"},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                with patch.dict(os.environ, {"HQ_SESSION_KEY": skey}):
+                    handle_hook_event(
+                        "agy",
+                        {
+                            "hookEventName": "PreInvocation",
+                            "conversationId": "conv-gen-flow",
+                            "lastUserInput": "<USER_REQUEST>现在在干啥</USER_REQUEST>",
+                        },
+                        hq_dir=hq_dir,
+                        channel=ch,
+                        now=1100,
+                    )
+                    bg_stop = handle_hook_event(
+                        "agy",
+                        {
+                            "hookEventName": "Stop",
+                            "conversationId": "conv-gen-flow",
+                            "transcriptPath": str(tfile),
+                        },
+                        hq_dir=hq_dir,
+                        channel=ch,
+                        now=1105,
+                    )
+                self.assertFalse(bg_stop["reply_pushed"])
+                self.assertEqual(len(ch.sent), sent_before_bg)
+
+                # --- Part 2: AgentBlockedError -> Feishu approve -> Stop pushes final reply once -> queue drains ---
+                term.should_block = True
+                ch.inbound.append(InboundMessage(2, "c1", None, "u1", "执行部署脚本", message_id="m-q2"))
+                s2 = daemon.run_once(now=1200)
+                self.assertEqual(s2.events_processed, 1)
+                self.assertEqual(ch.card_updates[-1]["text"], "⏸️ 需要审批，请点击下方审批卡片确认")
+                self.assertIsNone(daemon.db.get_meta(f"daemon_waiting:{skey}"))
+                self.assertEqual(daemon.db.get_meta(f"pending_approval_reply:{skey}"), "1")
+                self.assertEqual(daemon.db.get_meta(f"last_input_origin:{skey}"), "daemon")
+
+                approval_card = ch.sent[-1]
+                self.assertIsNone(approval_card["thread_id"])
+                self.assertIn("Run deploy.sh?", approval_card["text"])
+                allow_cb = approval_card["buttons"][0][0].callback_data
+
+                # Another Feishu message arrives while blocked -> parked in queue
+                ch.inbound.append(InboundMessage(3, "c1", None, "u1", "顺便查下版本号", message_id="m-q3"))
+                s_park = daemon.run_once(now=1205)
+                self.assertEqual(s_park.events_parked, 1)
+
+                # User clicks Allow on Feishu approval card
+                ch.inbound.append(
+                    InboundMessage(
+                        4, "c1", None, "u1", "",
+                        is_callback=True,
+                        callback_id="cb-deploy-allow",
+                        callback_data=allow_cb,
+                        message_id=approval_card["id"],
+                    )
+                )
+                daemon.run_once(now=1210)
+                self.assertEqual(term.sent_keys, [(GENERAL_PANE_NAME, ["enter"])])
+
+                # Agent finishes approved tool and triggers Stop (no new USER_INPUT, only PLANNER_RESPONSE)
+                with tfile.open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(
+                            {"type": "PLANNER_RESPONSE", "content": "部署脚本已执行完毕，全部成功！"},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                with patch.dict(os.environ, {"HQ_SESSION_KEY": skey}):
+                    approved_stop = handle_hook_event(
+                        "agy",
+                        {
+                            "hookEventName": "Stop",
+                            "conversationId": "conv-gen-flow",
+                            "transcriptPath": str(tfile),
+                        },
+                        hq_dir=hq_dir,
+                        channel=ch,
+                        now=1220,
+                    )
+                self.assertTrue(approved_stop["reply_pushed"])
+                self.assertEqual(ch.sent[-1]["text"], "部署脚本已执行完毕，全部成功！")
+                self.assertIsNone(ch.sent[-1]["thread_id"])
+                # One-shot flags consumed!
+                self.assertIsNone(daemon.db.get_meta(f"pending_approval_reply:{skey}"))
+                self.assertIsNone(daemon.db.get_meta(f"last_input_origin:{skey}"))
+
+                # Subsequent background SYSTEM_MESSAGE Stop MUST NOT leak again!
+                sent_after_approved = len(ch.sent)
+                with tfile.open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(
+                            {"type": "PLANNER_RESPONSE", "content": "审批后的后续后台定时回报（不应推飞书）"},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                with patch.dict(os.environ, {"HQ_SESSION_KEY": skey}):
+                    handle_hook_event(
+                        "agy",
+                        {
+                            "hookEventName": "PreInvocation",
+                            "conversationId": "conv-gen-flow",
+                            "lastUserInput": "<USER_REQUEST>执行部署脚本</USER_REQUEST>",
+                        },
+                        hq_dir=hq_dir,
+                        channel=ch,
+                        now=1250,
+                    )
+                    bg_stop2 = handle_hook_event(
+                        "agy",
+                        {
+                            "hookEventName": "Stop",
+                            "conversationId": "conv-gen-flow",
+                            "transcriptPath": str(tfile),
+                        },
+                        hq_dir=hq_dir,
+                        channel=ch,
+                        now=1255,
+                    )
+                self.assertFalse(bg_stop2["reply_pushed"])
+                self.assertEqual(len(ch.sent), sent_after_approved)
+
+                # Once pane returns idle & transcript quiet, queued message "顺便查下版本号" drains automatically!
+                term.should_block = False
+                term.set_pane(GENERAL_PANE_NAME, status="idle")
+                daemon.db.set_meta(f"transcript_mtime:{skey}", "1255", now=1255)
+                s_drain = daemon.run_once(now=1400)
+                self.assertEqual(s_drain.events_processed, 1)
+                self.assertEqual(term.prompt_calls[-1]["text"], "顺便查下版本号")
+                self.assertEqual(ch.card_updates[-1]["text"], "同步回复：顺便查下版本号")
             finally:
                 daemon.close()
 

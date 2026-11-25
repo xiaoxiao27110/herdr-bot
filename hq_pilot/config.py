@@ -22,7 +22,7 @@ TUNING_DESCRIPTIONS: Dict[str, str] = {
     "inbox_max_attempts": "Max event delivery attempts before moving to dead letter",
     "commit_debounce_sec": "Git sensitive commit debounce window in seconds",
     "active_repo_quiet_minutes": "Quiet window in minutes when repo has recent uncommitted edits",
-    "pane_blocked_notify_sec": "Delay in seconds before notifying on blocked managed pane",
+    "pane_blocked_notify_sec": "Delay in seconds before notifying on blocked managed pane (0 = immediate)",
     "deferred_approval_ttl_hours": "TTL in hours for deferred approval cards",
     "general_idle_seal_minutes": "Idle timeout in minutes before rotating #General session with handoff summary",
     "general_max_turns": "Max turns before marking #General for quiet daytime /new rotation",
@@ -57,7 +57,7 @@ class TuningConfig:
     inbox_max_attempts: int = 3
     commit_debounce_sec: int = 300
     active_repo_quiet_minutes: int = 15
-    pane_blocked_notify_sec: int = 60
+    pane_blocked_notify_sec: int = 0
     deferred_approval_ttl_hours: int = 24
     general_idle_seal_minutes: int = 1440
     general_max_turns: int = 60

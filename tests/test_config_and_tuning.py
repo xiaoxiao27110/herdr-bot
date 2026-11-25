@@ -24,7 +24,7 @@ class TestConfigAndTuning(unittest.TestCase):
         self.assertEqual(t.inbox_max_attempts, 3)
         self.assertEqual(t.commit_debounce_sec, 300)
         self.assertEqual(t.active_repo_quiet_minutes, 15)
-        self.assertEqual(t.pane_blocked_notify_sec, 60)
+        self.assertEqual(t.pane_blocked_notify_sec, 0)
         self.assertEqual(t.deferred_approval_ttl_hours, 24)
         self.assertEqual(t.general_idle_seal_minutes, 1440)
         self.assertEqual(t.general_max_turns, 60)

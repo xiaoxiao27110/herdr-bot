@@ -37,7 +37,7 @@ tuning:
   inbox_max_attempts: 3
   commit_debounce_sec: 300
   active_repo_quiet_minutes: 15
-  pane_blocked_notify_sec: 60
+  pane_blocked_notify_sec: 0
   deferred_approval_ttl_hours: 24
   general_idle_seal_minutes: 1440
   general_max_turns: 60

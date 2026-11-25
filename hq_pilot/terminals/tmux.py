@@ -9,6 +9,22 @@ import subprocess
 from hq_pilot.terminals.base import PaneInfo, TerminalDriver, shell_join
 
 
+_TMUX_KEY_MAP: Dict[str, str] = {
+    "enter": "Enter",
+    "return": "Enter",
+    "esc": "Escape",
+    "escape": "Escape",
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "tab": "Tab",
+    "space": "Space",
+    "backspace": "BSpace",
+    "bspace": "BSpace",
+}
+
+
 class TmuxDriver(TerminalDriver):
     name = "tmux"
 
@@ -55,6 +71,16 @@ class TmuxDriver(TerminalDriver):
         self._run(["send-keys", "-t", name, "-l", text], check=True)
         if enter:
             self._run(["send-keys", "-t", name, "Enter"], check=True)
+
+    def send_keys(self, name: str, keys: List[str]) -> None:
+        mapped = [
+            _TMUX_KEY_MAP.get(str(k).strip().lower(), str(k).strip())
+            for k in keys
+            if str(k).strip()
+        ]
+        if not mapped:
+            return
+        self._run(["send-keys", "-t", name, *mapped], check=True)
 
     def read_pane(self, name: str, lines: int = 80) -> str:
         res = self._run(

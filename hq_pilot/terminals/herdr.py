@@ -382,6 +382,57 @@ class HerdrDriver(TerminalDriver):
         else:
             self._run(["pane", "send-text", pane_id, text], check=True)
 
+    def send_keys(self, name: str, keys: List[str]) -> None:
+        clean_keys = [str(k).strip() for k in keys if str(k).strip()]
+        if not clean_keys:
+            return
+        agent_name = sanitize_herdr_agent_name(name)
+        res = self._run(["agent", "send-keys", agent_name, *clean_keys], check=False)
+        if res.returncode == 0:
+            return
+        pane_id = self._resolve_pane_id(name)
+        res2 = self._run(["pane", "send-keys", pane_id, *clean_keys], check=False)
+        if res2.returncode != 0:
+            err_detail = (res2.stderr or res2.stdout or res.stderr or res.stdout or "").strip()
+            raise RuntimeError(
+                f"Herdr send-keys failed for {name!r} (rc={res2.returncode}): {err_detail}"
+            )
+
+    def read_visible_pane(self, name: str, lines: int = 30) -> str:
+        agent_name = sanitize_herdr_agent_name(name)
+        res = self._run(
+            [
+                "agent",
+                "read",
+                agent_name,
+                "--source",
+                "visible",
+                "--lines",
+                str(int(lines)),
+                "--format",
+                "text",
+            ],
+            check=False,
+        )
+        if res.returncode == 0:
+            out = res.stdout or ""
+            stripped = out.strip()
+            if stripped.startswith("{"):
+                try:
+                    obj = json.loads(stripped)
+                    if isinstance(obj, dict) and isinstance(obj.get("result"), dict):
+                        r = obj["result"]
+                        if isinstance(r.get("text"), str):
+                            return r["text"]
+                        if isinstance(r.get("content"), str):
+                            return r["content"]
+                        if isinstance(r.get("lines"), list):
+                            return "\n".join(str(x) for x in r["lines"])
+                except json.JSONDecodeError:
+                    pass
+            return out
+        return self.read_pane(name, lines=lines)
+
     def read_pane(self, name: str, lines: int = 80) -> str:
         pane_id = self._resolve_pane_id(name)
         res = self._run(

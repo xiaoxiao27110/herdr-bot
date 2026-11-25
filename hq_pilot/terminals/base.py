@@ -97,6 +97,14 @@ class TerminalDriver(ABC):
         self.send_text(name=name, text=text, enter=True)
         return ""
 
+    def send_keys(self, name: str, keys: List[str]) -> None:
+        """Send raw key presses (e.g. ['enter'], ['down', 'enter'], ['esc']) to a pane/session."""
+        _ = (name, keys)
+
+    def read_visible_pane(self, name: str, lines: int = 30) -> str:
+        """Read currently visible viewport lines from a pane/session."""
+        return self.read_pane(name, lines=lines)
+
 
 def _run_git(cwd: Path, args: List[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(

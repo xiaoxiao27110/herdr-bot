@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+import hashlib
+import json
 import re
 import subprocess
 import time
@@ -275,6 +277,147 @@ def scan_distill_candidates(
     return enqueued
 
 
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])"
+)
+_BORDER_LINE_RE = re.compile(r"^[\s─━═┄┅┈┉\-_=+|┌┐└┘├┤┬┴┼╭╮╰╯╔╗╚╝║]+$")
+_TUI_CHROME_RE = re.compile(
+    r"(?:\?\s*for\s+shortcuts|(?:^|\s)(?:auto|plan|ask)\s*·\s*)", re.IGNORECASE
+)
+_NUMBERED_OPT_RE = re.compile(
+    r"^\s*(?:(?P<cursor>[❯›>▶▸►•●])\s*)?(?P<num>[1-9])[\.\)\]]\s+(?P<label>.+?)\s*$"
+)
+
+
+def parse_blocked_prompt(raw_screen: str) -> Dict[str, Any]:
+    """Clean visible terminal output and parse interactive approval options & key sequences."""
+    cleaned_raw = _ANSI_ESCAPE_RE.sub("", raw_screen or "").replace("\r\n", "\n").replace("\r", "")
+    lines: List[str] = []
+    for line in cleaned_raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _BORDER_LINE_RE.match(line):
+            continue
+        lines.append(line.rstrip())
+
+    while lines:
+        tail = lines[-1].strip()
+        if tail in {">", "❯", "›"} or _TUI_CHROME_RE.search(tail):
+            lines.pop()
+            continue
+        break
+
+    recent_lines = lines[-20:]
+    summary = "\n".join(recent_lines).strip()
+    if len(summary) > 1200:
+        summary = "...\n" + summary[-(1200 - 4):]
+
+    # Detect the last contiguous numbered menu (2..4 options starting at 1) near the bottom
+    groups: List[Dict[str, Any]] = []
+    current_group: Optional[Dict[str, Any]] = None
+    for idx, line in enumerate(recent_lines):
+        m = _NUMBERED_OPT_RE.match(line)
+        if not m:
+            if current_group is not None and (idx - int(current_group["last_idx"])) > 2:
+                groups.append(current_group)
+                current_group = None
+            continue
+        num = int(m.group("num"))
+        cursor = bool(m.group("cursor"))
+        label = m.group("label").strip()
+        if num == 1:
+            if current_group is not None:
+                groups.append(current_group)
+            current_group = {
+                "items": [{"num": 1, "label": label, "cursor": cursor}],
+                "last_idx": idx,
+                "overflow": False,
+            }
+        elif current_group is not None and num == len(current_group["items"]) + 1:
+            if num > 4:
+                current_group["overflow"] = True
+            current_group["items"].append({"num": num, "label": label, "cursor": cursor})
+            current_group["last_idx"] = idx
+        else:
+            if current_group is not None:
+                groups.append(current_group)
+                current_group = None
+    if current_group is not None:
+        groups.append(current_group)
+
+    chosen_items: Optional[List[Dict[str, Any]]] = None
+    n_recent = len(recent_lines)
+    for grp in reversed(groups):
+        if grp["overflow"]:
+            continue
+        items = grp["items"]
+        if 2 <= len(items) <= 4 and (n_recent - 1 - int(grp["last_idx"])) <= 8:
+            chosen_items = items
+            break
+
+    options: List[Dict[str, Any]] = []
+    has_menu = False
+    if chosen_items:
+        has_menu = True
+        highlighted_idx = 0
+        for i, item in enumerate(chosen_items):
+            if item["cursor"]:
+                highlighted_idx = i
+                break
+        for i, item in enumerate(chosen_items):
+            delta = i - highlighted_idx
+            if delta == 0:
+                keys = ["enter"]
+            elif delta > 0:
+                keys = ["down"] * delta + ["enter"]
+            else:
+                keys = ["up"] * (-delta) + ["enter"]
+            short_lbl = " ".join(str(item["label"]).split())
+            if len(short_lbl) > 28:
+                short_lbl = short_lbl[:25] + "..."
+            num = int(item["num"])
+            options.append(
+                {
+                    "id": f"opt_{num}",
+                    "label": f"{num}. {short_lbl}",
+                    "keys": keys,
+                    "negative": False,
+                }
+            )
+        options.append(
+            {
+                "id": "cancel",
+                "label": "❌ 取消",
+                "keys": ["esc"],
+                "negative": True,
+            }
+        )
+    else:
+        options = [
+            {
+                "id": "allow",
+                "label": "✅ 允许",
+                "keys": ["enter"],
+                "negative": False,
+            },
+            {
+                "id": "deny",
+                "label": "❌ 拒绝",
+                "keys": ["esc"],
+                "negative": True,
+            },
+        ]
+
+    screen_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()[:16]
+    return {
+        "summary": summary,
+        "screen_hash": screen_hash,
+        "options": options,
+        "has_menu": has_menu,
+    }
+
+
 def scan_pane_blocked(
     db: HQDatabase,
     terminal_driver: TerminalDriver,
@@ -285,25 +428,49 @@ def scan_pane_blocked(
     ts = int(now if now is not None else time.time())
     panes = {p.name: p for p in terminal_driver.list_panes()}
     enqueued: List[str] = []
+    notify_sec = int(config.tuning.pane_blocked_notify_sec)
     for sess in db.list_sessions(statuses=["active"]):
         if int(sess.get("pinned") or 0) == 1:
             continue
         pname = sess.get("pane_name")
         if not pname or pname not in panes:
             continue
+        skey = str(sess["session_key"])
         pane = panes[pname]
         if pane.status != "blocked":
+            if db.get_meta(f"blocked_approval_card:{skey}") is not None:
+                db.delete_meta(f"blocked_approval_card:{skey}")
+                prev_ep = int(db.get_meta(f"blocked_epoch:{skey}") or "0")
+                db.set_meta(f"blocked_epoch:{skey}", str(prev_ep + 1), now=ts)
+            if db.get_meta(f"blocked_last_resolved:{skey}") is not None:
+                db.delete_meta(f"blocked_last_resolved:{skey}")
             continue
         last_active = int(sess.get("last_active_at") or 0)
-        if (ts - last_active) < config.tuning.pane_blocked_notify_sec:
+        if notify_sec > 0 and (ts - last_active) < notify_sec:
             continue
+
+        resolved_raw = db.get_meta(f"blocked_last_resolved:{skey}")
+        if resolved_raw:
+            try:
+                resolved_info = json.loads(resolved_raw)
+                r_at = int(resolved_info.get("resolved_at") or 0)
+                r_hash = str(resolved_info.get("screen_hash") or "")
+                if (ts - r_at) < 10:
+                    raw_vis = terminal_driver.read_visible_pane(str(pname), lines=30)
+                    cur_hash = parse_blocked_prompt(raw_vis)["screen_hash"]
+                    if cur_hash == r_hash:
+                        continue
+            except Exception:
+                pass
+
+        epoch = (db.get_meta(f"blocked_epoch:{skey}") or "0").strip() or "0"
         eid = db.enqueue_event(
             source="pane_blocked",
-            dedupe_key=f"pane_blocked:{sess['session_key']}:{last_active}",
+            dedupe_key=f"pane_blocked:{skey}:{last_active}:{epoch}",
             priority=10,
             available_at=ts,
             payload={
-                "session_key": sess["session_key"],
+                "session_key": skey,
                 "pane_name": pname,
                 "channel_thread_id": sess.get("channel_thread_id"),
                 "repo_name": sess.get("repo_name"),
@@ -312,5 +479,5 @@ def scan_pane_blocked(
             now=ts,
         )
         if eid is not None:
-            enqueued.append(str(sess["session_key"]))
+            enqueued.append(skey)
     return enqueued

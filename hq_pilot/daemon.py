@@ -23,6 +23,7 @@ from hq_pilot.cursors import CursorStore
 from hq_pilot.db import EventRow, HQDatabase
 from hq_pilot.gatekeeper import (
     detect_manual_touch,
+    parse_blocked_prompt,
     scan_distill_candidates,
     scan_pane_blocked,
     scan_repo_commits,
@@ -58,14 +59,17 @@ def _format_digest_category(category: str) -> str:
     return "系统提醒"
 
 
+_parse_blocked_prompt = parse_blocked_prompt
+
+
 def _build_busy_queue_card_text(busy_kind: str, hint: str, count: int) -> str:
     """Format button-less Feishu queuing card text for a busy `#General` batch."""
     _ = hint
     n = max(1, int(count))
     if busy_kind == "blocked":
         if n <= 1:
-            return "⏸️ 正在等待审批，请打开 herdr 处理；消息已排队"
-        return f"⏸️ 正在等待审批，请打开 herdr 处理；消息已排队（共 {n} 条）"
+            return "⏸️ 正在等待审批，请先点击审批卡片确认；消息已排队"
+        return f"⏸️ 正在等待审批，请先点击审批卡片确认；消息已排队（共 {n} 条）"
     if n <= 1:
         return "⏳ 收到，正在排队处理..."
     return f"⏳ 收到，正在排队处理（共 {n} 条）..."
@@ -431,6 +435,90 @@ class HQDaemon:
                 )
             return
 
+        if data.startswith("approve_key:"):
+            rest = data[len("approve_key:"):]
+            if ":" in rest:
+                skey, action_id = rest.rsplit(":", 1)
+            else:
+                skey, action_id = rest, ""
+
+            def _reply_approval_status(target_card_id: Optional[str], status_text: str) -> None:
+                if self.channel is None:
+                    return
+                if target_card_id and self.channel.finish_working_indicator(
+                    str(target_card_id), status_text, thread_id=None
+                ):
+                    return
+                self.channel.send_message(status_text, thread_id=None)
+
+            raw_meta = self.db.get_meta(f"blocked_approval_card:{skey}") if skey else None
+            card_meta: Optional[Dict[str, Any]] = None
+            if raw_meta:
+                try:
+                    parsed_meta = json.loads(raw_meta)
+                    if isinstance(parsed_meta, dict):
+                        card_meta = parsed_meta
+                except json.JSONDecodeError:
+                    card_meta = None
+
+            actions_map = card_meta.get("actions") if isinstance(card_meta, dict) else None
+            action_info = (
+                actions_map.get(action_id)
+                if isinstance(actions_map, dict) and action_id
+                else None
+            )
+            saved_card_id = (
+                str(card_meta.get("card_id") or "")
+                if isinstance(card_meta, dict)
+                else ""
+            )
+            if (
+                card_meta is None
+                or not isinstance(action_info, dict)
+                or (
+                    msg.message_id
+                    and saved_card_id
+                    and str(msg.message_id) != saved_card_id
+                )
+            ):
+                _reply_approval_status(msg.message_id, "该审批已处理或已失效。")
+                return
+
+            pane_name = str(card_meta.get("pane_name") or "").strip()
+            screen_hash = str(card_meta.get("screen_hash") or "")
+            is_still_blocked = False
+            for p in self.terminal_driver.list_panes():
+                if p.name == pane_name and str(p.status or "").strip().lower() == "blocked":
+                    is_still_blocked = True
+                    break
+
+            if not is_still_blocked:
+                self.db.delete_meta(f"blocked_approval_card:{skey}")
+                _reply_approval_status(
+                    saved_card_id or msg.message_id, "该审批已处理或已失效。"
+                )
+                return
+
+            keys = [str(k) for k in (action_info.get("keys") or []) if str(k).strip()]
+            label = str(action_info.get("label") or action_id)
+            is_negative = bool(action_info.get("negative")) or action_id in {"deny", "cancel"}
+            self.terminal_driver.send_keys(pane_name, keys)
+            self.db.delete_meta(f"blocked_approval_card:{skey}")
+            self.db.set_meta(
+                f"blocked_last_resolved:{skey}",
+                json.dumps({"screen_hash": screen_hash, "resolved_at": now}, ensure_ascii=False),
+                now=now,
+            )
+            prev_epoch = int(self.db.get_meta(f"blocked_epoch:{skey}") or "0")
+            self.db.set_meta(f"blocked_epoch:{skey}", str(prev_epoch + 1), now=now)
+
+            if is_negative:
+                done_text = f"❌ 已执行操作（{label}）"
+            else:
+                done_text = f"✅ 已执行审批（{label}），继续执行中..."
+            _reply_approval_status(saved_card_id or msg.message_id, done_text)
+            return
+
         if data.startswith("pane_continue:") or data.startswith("pane_seal:"):
             is_seal = data.startswith("pane_seal:")
             skey = data.split(":", 1)[1]
@@ -791,6 +879,9 @@ class HQDaemon:
         self.db.delete_meta(f"last_reply:{skey}")
         self.db.delete_meta(f"last_reply_pane:{pane_name}")
         self.db.delete_meta(f"last_input_origin:{skey}")
+        self.db.delete_meta(f"pending_approval_reply:{skey}")
+        self.db.delete_meta(f"blocked_approval_card:{skey}")
+        self.db.delete_meta(f"blocked_last_resolved:{skey}")
         self.db.delete_meta(f"current_work_hint:{skey}")
 
         new_sess = self._create_next_general_session(now)
@@ -1133,6 +1224,94 @@ class HQDaemon:
         prompt_file.write_text(prompt, encoding="utf-8")
         return f"请读取并执行指令文件 `{prompt_file}` 中的全部要求，完成后直接给出简洁结论。"
 
+    def _ensure_pane_approval_card(
+        self,
+        sess: Dict[str, Any],
+        pane_name: str,
+        now: int,
+    ) -> Optional[str]:
+        """Capture visible blocked prompt and push a deduplicated Feishu interactive approval card."""
+        if self.channel is None:
+            return None
+        skey = str(sess.get("session_key") or pane_name)
+        try:
+            raw_screen = self.terminal_driver.read_visible_pane(pane_name, lines=30)
+        except Exception:
+            raw_screen = ""
+        parsed = _parse_blocked_prompt(raw_screen)
+        summary = str(parsed["summary"] or "")
+        screen_hash = str(parsed["screen_hash"] or "")
+        options = list(parsed["options"] or [])
+
+        existing_raw = self.db.get_meta(f"blocked_approval_card:{skey}")
+        if existing_raw:
+            try:
+                existing = json.loads(existing_raw)
+                if isinstance(existing, dict) and existing.get("screen_hash") == screen_hash:
+                    return str(existing.get("card_id") or "") or None
+            except json.JSONDecodeError:
+                pass
+
+        resolved_raw = self.db.get_meta(f"blocked_last_resolved:{skey}")
+        if resolved_raw:
+            try:
+                resolved = json.loads(resolved_raw)
+                if (
+                    isinstance(resolved, dict)
+                    and resolved.get("screen_hash") == screen_hash
+                    and (now - int(resolved.get("resolved_at") or 0)) < 10
+                ):
+                    return None
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
+        if summary:
+            safe_summary = summary.replace("```", "` ` `")
+            card_text = f"⏸️ 面板 `{pane_name}` 等待操作审批：\n```text\n{safe_summary}\n```"
+        else:
+            card_text = f"⏸️ 面板 `{pane_name}` 等待操作审批，请点击下方按钮确认："
+
+        actions: Dict[str, Dict[str, Any]] = {}
+        flat_buttons: List[InlineButton] = []
+        for opt in options:
+            aid = str(opt["id"])
+            label = str(opt["label"])
+            actions[aid] = {
+                "label": label,
+                "keys": list(opt["keys"]),
+                "negative": bool(opt.get("negative", False)),
+            }
+            flat_buttons.append(
+                InlineButton(text=label, callback_data=f"approve_key:{skey}:{aid}")
+            )
+
+        if len(flat_buttons) <= 3:
+            button_rows = [flat_buttons]
+        elif len(flat_buttons) == 4:
+            button_rows = [flat_buttons[:2], flat_buttons[2:]]
+        else:
+            button_rows = [flat_buttons[:3], flat_buttons[3:]]
+
+        card_id = self.channel.send_message(
+            card_text,
+            thread_id=None,
+            buttons=button_rows,
+        )
+        record = {
+            "card_id": card_id,
+            "screen_hash": screen_hash,
+            "pane_name": pane_name,
+            "session_key": skey,
+            "actions": actions,
+            "created_at": now,
+        }
+        self.db.set_meta(
+            f"blocked_approval_card:{skey}",
+            json.dumps(record, ensure_ascii=False),
+            now=now,
+        )
+        return card_id
+
     def _dispatch_interactive(
         self,
         session: Dict[str, Any],
@@ -1167,23 +1346,28 @@ class HQDaemon:
         )
         self.db.record_dispatch(skey, agent_sid, delivery_prompt, now=now)
         self.db.set_meta(f"last_input_origin:{skey}", "daemon", now=now)
+        self.db.delete_meta(f"pending_approval_reply:{skey}")
         self.db.delete_meta(f"last_reply:{skey}")
         self.db.delete_meta(f"last_reply_pane:{pane_name}")
         self.db.set_meta(f"daemon_waiting:{skey}", "1", now=now)
         self.db.set_meta(f"daemon_waiting_pane:{pane_name}", "1", now=now)
+        blocked = False
         try:
             fallback_reply = self.terminal_driver.prompt_agent(
                 pane_name, delivery_prompt, wait=wait
             )
         except AgentBlockedError:
-            return (
-                "⏸️ Agent 正在等待工具或操作审批（状态：blocked），"
-                "请打开 herdr 面板确认，或在 hq.yaml 中开启 agent.permission_mode: turbo。"
-            )
+            blocked = True
+            self.db.set_meta(f"pending_approval_reply:{skey}", "1", now=now)
+            self.db.set_meta(f"last_input_origin:{skey}", "daemon", now=now)
+            self._ensure_pane_approval_card(session, pane_name, now=now)
+            return "⏸️ 需要审批，请点击下方审批卡片确认"
         finally:
             self.db.delete_meta(f"daemon_waiting:{skey}")
             self.db.delete_meta(f"daemon_waiting_pane:{pane_name}")
             self.db.delete_meta(f"current_work_hint:{skey}")
+            if not blocked and wait:
+                self.db.delete_meta(f"last_input_origin:{skey}")
 
         hook_reply = self.db.get_meta(f"last_reply:{skey}")
         if hook_reply is not None:
@@ -1341,6 +1525,8 @@ class HQDaemon:
             is_busy, busy_kind, hint = self._inspect_session_busy(sess, now)
             if is_busy:
                 self._park_channel_event_in_batch(ev, sess, busy_kind, hint)
+                if busy_kind == "blocked":
+                    self._ensure_pane_approval_card(sess, pane_name, now=now)
                 raise _EventParked()
 
             batch_events: List[EventRow] = [ev]
@@ -1607,30 +1793,15 @@ class HQDaemon:
 
         if ev.source == "pane_blocked":
             skey = str(ev.payload.get("session_key", ""))
-            thread_id = ev.payload.get("channel_thread_id")
-            if self.channel:
-                msg_id = self.channel.send_message(
-                    f"⏸️ 任务 `{skey}` 当前处于阻塞状态，等待你处理：",
-                    thread_id=thread_id,
-                    buttons=[
-                        [
-                            InlineButton(text="继续执行", callback_data=f"pane_continue:{skey}"),
-                            InlineButton(text="封口结束", callback_data=f"pane_seal:{skey}"),
-                        ]
-                    ],
-                )
-                if msg_id:
-                    self.db.create_deferred_action(
-                        channel_msg_id=msg_id,
-                        session_key=skey,
-                        level="review",
-                        options=[
-                            {"id": "continue", "label": "继续执行"},
-                            {"id": "seal", "label": "封口结束"},
-                        ],
-                        ttl_hours=self.config.tuning.deferred_approval_ttl_hours,
-                        now=now,
-                    )
+            sess = self.db.get_session(skey) if skey else None
+            pane_name = str(
+                ev.payload.get("pane_name")
+                or (sess.get("pane_name") if sess else "")
+                or GENERAL_PANE_NAME
+            )
+            if sess is None:
+                sess = {"session_key": skey or pane_name, "pane_name": pane_name}
+            self._ensure_pane_approval_card(sess, pane_name, now=now)
             return
 
     # ------------------------------------------------------------------

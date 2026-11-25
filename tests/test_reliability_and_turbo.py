@@ -122,9 +122,16 @@ class TestReliabilityAndTurbo(unittest.TestCase):
                 self.assertEqual(summary.events_failed, 0)
                 self.assertEqual(len(ch.finished_indicators), 1)
                 msg = ch.finished_indicators[0]["text"]
-                self.assertIn("blocked", msg)
-                self.assertIn("agent.permission_mode: turbo", msg)
+                self.assertEqual(msg, "⏸️ 需要审批，请点击下方审批卡片确认")
+                self.assertNotIn("herdr", msg.lower())
+                self.assertEqual(len(ch.sent), 1)
+                self.assertIsNone(ch.sent[0]["thread_id"])
+                self.assertIsNotNone(ch.sent[0]["buttons"])
+                btn_texts = [b.text for row in ch.sent[0]["buttons"] for b in row]
+                self.assertEqual(btn_texts, ["✅ 允许", "❌ 拒绝"])
                 self.assertIsNone(daemon.db.get_meta("daemon_waiting:general:1"))
+                self.assertEqual(daemon.db.get_meta("pending_approval_reply:general:1"), "1")
+                self.assertEqual(daemon.db.get_meta("last_input_origin:general:1"), "daemon")
             finally:
                 daemon.close()
 

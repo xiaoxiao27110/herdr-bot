@@ -9,14 +9,14 @@ import json
 from hq_pilot.config import HQConfig
 
 
-GENERAL_ORCHESTRATION_GUIDE = """## 0. #General & Auto-Topic Orchestration Guide
-- **轻量直回（不开 Topic）**：轻量问答、打招呼、状态查询、记忆检索或临时汇报，直接在当前 `#General` 会话回复，不要创建新 Topic。
-- **独立开发自动开 Topic**：遇到需要修改代码、运行测试或长链路排查的独立开发需求时，`#General` 无需人工手敲 `/task`，请自主执行：
-  `herdr-bot task spawn <repo> <slug> "<需求>" --hq-dir "$HQ_DIR"`
-  自动创建独立 Git worktree、Herdr 交互面板与频道话题卡片，并在 `#General` 简短告知已拉起的话题。
-- **完成自主封口**：`#Topic` 完成开发并验收通过后，Agent 可调用：
+GENERAL_ORCHESTRATION_GUIDE = """## 0. #General & #Topic Collaboration Guide
+- **默认在 `#General` 连贯完成（永不擅自开 Topic）**：日常问答、状态查询、环境排查、方案讨论及常规代码修改默认均在当前 `#General` 会话连贯完成（可自行派子 Agent 协助；修改业务仓代码前请先在业务仓切换或创建功能分支，勿直接提交主分支）。未经用户明确要求，`#General` 严禁擅自创建新 `#Topic`。
+- **仅在用户明确要求时开 `#Topic`**：仅当用户明确提出“单独开个任务 / 另开分身 / 新开面板跟进某条线”时，才执行：
+  `herdr-bot task spawn <repo> <slug> "<含当前背景与约束的需求>" --hq-dir "$HQ_DIR"`
+  拉起独立 Git worktree、Herdr 面板与频道话题卡片。
+- **完成封口**：`#Topic` 完成开发并验收通过后，可调用：
   `herdr-bot seal "$HQ_SESSION_KEY" --hq-dir "$HQ_DIR"`
-  自主封口（保留 worktree 至夜间安全归档；未主动封口的非 `pinned` Topic 在空闲超时后也会自动封口）。
+  封口（保留 worktree 至夜间安全归档；非 `pinned` Topic 空闲超时也会自动封口）。
 - **自主定时唤醒**：需稍后跟进或定期巡检时，可设定一次性或周期性闹钟：
   `herdr-bot timer set --in 15m --reason "<跟进原因>" --hq-dir "$HQ_DIR"`
   （支持 `--at` / `--every`，以及 `timer list` / `timer cancel <id>`）。"""

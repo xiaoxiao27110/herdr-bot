@@ -307,6 +307,68 @@ class HQDatabase:
         row = self.conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         return dict(row) if row else None
 
+    def park_event_waiting(
+        self,
+        event_id: int,
+        payload_updates: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Park a leased event in `waiting_general` without counting as a failure attempt."""
+        row = self.conn.execute("SELECT * FROM events WHERE id = ?", (int(event_id),)).fetchone()
+        if not row or str(row["status"]) == "done":
+            return False
+        payload = json.loads(row["payload_json"])
+        if payload_updates:
+            payload.update(payload_updates)
+        new_attempts = max(0, int(row["attempts"]) - 1)
+        self.conn.execute(
+            """
+            UPDATE events
+            SET status = 'waiting_general', lease_until = 0, attempts = ?, payload_json = ?
+            WHERE id = ?
+            """,
+            (
+                new_attempts,
+                json.dumps(payload, sort_keys=True, ensure_ascii=False),
+                int(event_id),
+            ),
+        )
+        return True
+
+    def list_waiting_events(self) -> List[EventRow]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM events
+            WHERE status = 'waiting_general'
+            ORDER BY priority ASC, available_at ASC, id ASC
+            """
+        ).fetchall()
+        return [
+            EventRow(
+                id=int(r["id"]),
+                source=str(r["source"]),
+                dedupe_key=str(r["dedupe_key"]),
+                priority=int(r["priority"]),
+                available_at=int(r["available_at"]),
+                payload=json.loads(r["payload_json"]),
+                status=str(r["status"]),
+                lease_until=int(r["lease_until"] or 0),
+                attempts=int(r["attempts"]),
+                created_at=int(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    def promote_waiting_event(self, event_id: int) -> bool:
+        cur = self.conn.execute(
+            """
+            UPDATE events
+            SET status = 'pending', lease_until = 0
+            WHERE id = ? AND status = 'waiting_general'
+            """,
+            (int(event_id),),
+        )
+        return cur.rowcount > 0
+
     # ------------------------------------------------------------------
     # Sessions (4-state: active | sealed | pinned | archived)
     # ------------------------------------------------------------------
@@ -1024,6 +1086,22 @@ class HQDatabase:
             (int(timer_id),),
         )
         return cur.rowcount > 0
+
+    def migrate_session_timers(
+        self, from_session_key: str, to_session_key: str
+    ) -> int:
+        """Migrate all active timers bound to `from_session_key` onto `to_session_key`."""
+        if not from_session_key or not to_session_key or from_session_key == to_session_key:
+            return 0
+        cur = self.conn.execute(
+            """
+            UPDATE timers
+            SET session_key = ?
+            WHERE session_key = ? AND status = 'active'
+            """,
+            (str(to_session_key), str(from_session_key)),
+        )
+        return int(cur.rowcount)
 
     def fire_due_timers(
         self, now: Optional[int] = None

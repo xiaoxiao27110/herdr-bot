@@ -36,10 +36,12 @@ def _discover_hq_dir(explicit: Optional[str], payload: Dict[str, Any]) -> Option
     return None
 
 
-def _hook_stdout_response(event_type: str) -> Dict[str, Any]:
+def _hook_stdout_response(
+    event_type: str, inject_steps: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
     if event_type == "Stop":
         return {"decision": "allow_stop"}
-    return {"injectSteps": []}
+    return {"injectSteps": list(inject_steps or [])}
 
 
 _USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", flags=re.DOTALL)
@@ -159,6 +161,7 @@ def handle_hook_event(
             sess = db.get_session(skey) or sess
 
         pinned_reason = None
+        inject_steps: List[Dict[str, Any]] = []
         if event_type in {"PreInvocation", "UserPromptSubmit", "SessionStart"} and user_prompt:
             cleaned_prompt = _extract_user_request_text(str(user_prompt))
             pinned_reason = detect_manual_touch(
@@ -171,12 +174,38 @@ def handle_hook_event(
                 origin = "local_tty" if pinned_reason == "manual_input" else "daemon"
                 db.set_meta(f"last_input_origin:{skey}", origin, now=ts)
 
+        # Inject post-rotation handoff summary on local Herdr turn (SessionStart with user input or PreInvocation)
+        is_general_sess = str(sess.get("track") or "") in {"GENERAL", "B"}
+        pane_name_cur = str(sess.get("pane_name") or "").strip()
+        daemon_waiting_cur = db.get_meta(f"daemon_waiting:{skey}") == "1" or (
+            bool(pane_name_cur)
+            and db.get_meta(f"daemon_waiting_pane:{pane_name_cur}") == "1"
+        )
+        if (
+            is_general_sess
+            and event_type in {"SessionStart", "PreInvocation"}
+            and not daemon_waiting_cur
+            and db.get_meta("general_handoff_pending") == "1"
+            and (event_type == "PreInvocation" or bool(user_prompt))
+        ):
+            handoff_text = (db.get_meta("general_handoff_summary") or "").strip()
+            db.delete_meta("general_handoff_pending")
+            if handoff_text:
+                inject_steps.append(
+                    {
+                        "systemMessage": {
+                            "systemMessage": f"[昨日会话交接摘要]\n{handoff_text}"
+                        }
+                    }
+                )
+
         if event_type == "Stop":
             tpath = transcript_path or sess.get("transcript_path")
             reply_pushed = False
             if tpath and Path(str(tpath)).exists():
+                tpath_obj = Path(str(tpath))
                 offset = int(sess.get("reply_line_offset") or 0)
-                turns, total_lines = adapter.read_transcript_slice(str(tpath), from_line=offset)
+                turns, total_lines = adapter.read_transcript_slice(str(tpath_obj), from_line=offset)
                 user_msgs = [t.text for t in turns if t.role == "user"]
                 assistant_msgs = [t.text for t in turns if t.role == "assistant"]
                 new_turns = int(sess.get("turn_count") or 0) + len(user_msgs)
@@ -186,6 +215,14 @@ def handle_hook_event(
                     turn_count=new_turns,
                     last_active_at=ts,
                 )
+                try:
+                    db.set_meta(
+                        f"last_stop_mtime:{skey}",
+                        str(int(tpath_obj.stat().st_mtime)),
+                        now=ts,
+                    )
+                except OSError:
+                    pass
                 if assistant_msgs:
                     latest_reply = assistant_msgs[-1]
                     pane_name = str(sess.get("pane_name") or "").strip()
@@ -258,6 +295,7 @@ def handle_hook_event(
             "event": event_type,
             "session_key": skey,
             "pinned_reason": pinned_reason,
+            "inject_steps": inject_steps,
         }
     finally:
         db.close()
@@ -286,7 +324,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         or payload.get("hook_event_name")
         or ""
     )
-    print(json.dumps(_hook_stdout_response(event_type)))
+    inject_steps = result.get("inject_steps") if isinstance(result, dict) else None
+    print(json.dumps(_hook_stdout_response(event_type, inject_steps=inject_steps), ensure_ascii=False))
     return 0
 
 

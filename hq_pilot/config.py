@@ -26,7 +26,9 @@ TUNING_DESCRIPTIONS: Dict[str, str] = {
     "deferred_approval_ttl_hours": "TTL in hours for deferred approval cards",
     "general_idle_seal_minutes": "Idle timeout in minutes before sealing #General session",
     "general_max_turns": "Max turns before rotating/sealing #General session",
-    "general_nightly_reset": "If true, rotate #General in-place with /new after nightly closeout when idle",
+    "general_nightly_reset": "If true, mark #General for in-place /new rotation after nightly closeout",
+    "general_rotation_quiet_minutes": "Continuous quiet minutes required before executing due daily #General /new rotation",
+    "transcript_busy_window_sec": "Seconds since post-Stop transcript write within which a session is treated as busy",
     "topic_idle_seal_minutes": "Idle timeout in minutes before sealing non-pinned #Topic session",
     "distill_idle_minutes": "Idle threshold in minutes for incremental session distillation",
     "distill_min_new_turns": "Minimum new turns required for incremental distillation",
@@ -58,6 +60,8 @@ class TuningConfig:
     general_idle_seal_minutes: int = 1440
     general_max_turns: int = 200
     general_nightly_reset: bool = True
+    general_rotation_quiet_minutes: int = 60
+    transcript_busy_window_sec: int = 120
     topic_idle_seal_minutes: int = 120
     distill_idle_minutes: int = 20
     distill_min_new_turns: int = 3

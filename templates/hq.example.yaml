@@ -42,6 +42,8 @@ tuning:
   general_idle_seal_minutes: 1440
   general_max_turns: 200
   general_nightly_reset: true
+  general_rotation_quiet_minutes: 60
+  transcript_busy_window_sec: 120
   topic_idle_seal_minutes: 120
   distill_idle_minutes: 20
   distill_min_new_turns: 3

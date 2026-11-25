@@ -423,10 +423,18 @@ class TestGeneralDailyRotation(unittest.TestCase):
                 daemon._ensure_general_session(1000)
                 term.set_pane(GENERAL_PANE_NAME, status="idle")
 
-                # Default general_nightly_reset=True -> nightly pipeline sends /new & rotates general:1 -> general:2
+                # Default general_nightly_reset=True -> nightly pipeline marks due, waits 60m quiet, then rotates
                 self.assertTrue(daemon.config.tuning.general_nightly_reset)
                 daemon.run_nightly_pipeline(now=2000)
+                self.assertEqual(daemon.db.get_meta("general_rotation_due"), "1")
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
 
+                # Before 60m quiet (e.g. +59m) -> still active
+                daemon.run_once(now=2000 + 59 * 60)
+                self.assertEqual(daemon.db.get_session("general:1")["status"], "active")
+
+                # At +60m quiet -> rotates in-place with /new
+                daemon.run_once(now=2000 + 60 * 60)
                 slash_new_calls = [
                     c for c in term.sent_texts if c["name"] == GENERAL_PANE_NAME and c["text"] == "/new"
                 ]
@@ -434,13 +442,15 @@ class TestGeneralDailyRotation(unittest.TestCase):
                 self.assertEqual(term.killed_panes, [])
                 self.assertEqual(daemon.db.get_session("general:1")["status"], "sealed")
                 self.assertEqual(daemon.db.get_session("general:2")["status"], "active")
+                self.assertIsNone(daemon.db.get_meta("general_rotation_due"))
 
-                # Disable general_nightly_reset=False -> nightly pipeline does NOT rotate general:2
+                # Disable general_nightly_reset=False -> nightly pipeline does NOT mark due or rotate general:2
                 update_tuning_value(hq_dir, "general_nightly_reset", "false")
                 daemon.config.reload_if_changed()
                 self.assertFalse(daemon.config.tuning.general_nightly_reset)
 
-                daemon.run_nightly_pipeline(now=3000)
+                daemon.run_nightly_pipeline(now=10000)
+                daemon.run_once(now=10000 + 7200)
                 slash_new_calls_after = [
                     c for c in term.sent_texts if c["name"] == GENERAL_PANE_NAME and c["text"] == "/new"
                 ]

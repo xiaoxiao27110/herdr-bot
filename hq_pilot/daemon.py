@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -144,14 +145,20 @@ def default_cmd_runner(cmd: List[str], cwd: Path) -> subprocess.CompletedProcess
     )
 
 
+class _EventParked(Exception):
+    """Internal control-flow signal when an event is parked in `waiting_general`."""
+
+
 @dataclass
 class TickSummary:
     events_processed: int = 0
     events_failed: int = 0
+    events_parked: int = 0
     distill_enqueued: int = 0
     commits_enqueued: int = 0
     timers_fired: int = 0
     nightly_ran: bool = False
+    general_rotated: bool = False
     digest_sent: bool = False
     outbox_sent: int = 0
 
@@ -245,6 +252,16 @@ class HQDaemon:
                 return
 
         if msg.thread_id:
+            sess_any = self.db.get_session_by_thread(msg.thread_id, include_archived=True)
+            if sess_any and sess_any["status"] == "archived":
+                if self.channel:
+                    self.channel.send_message(
+                        f"会话 `{sess_any['session_key']}` 已归档（分支 `{sess_any.get('branch_name') or '-'}` 仍保留），"
+                        f"可执行 `herdr-bot resume {sess_any['session_key']} --hq-dir {self.hq_dir}` 恢复工作树后继续。",
+                        thread_id=msg.thread_id,
+                    )
+                return
+
             sess = self.db.get_session_by_thread(msg.thread_id)
             if text == "/done" and sess:
                 self.seal_session(str(sess["session_key"]), now=now)
@@ -257,11 +274,11 @@ class HQDaemon:
                     buttons = [
                         [
                             InlineButton(
-                                text="1. 基于当前分支开新短会话",
+                                text="1. 基于当前分支开新会话",
                                 callback_data=f"seal_new:{sess['session_key']}",
                             ),
                             InlineButton(
-                                text="2. 解锁转 Pinned 续聊",
+                                text="2. 解锁继续原会话",
                                 callback_data=f"seal_pin:{sess['session_key']}",
                             ),
                         ]
@@ -472,6 +489,55 @@ class HQDaemon:
                 self.seal_session(str(orig["session_key"]), now=now)
             return
 
+        if data.startswith("busy_wait:") or data.startswith("busy_fork:"):
+            is_fork = data.startswith("busy_fork:")
+            try:
+                ev_id = int(data.split(":", 1)[1])
+            except ValueError:
+                return
+            ev_row = self.db.get_event(ev_id)
+            if not ev_row or str(ev_row.get("status")) != "waiting_general":
+                if self.channel:
+                    self.channel.send_message(
+                        "该消息已开始处理或已完成。",
+                        thread_id=msg.thread_id,
+                    )
+                return
+
+            ev_payload = json.loads(ev_row["payload_json"])
+            card_id = msg.message_id or ev_payload.get("busy_card_msg_id")
+            tid = msg.thread_id or ev_payload.get("thread_id")
+
+            if not is_fork:
+                wait_ack = "⏳ 已确认排队，等当前任务忙完后立即为你处理..."
+                if self.channel:
+                    if not (
+                        card_id
+                        and self.channel.finish_working_indicator(
+                            str(card_id), wait_ack, thread_id=tid
+                        )
+                    ):
+                        self.channel.send_message(wait_ack, thread_id=tid)
+                return
+
+            orig_text = str(ev_payload.get("text") or "").strip() or "并行处理新任务"
+            fork_sess = self._spawn_fork_from_general(orig_text, now=now)
+            self.db.complete_event(ev_id)
+            fork_ack = (
+                f"🔀 已另开并行分身 `{fork_sess['pane_name']}`"
+                f"（分支 `{fork_sess.get('branch_name') or '-'}`，"
+                f"话题 `{fork_sess.get('channel_thread_id') or '-'}`），后续请在该话题中回复。"
+            )
+            if self.channel:
+                if not (
+                    card_id
+                    and self.channel.finish_working_indicator(
+                        str(card_id), fork_ack, thread_id=tid
+                    )
+                ):
+                    self.channel.send_message(fork_ack, thread_id=tid)
+            return
+
         if msg.message_id:
             self.db.resolve_deferred_action(msg.message_id, now=now)
 
@@ -582,8 +648,225 @@ class HQDaemon:
                 return s
         return self._create_next_general_session(now)
 
+    def _get_valid_transcript_mtime(self, session: Dict[str, Any], now: int) -> int:
+        skey = str(session["session_key"])
+        override = self.db.get_meta(f"transcript_mtime:{skey}")
+        if override is not None:
+            try:
+                return int(override)
+            except ValueError:
+                pass
+        tpath = session.get("transcript_path")
+        if tpath and Path(str(tpath)).exists():
+            try:
+                st_mtime = int(Path(str(tpath)).stat().st_mtime)
+                if st_mtime <= now + 5:
+                    return st_mtime
+            except OSError:
+                pass
+        return 0
+
+    def _get_current_work_hint(self, session: Dict[str, Any]) -> str:
+        skey = str(session["session_key"])
+        hint = (self.db.get_meta(f"current_work_hint:{skey}") or "").strip()
+        if hint:
+            return f"「{hint}」"
+        return "当前任务"
+
+    def _inspect_session_busy(
+        self, session: Dict[str, Any], now: int
+    ) -> Tuple[bool, str, str]:
+        """
+        Determine whether `session`'s interactive pane is busy:
+          1. `daemon_waiting` flag set on session or pane
+          2. Herdr / terminal pane status is `working` or `blocked`
+          3. Transcript had post-Stop writes within `transcript_busy_window_sec`
+             (covers background subagents running while terminal status shows `idle`).
+        """
+        skey = str(session["session_key"])
+        pane_name = self._resolve_pane_name(session)
+        hint = self._get_current_work_hint(session)
+
+        if (
+            self.db.get_meta(f"daemon_waiting:{skey}") == "1"
+            or self.db.get_meta(f"daemon_waiting_pane:{pane_name}") == "1"
+        ):
+            return True, "daemon_waiting", hint
+
+        pane_info = None
+        for p in self.terminal_driver.list_panes():
+            if p.name == pane_name:
+                pane_info = p
+                break
+        if pane_info is not None:
+            pstatus = str(pane_info.status or "").strip().lower()
+            if pstatus == "blocked":
+                return True, "blocked", hint
+            if pstatus == "working":
+                return True, "working", hint
+
+        win = int(self.config.tuning.transcript_busy_window_sec)
+        tpath = session.get("transcript_path")
+        if win > 0 and tpath and Path(str(tpath)).exists():
+            mtime = self._get_valid_transcript_mtime(session, now)
+            if mtime > 0 and 0 <= (now - mtime) < win:
+                total_lines = self.agent_adapter.count_transcript_lines(str(tpath))
+                reply_offset = int(session.get("reply_line_offset") or 0)
+                last_stop_mtime = int(self.db.get_meta(f"last_stop_mtime:{skey}") or "0")
+                if total_lines > reply_offset or (
+                    last_stop_mtime > 0 and mtime > last_stop_mtime
+                ):
+                    return True, "transcript_active", hint
+
+        return False, "", ""
+
+    def _build_general_handoff_summary(
+        self, current: Dict[str, Any], now: int
+    ) -> str:
+        """Build a concise handoff summary before rotating `#General`."""
+        _ = now
+        lines: List[str] = []
+        tpath = current.get("transcript_path")
+        if tpath and Path(str(tpath)).exists():
+            turns, _ = self.agent_adapter.read_transcript_slice(str(tpath), from_line=0)
+            recent_turns = turns[-4:]
+            if recent_turns:
+                lines.append("### 上一轮总管会话最近上下文")
+                for t in recent_turns:
+                    role_label = "用户" if t.role == "user" else "总管"
+                    clean = " ".join(t.text.split())
+                    if len(clean) > 180:
+                        clean = clean[:177] + "..."
+                    lines.append(f"- {role_label}：{clean}")
+
+        if not lines:
+            recent_out = self._get_recent_outbound()[-3:]
+            if recent_out:
+                lines.append("### 最近已向用户汇报的结论")
+                for m in recent_out:
+                    clean = " ".join(str(m.get("text") or "").split())
+                    if clean:
+                        if len(clean) > 180:
+                            clean = clean[:177] + "..."
+                        lines.append(f"- {clean}")
+
+        active_topics = [
+            s
+            for s in self.db.list_sessions(statuses=["active", "pinned"])
+            if s.get("track") in TOPIC_TRACKS
+        ]
+        if active_topics:
+            lines.append("### 当前在途独立 Topic 任务")
+            for tsess in active_topics[:6]:
+                lines.append(
+                    f"- `{tsess['session_key']}` | 面板 `{tsess.get('pane_name') or '-'}` "
+                    f"| 分支 `{tsess.get('branch_name') or '-'}` | 状态 `{tsess['status']}`"
+                )
+
+        active_timers = self.db.list_timers(statuses=["active"])
+        if active_timers:
+            lines.append("### 当前待触发定时器")
+            for tm in active_timers[:6]:
+                lines.append(
+                    f"- timer#{tm['id']} ({tm['kind']}, next={tm['next_fire_at']}): {tm['reason']}"
+                )
+
+        if not lines:
+            lines.append("- 上一轮会话已正常收口，详见 `notes/` 与 `tasks/active-wip.md`。")
+        return "\n".join(lines)
+
+    def _spawn_fork_from_general(self, user_text: str, now: int) -> Dict[str, Any]:
+        """Spawn a parallel `#Topic` fork carrying `#General`'s recent context + user request."""
+        general_sess = self._ensure_general_session(now)
+        handoff_ctx = self._build_general_handoff_summary(general_sess, now)
+        user_notes_path = self.hq_dir / "memory" / "user-notes.md"
+        notes_snippet = ""
+        if user_notes_path.is_file():
+            raw_notes = user_notes_path.read_text(encoding="utf-8").strip()
+            if raw_notes:
+                notes_snippet = "\n\n### 用户偏好与约束摘要\n" + "\n".join(
+                    raw_notes.splitlines()[:20]
+                )
+
+        fork_prompt = (
+            "## 并行分身交接背景（来自 #General）\n"
+            f"{handoff_ctx}{notes_snippet}\n\n"
+            "## 本分身需独立处理的任务\n"
+            f"{user_text}"
+        )
+
+        # Match mentioned repository name if present; otherwise pick first valid configured repo
+        chosen_repo = ""
+        lowered = user_text.lower()
+        for rname in sorted(self.config.repos.keys()):
+            if rname.lower() in lowered and (self.config.get_repo_path(rname) / ".git").exists():
+                chosen_repo = rname
+                break
+        if not chosen_repo:
+            for rname in sorted(self.config.repos.keys()):
+                if (self.config.get_repo_path(rname) / ".git").exists():
+                    chosen_repo = rname
+                    break
+
+        slug_base = re.sub(r"[^a-z0-9]+", "-", user_text.lower()).strip("-")[:16] or "fork"
+        slug = f"{slug_base}-{now % 100000}"
+
+        if chosen_repo:
+            return self.spawn_task(chosen_repo, slug, fork_prompt, now=now)
+
+        # Zero-repo fallback: create isolated directory under .hq/worktrees/<slug>
+        wt_path = self.hq_dir / ".hq" / "worktrees" / f"general-{slug}"
+        wt_path.mkdir(parents=True, exist_ok=True)
+        thread_id = self.channel.create_thread(f"[fork] {slug}") if self.channel else None
+        pane_name = f"hq-{slug}"
+        skey = f"task:general:{slug}:{now}"
+        sess = self.db.create_session(
+            session_key=skey,
+            track="TOPIC",
+            agent_backend=self.agent_adapter.name,
+            status="active",
+            channel_thread_id=thread_id,
+            topic_slug=slug,
+            branch_name=f"hq/{slug}",
+            worktree_path=str(wt_path),
+            pane_name=pane_name,
+            now=now,
+        )
+        delivery_prompt = self._materialize_long_prompt(fork_prompt, tag=f"fork-{slug}", now=now)
+        self.agent_adapter.ensure_hooks_installed(wt_path, self._hook_bin_path())
+        self.db.record_dispatch(skey, None, delivery_prompt, now=now)
+        self.db.set_meta(f"last_input_origin:{skey}", "daemon", now=now)
+        _upsert_task_progress_file(
+            self.hq_dir, slug, "general", f"hq/{slug}", skey, user_text, status="active"
+        )
+        _upsert_active_wip_index(
+            self.hq_dir, slug, "general", f"hq/{slug}", status="active"
+        )
+        interactive_cmd = self.agent_adapter.build_interactive_cmd(
+            initial_prompt=None,
+            model=self.config.agent.model,
+            effort=self.config.agent.default_effort,
+        )
+        trust_args = self.agent_adapter.extra_trust_args(
+            [wt_path, self.hq_dir],
+            permission_mode=self.config.agent.permission_mode,
+        )
+        self.terminal_driver.start_agent(
+            name=pane_name,
+            cwd=wt_path,
+            kind=self.agent_adapter.name,
+            agent_args=[*interactive_cmd[1:], *trust_args],
+            env={
+                "HQ_DIR": str(self.hq_dir),
+                "HQ_SESSION_KEY": skey,
+            },
+        )
+        if delivery_prompt:
+            self.terminal_driver.prompt_agent(pane_name, delivery_prompt, wait=False)
+        return sess
+
     def rotate_general_session(self, now: int, force: bool = False) -> bool:
-        """Rotate `#General` in-place via `/new` without closing the terminal pane."""
+        """Rotate `#General` in-place via `/new`, migrating timers and saving handoff summary."""
         current: Optional[Dict[str, Any]] = None
         for s in self.db.list_sessions(statuses=["active", "pinned"]):
             if s["track"] in GENERAL_TRACKS:
@@ -608,11 +891,11 @@ class HQDaemon:
         if not force:
             if pane_is_live and pane_status not in GENERAL_ROTATABLE_STATUSES:
                 return False
-            if (
-                self.db.get_meta(f"daemon_waiting:{skey}") == "1"
-                or self.db.get_meta(f"daemon_waiting_pane:{pane_name}") == "1"
-            ):
+            is_busy, _, _ = self._inspect_session_busy(current, now)
+            if is_busy:
                 return False
+
+        handoff_summary = self._build_general_handoff_summary(current, now)
 
         if pane_is_live:
             try:
@@ -633,12 +916,45 @@ class HQDaemon:
         self.db.delete_meta(f"last_reply:{skey}")
         self.db.delete_meta(f"last_reply_pane:{pane_name}")
         self.db.delete_meta(f"last_input_origin:{skey}")
+        self.db.delete_meta(f"current_work_hint:{skey}")
 
         new_sess = self._create_next_general_session(now)
         new_key = str(new_sess["session_key"])
+        self.db.migrate_session_timers(skey, new_key)
         self.db.delete_meta(f"last_reply:{new_key}")
         self.db.delete_meta(f"last_input_origin:{new_key}")
+        self.db.set_meta("general_handoff_summary", handoff_summary, now=now)
+        self.db.set_meta("general_handoff_pending", "1", now=now)
+        self.db.set_meta("general_rotation_notice_pending", "1", now=now)
+        self.db.delete_meta("general_rotation_due")
         return True
+
+    def _maybe_run_due_general_rotation(self, now: int) -> bool:
+        """Execute due daily `#General` rotation only when idle and continuously quiet >= N min."""
+        if self.db.get_meta("general_rotation_due") != "1":
+            return False
+        current: Optional[Dict[str, Any]] = None
+        for s in self.db.list_sessions(statuses=["active", "pinned"]):
+            if s["track"] in GENERAL_TRACKS:
+                current = s
+                break
+        if current is None:
+            self.db.delete_meta("general_rotation_due")
+            return False
+
+        is_busy, _, _ = self._inspect_session_busy(current, now)
+        if is_busy:
+            return False
+
+        quiet_sec = max(0, int(self.config.tuning.general_rotation_quiet_minutes)) * 60
+        last_act = max(
+            int(current.get("last_active_at") or 0),
+            self._get_valid_transcript_mtime(current, now),
+        )
+        if quiet_sec > 0 and (now - last_act) < quiet_sec:
+            return False
+
+        return self.rotate_general_session(now, force=False)
 
     def _seal_idle_general_sessions(self, now: int) -> None:
         idle_limit = self.config.tuning.general_idle_seal_minutes * 60
@@ -743,9 +1059,27 @@ class HQDaemon:
         cwd: Path,
         effort: str,
     ) -> str:
-        pane_name = self._resolve_pane_name(session)
+        fresh = self.db.get_session(str(session["session_key"])) or session
+        pane_name = self._resolve_pane_name(fresh)
+        session["pane_name"] = pane_name
         live_panes = {p.name for p in self.terminal_driver.list_panes()}
         if pane_name not in live_panes:
+            if (
+                not cwd.exists()
+                and fresh.get("track") in TOPIC_TRACKS
+                and fresh.get("repo_name")
+                and fresh.get("branch_name")
+            ):
+                rname = str(fresh["repo_name"])
+                rpath = self.config.get_repo_path(rname)
+                if (rpath / ".git").exists():
+                    base_br = (
+                        self.config.repos[rname].default_branch
+                        if rname in self.config.repos
+                        else "main"
+                    )
+                    git_worktree_add(rpath, cwd, str(fresh["branch_name"]), base_branch=base_br)
+            cwd.mkdir(parents=True, exist_ok=True)
             self.agent_adapter.ensure_hooks_installed(cwd, self._hook_bin_path())
             add_dirs = (
                 [
@@ -758,7 +1092,7 @@ class HQDaemon:
             )
             interactive_cmd = self.agent_adapter.build_interactive_cmd(
                 initial_prompt=None,
-                session_id=session.get("agent_session_id"),
+                session_id=fresh.get("agent_session_id"),
                 model=self.config.agent.model,
                 effort=effort,
                 add_dirs=add_dirs,
@@ -774,7 +1108,7 @@ class HQDaemon:
                 agent_args=[*interactive_cmd[1:], *trust_args],
                 env={
                     "HQ_DIR": str(self.hq_dir),
-                    "HQ_SESSION_KEY": str(session["session_key"]),
+                    "HQ_SESSION_KEY": str(fresh["session_key"]),
                 },
             )
         return pane_name
@@ -859,6 +1193,7 @@ class HQDaemon:
         finally:
             self.db.delete_meta(f"daemon_waiting:{skey}")
             self.db.delete_meta(f"daemon_waiting_pane:{pane_name}")
+            self.db.delete_meta(f"current_work_hint:{skey}")
 
         hook_reply = self.db.get_meta(f"last_reply:{skey}")
         if hook_reply is not None:
@@ -912,6 +1247,39 @@ class HQDaemon:
             return []
         return self.db.list_recent_local_outbound(limit)
 
+    def _consume_general_handoff_prefix(self, session: Dict[str, Any]) -> str:
+        if session.get("track") not in GENERAL_TRACKS:
+            return ""
+        if self.db.get_meta("general_handoff_pending") != "1":
+            return ""
+        self.db.delete_meta("general_handoff_pending")
+        summary = (self.db.get_meta("general_handoff_summary") or "").strip()
+        if not summary:
+            return ""
+        return f"## 昨日会话交接摘要\n{summary}\n\n"
+
+    def _wake_waiting_events(self, now: int) -> int:
+        """Promote at most 1 FIFO `waiting_general` event per idle target session."""
+        waiting = self.db.list_waiting_events()
+        if not waiting:
+            return 0
+        woken_sessions: Set[str] = set()
+        promoted = 0
+        for ev in waiting:
+            wait_skey = str(ev.payload.get("wait_session_key") or "")
+            sess = self.db.get_session(wait_skey) if wait_skey else None
+            if sess is None or sess.get("status") not in {"active", "pinned"}:
+                sess = self._ensure_general_session(now)
+            eff_key = str(sess["session_key"])
+            if eff_key in woken_sessions:
+                continue
+            is_busy, _, _ = self._inspect_session_busy(sess, now)
+            if not is_busy:
+                if self.db.promote_waiting_event(ev.id):
+                    woken_sessions.add(eff_key)
+                    promoted += 1
+        return promoted
+
     # ------------------------------------------------------------------
     # Event Execution
     # ------------------------------------------------------------------
@@ -938,6 +1306,46 @@ class HQDaemon:
                 sess = self._ensure_general_session(now)
 
             pane_name = self._resolve_pane_name(sess)
+            is_busy, busy_kind, hint = self._inspect_session_busy(sess, now)
+            if is_busy:
+                card_id = payload.get("busy_card_msg_id")
+                if not card_id and self.channel is not None:
+                    if sess.get("track") in GENERAL_TRACKS and not thread_id:
+                        if busy_kind == "blocked":
+                            card_text = (
+                                f"⏸️ 总管正在等待审批（面板 `{pane_name}`），"
+                                "请打开 `herdr` 处理，或选择本条消息处理方式："
+                            )
+                        else:
+                            card_text = f"⏳ 总管正在处理{hint}，这条消息怎么处理？"
+                        buttons = [
+                            [
+                                InlineButton(text="等它忙完", callback_data=f"busy_wait:{ev.id}"),
+                                InlineButton(text="另开分身并行", callback_data=f"busy_fork:{ev.id}"),
+                            ]
+                        ]
+                    else:
+                        card_text = f"⏳ 当前任务面板 `{pane_name}` 正在处理中，本条消息已进入排队："
+                        buttons = [
+                            [InlineButton(text="等它忙完", callback_data=f"busy_wait:{ev.id}")]
+                        ]
+                    card_id = self.channel.send_message(
+                        card_text, thread_id=thread_id, buttons=buttons
+                    )
+                self.db.park_event_waiting(
+                    ev.id,
+                    payload_updates={
+                        "busy_card_msg_id": card_id,
+                        "wait_session_key": str(sess["session_key"]),
+                    },
+                )
+                raise _EventParked()
+
+            raw_user_text = str(payload.get("text") or "")
+            compact_hint = " ".join(raw_user_text.split())[:24]
+            if compact_hint:
+                self.db.set_meta(f"current_work_hint:{sess['session_key']}", compact_hint, now=now)
+
             live_panes = {p.name for p in self.terminal_driver.list_panes()}
             is_live_pane = pane_name in live_panes
             is_live_topic = (sess.get("track") in TOPIC_TRACKS) and is_live_pane
@@ -949,8 +1357,9 @@ class HQDaemon:
                 if (sess.get("track") in TOPIC_TRACKS and sess.get("topic_slug"))
                 else None
             )
-            prompt = (
-                str(payload.get("text") or "")
+            handoff_prefix = self._consume_general_handoff_prefix(sess)
+            base_prompt = (
+                raw_user_text
                 if use_raw_prompt
                 else build_prompt(
                     self.hq_dir,
@@ -960,12 +1369,21 @@ class HQDaemon:
                     topic_slug=topic_slug,
                 )
             )
+            prompt = (handoff_prefix + base_prompt) if handoff_prefix else base_prompt
 
-            indicator_id = (
-                self.channel.send_working_indicator("⏳ 收到，正在处理中...", thread_id=thread_id)
-                if self.channel
-                else None
-            )
+            existing_busy_card = payload.get("busy_card_msg_id")
+            if existing_busy_card:
+                indicator_id = str(existing_busy_card)
+                if self.channel:
+                    self.channel.finish_working_indicator(
+                        indicator_id, "⏳ 轮到你了，正在处理中...", thread_id=thread_id
+                    )
+            else:
+                indicator_id = (
+                    self.channel.send_working_indicator("⏳ 收到，正在处理中...", thread_id=thread_id)
+                    if self.channel
+                    else None
+                )
             try:
                 reply = self._dispatch_interactive(
                     sess,
@@ -981,6 +1399,18 @@ class HQDaemon:
                         indicator_id, f"❌ 处理失败：{exc}", thread_id=thread_id
                     )
                 raise
+
+            if (
+                sess.get("track") in GENERAL_TRACKS
+                and reply
+                and self.db.get_meta("general_rotation_notice_pending") == "1"
+            ):
+                self.db.delete_meta("general_rotation_notice_pending")
+                reply = (
+                    reply.rstrip()
+                    + "\n\n---\n_🧹 昨晚已整理记忆并开启新对话，旧对话可在 `herdr` 中输入 `/resume` 查看。_"
+                )
+
             if self.channel:
                 if reply:
                     if indicator_id and self.channel.finish_working_indicator(
@@ -998,8 +1428,15 @@ class HQDaemon:
         if ev.source == "git_commit":
             repo_name = str(ev.payload.get("repo", ""))
             sess = self._ensure_general_session(now)
+            is_busy, _, _ = self._inspect_session_busy(sess, now)
+            if is_busy:
+                self.db.park_event_waiting(
+                    ev.id, payload_updates={"wait_session_key": str(sess["session_key"])}
+                )
+                raise _EventParked()
             recent_outbound = self._get_recent_outbound()
-            prompt = build_prompt(
+            handoff_prefix = self._consume_general_handoff_prefix(sess)
+            prompt = handoff_prefix + build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
@@ -1023,8 +1460,15 @@ class HQDaemon:
             to_line = int(ev.payload.get("to_line", 0))
 
             sess = self._ensure_general_session(now)
+            is_busy, _, _ = self._inspect_session_busy(sess, now)
+            if is_busy:
+                self.db.park_event_waiting(
+                    ev.id, payload_updates={"wait_session_key": str(sess["session_key"])}
+                )
+                raise _EventParked()
             recent_outbound = self._get_recent_outbound()
-            prompt = build_prompt(
+            handoff_prefix = self._consume_general_handoff_prefix(sess)
+            prompt = handoff_prefix + build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
@@ -1064,8 +1508,15 @@ class HQDaemon:
             if not orig_sess:
                 return
             general_sess = self._ensure_general_session(now)
+            is_busy, _, _ = self._inspect_session_busy(general_sess, now)
+            if is_busy:
+                self.db.park_event_waiting(
+                    ev.id, payload_updates={"wait_session_key": str(general_sess["session_key"])}
+                )
+                raise _EventParked()
             recent_outbound = self._get_recent_outbound()
-            prompt = build_prompt(
+            handoff_prefix = self._consume_general_handoff_prefix(general_sess)
+            prompt = handoff_prefix + build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
@@ -1087,13 +1538,22 @@ class HQDaemon:
             return
 
         if ev.source == "timer_wake":
-            payload = ev.payload
+            payload = dict(ev.payload)
             target_key = payload.get("session_key")
             target_sess = self.db.get_session(str(target_key)) if target_key else None
             if target_sess and target_sess.get("status") in {"active", "pinned"}:
                 sess = target_sess
             else:
                 sess = self._ensure_general_session(now)
+                if target_key:
+                    payload["migrated_from_session"] = str(target_key)
+
+            is_busy, _, _ = self._inspect_session_busy(sess, now)
+            if is_busy:
+                self.db.park_event_waiting(
+                    ev.id, payload_updates={"wait_session_key": str(sess["session_key"])}
+                )
+                raise _EventParked()
 
             recent_outbound = self._get_recent_outbound()
             topic_slug = (
@@ -1101,7 +1561,8 @@ class HQDaemon:
                 if (sess.get("track") in TOPIC_TRACKS and sess.get("topic_slug"))
                 else None
             )
-            prompt = build_prompt(
+            handoff_prefix = self._consume_general_handoff_prefix(sess)
+            prompt = handoff_prefix + build_prompt(
                 self.hq_dir,
                 self.config,
                 payload,
@@ -1177,6 +1638,8 @@ class HQDaemon:
                 try:
                     self._process_event(ev, ts)
                     self.db.complete_event(ev.id)
+                except _EventParked:
+                    pass
                 except Exception as exc:
                     self.db.fail_event(
                         ev.id, max_attempts=self.config.tuning.inbox_max_attempts, now=ts, error_msg=str(exc)
@@ -1246,7 +1709,8 @@ class HQDaemon:
             now=ts,
         )
         if self.config.tuning.general_nightly_reset:
-            self.rotate_general_session(ts)
+            self.db.set_meta("general_rotation_due", "1", now=ts)
+            self._maybe_run_due_general_rotation(ts)
         sync_hq_repo(self.hq_dir, commit_message="hq-pilot: nightly memory closeout", push=False)
         return report
 
@@ -1302,6 +1766,7 @@ class HQDaemon:
         self._seal_idle_general_sessions(ts)
         self._seal_idle_topic_sessions(ts)
         summary.timers_fired = self._tick_custom_timers(ts)
+        self._wake_waiting_events(ts)
 
         events = self.db.claim_next_events(
             limit=10,
@@ -1317,6 +1782,8 @@ class HQDaemon:
                     f"[hq-daemon] done event={ev.id} source={ev.source}",
                     flush=True,
                 )
+            except _EventParked:
+                summary.events_parked += 1
             except Exception as exc:
                 print(
                     f"[hq-daemon] error event={ev.id} source={ev.source}: {exc}",
@@ -1338,6 +1805,9 @@ class HQDaemon:
             self.run_nightly_pipeline(now=ts)
             self.db.set_meta("last_dream_date", today_str, now=ts)
             summary.nightly_ran = True
+
+        if self._maybe_run_due_general_rotation(ts):
+            summary.general_rotated = True
 
         if hhmm >= self.config.tuning.digest_cron and self.db.get_meta("last_digest_date") != today_str:
             self.run_morning_digest(now=ts)

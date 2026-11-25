@@ -39,8 +39,9 @@ tuning:
   active_repo_quiet_minutes: 15
   pane_blocked_notify_sec: 60
   deferred_approval_ttl_hours: 24
-  general_idle_seal_minutes: 60
-  general_max_turns: 20
+  general_idle_seal_minutes: 1440
+  general_max_turns: 200
+  general_nightly_reset: true
   topic_idle_seal_minutes: 120
   distill_idle_minutes: 20
   distill_min_new_turns: 3

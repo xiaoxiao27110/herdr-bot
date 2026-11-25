@@ -35,6 +35,7 @@ from hq_pilot.terminals.registry import get_terminal_driver
 GENERAL_PANE_NAME = "hq-general"
 GENERAL_TRACKS = {"GENERAL", "B"}
 TOPIC_TRACKS = {"TOPIC", "C"}
+GENERAL_ROTATABLE_STATUSES = {"idle", "done", "unknown", "running", ""}
 OUTBOX_BACKOFF_SCHEDULE = [10, 30, 120, 300, 600]
 
 
@@ -465,6 +466,22 @@ class HQDaemon:
     # ------------------------------------------------------------------
     # Two-Tier Interactive Session Management (#General + #Topic)
     # ------------------------------------------------------------------
+    def _create_next_general_session(self, now: int) -> Dict[str, Any]:
+        seq = int(self.db.get_meta("general_seq", "0") or "0") + 1
+        while self.db.get_session(f"general:{seq}") is not None:
+            seq += 1
+        self.db.set_meta("general_seq", str(seq), now=now)
+        return self.db.create_session(
+            session_key=f"general:{seq}",
+            track="GENERAL",
+            agent_backend=self.agent_adapter.name,
+            status="active",
+            pane_name=GENERAL_PANE_NAME,
+            agent_session_id=None,
+            transcript_path=None,
+            now=now,
+        )
+
     def _ensure_general_session(self, now: int) -> Dict[str, Any]:
         for s in self.db.list_sessions(statuses=["active", "pinned"]):
             if s["track"] in GENERAL_TRACKS:
@@ -474,16 +491,65 @@ class HQDaemon:
                     )
                     s["pane_name"] = GENERAL_PANE_NAME
                 return s
-        seq = int(self.db.get_meta("general_seq", "0") or "0") + 1
-        self.db.set_meta("general_seq", str(seq), now=now)
-        return self.db.create_session(
-            session_key=f"general:{seq}",
-            track="GENERAL",
-            agent_backend=self.agent_adapter.name,
-            status="active",
-            pane_name=GENERAL_PANE_NAME,
-            now=now,
+        return self._create_next_general_session(now)
+
+    def rotate_general_session(self, now: int, force: bool = False) -> bool:
+        """Rotate `#General` in-place via `/new` without closing the terminal pane."""
+        current: Optional[Dict[str, Any]] = None
+        for s in self.db.list_sessions(statuses=["active", "pinned"]):
+            if s["track"] in GENERAL_TRACKS:
+                current = s
+                break
+        if current is None:
+            return False
+
+        skey = str(current["session_key"])
+        pane_name = str(current.get("pane_name") or GENERAL_PANE_NAME)
+        pane_info = None
+        for p in self.terminal_driver.list_panes():
+            if p.name == pane_name:
+                pane_info = p
+                break
+
+        pane_status = (
+            str(pane_info.status or "").strip().lower() if pane_info is not None else ""
         )
+        pane_is_live = pane_info is not None and pane_status != "exited"
+
+        if not force:
+            if pane_is_live and pane_status not in GENERAL_ROTATABLE_STATUSES:
+                return False
+            if (
+                self.db.get_meta(f"daemon_waiting:{skey}") == "1"
+                or self.db.get_meta(f"daemon_waiting_pane:{pane_name}") == "1"
+            ):
+                return False
+
+        if pane_is_live:
+            try:
+                self.terminal_driver.send_text(pane_name, "/new", enter=True)
+            except Exception as exc:
+                print(
+                    f"[hq-daemon] warn: failed to send /new to {pane_name}: {exc}",
+                    flush=True,
+                )
+                return False
+
+        if int(current.get("pinned") or 0) != 0 or current.get("status") == "pinned":
+            self.db.unpin_session(skey, target_status="sealed", now=now)
+            self.db.update_session(skey, sealed_at=now, last_active_at=now)
+        else:
+            self.db.seal_session(skey, now=now)
+
+        self.db.delete_meta(f"last_reply:{skey}")
+        self.db.delete_meta(f"last_reply_pane:{pane_name}")
+        self.db.delete_meta(f"last_input_origin:{skey}")
+
+        new_sess = self._create_next_general_session(now)
+        new_key = str(new_sess["session_key"])
+        self.db.delete_meta(f"last_reply:{new_key}")
+        self.db.delete_meta(f"last_input_origin:{new_key}")
+        return True
 
     def _seal_idle_general_sessions(self, now: int) -> None:
         idle_limit = self.config.tuning.general_idle_seal_minutes * 60
@@ -492,8 +558,11 @@ class HQDaemon:
             if s["track"] not in GENERAL_TRACKS:
                 continue
             idle_sec = now - int(s["last_active_at"])
-            if idle_sec >= idle_limit or int(s["turn_count"]) >= max_turns:
-                self.db.seal_session(str(s["session_key"]), now=now)
+            idle_exceeded = idle_limit > 0 and idle_sec >= idle_limit
+            turns_exceeded = max_turns > 0 and int(s["turn_count"]) >= max_turns
+            if idle_exceeded or turns_exceeded:
+                self.rotate_general_session(now, force=False)
+                break
 
     def _seal_idle_topic_sessions(self, now: int) -> None:
         idle_limit = self.config.tuning.topic_idle_seal_minutes * 60
@@ -1087,6 +1156,8 @@ class HQDaemon:
             channel=self.channel,
             now=ts,
         )
+        if self.config.tuning.general_nightly_reset:
+            self.rotate_general_session(ts)
         sync_hq_repo(self.hq_dir, commit_message="hq-pilot: nightly memory closeout", push=False)
         return report
 

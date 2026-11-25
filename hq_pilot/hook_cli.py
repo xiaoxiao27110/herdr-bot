@@ -98,6 +98,28 @@ def handle_hook_event(
             sess = db.get_session(env_session_key)
             if (
                 sess is not None
+                and str(sess.get("track") or "") in {"GENERAL", "B"}
+                and str(sess.get("status") or "") in {"sealed", "archived"}
+            ):
+                active_general = None
+                for candidate in db.list_sessions(statuses=["active"]):
+                    if str(candidate.get("track") or "") in {"GENERAL", "B"}:
+                        active_general = candidate
+                        break
+                if active_general is not None:
+                    existing_by_sid = (
+                        db.get_session_by_agent_id(agent_sid) if agent_sid else None
+                    )
+                    if (
+                        existing_by_sid is not None
+                        and str(existing_by_sid["session_key"])
+                        != str(active_general["session_key"])
+                    ):
+                        sess = existing_by_sid
+                    else:
+                        sess = active_general
+            if (
+                sess is not None
                 and agent_sid
                 and sess.get("agent_session_id")
                 and str(sess["agent_session_id"]) != agent_sid

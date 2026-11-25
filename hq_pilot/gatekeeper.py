@@ -194,10 +194,11 @@ def detect_manual_touch(
     input_text: Optional[str] = None,
     now: Optional[int] = None,
 ) -> Optional[str]:
-    """Promote session to pinned if manual non-daemon input or terminal attach is detected."""
+    """Detect manual non-daemon input or terminal attach; auto-pin non-#General sessions."""
     ts = int(now if now is not None else time.time())
     session_key = str(session["session_key"])
     agent_sid = str(session.get("agent_session_id") or "") or None
+    is_general = str(session.get("track") or "") in {"GENERAL", "B"}
 
     if input_text is not None and input_text.strip():
         is_daemon = db.is_daemon_dispatch(
@@ -206,13 +207,15 @@ def detect_manual_touch(
             agent_session_id=agent_sid,
         )
         if not is_daemon:
-            db.pin_session(session_key, reason="manual_input", now=ts)
+            if not is_general:
+                db.pin_session(session_key, reason="manual_input", now=ts)
             return "manual_input"
 
     pane_name = session.get("pane_name")
     if terminal_driver is not None and pane_name:
         if terminal_driver.is_client_attached(str(pane_name)):
-            db.pin_session(session_key, reason="terminal_attach", now=ts)
+            if not is_general:
+                db.pin_session(session_key, reason="terminal_attach", now=ts)
             return "terminal_attach"
 
     return None

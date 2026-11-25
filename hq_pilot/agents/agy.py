@@ -240,7 +240,8 @@ class AgyAdapter(CodingAgentAdapter):
                 existing = {}
 
         cmd = f"{hook_bin} --agent agy"
-        existing["hq-pilot"] = {
+        existing.pop("hq-pilot", None)
+        existing["herdr-bot"] = {
             "SessionStart": [{"command": cmd}],
             "PreInvocation": [{"command": cmd}],
             "Stop": [{"command": cmd}],

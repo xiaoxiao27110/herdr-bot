@@ -94,14 +94,22 @@ class TestReviewFixes(unittest.TestCase):
             ws = Path(tmp) / "ws"
             (ws / ".agents").mkdir(parents=True)
             (ws / ".agents" / "hooks.json").write_text(
-                json.dumps({"other-tool": {"Stop": [{"command": "echo ok"}]}}),
+                json.dumps({
+                    "other-tool": {"Stop": [{"command": "echo ok"}]},
+                    "hq-pilot": {"Stop": [{"command": "/old/hq-agent-hook --agent agy"}]},
+                }),
                 encoding="utf-8",
             )
             adapter = AgyAdapter()
             hfile = adapter.ensure_hooks_installed(ws, "/usr/local/bin/hq-agent-hook")
             data = json.loads(hfile.read_text(encoding="utf-8"))
             self.assertIn("other-tool", data)
-            self.assertIn("hq-pilot", data)
+            self.assertIn("herdr-bot", data)
+            self.assertNotIn("hq-pilot", data)
+            self.assertEqual(
+                data["herdr-bot"]["Stop"][0]["command"],
+                "/usr/local/bin/hq-agent-hook --agent agy",
+            )
             self.assertNotIn("hooks", data)
 
             hq_dir = Path(tmp) / "acme-hq"

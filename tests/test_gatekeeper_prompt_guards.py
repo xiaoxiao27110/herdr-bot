@@ -132,7 +132,7 @@ class TestGatekeeperPromptGuards(unittest.TestCase):
             self.assertFalse(oss_bad.ok)
             self.assertGreaterEqual(len(oss_bad.violations), 2)
 
-        # Verify actual hq-pilot repo passes oss_guard cleanly
+        # Verify actual herdr-bot repo passes oss_guard cleanly
         engine_root = Path(__file__).resolve().parent.parent
         oss_self = run_oss_guard(engine_root, check_git_history=False)
         self.assertTrue(oss_self.ok, msg=oss_self.violations)

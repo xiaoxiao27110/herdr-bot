@@ -155,7 +155,7 @@ class FeishuChannel(MessagingChannel):
         url = f"{self.api_base}{path}"
         hdrs: Dict[str, str] = {
             "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "hq-pilot/1.0",
+            "User-Agent": "herdr-bot/1.0",
         }
         if headers:
             hdrs.update(headers)

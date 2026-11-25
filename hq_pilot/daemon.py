@@ -1,4 +1,4 @@
-"""0-LLM deterministic daemon event loop for hq-pilot (100% interactive terminal sessions)."""
+"""0-LLM deterministic daemon event loop for herdr-bot (100% interactive terminal sessions)."""
 
 from __future__ import annotations
 
@@ -1900,7 +1900,7 @@ class HQDaemon:
         if self.config.tuning.general_nightly_reset:
             self.db.set_meta("general_rotation_due", "night", now=ts)
             self._maybe_run_due_general_rotation(ts)
-        sync_hq_repo(self.hq_dir, commit_message="hq-pilot: nightly memory closeout", push=False)
+        sync_hq_repo(self.hq_dir, commit_message="herdr-bot: nightly memory closeout", push=False)
         return report
 
     def run_morning_digest(self, now: Optional[int] = None) -> bool:

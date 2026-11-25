@@ -1,1 +1,1 @@
-"""hq-pilot test suite."""
+"""herdr-bot test suite."""

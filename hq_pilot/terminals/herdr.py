@@ -63,7 +63,7 @@ def install_herdr_guide() -> str:
         "  1. Run: curl -fsSL https://herdr.dev/install.sh | sh\n"
         "     (or visit https://github.com/herdrdev/herdr)\n"
         "  2. Ensure `herdr` is in PATH and verify with `herdr --version`.\n"
-        "  3. Until then, hq-pilot with `terminal.backend: auto` automatically uses `tmux`."
+        "  3. Until then, herdr-bot with `terminal.backend: auto` automatically uses `tmux`."
     )
 
 

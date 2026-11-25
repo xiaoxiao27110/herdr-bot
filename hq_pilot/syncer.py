@@ -32,7 +32,7 @@ def sync_hq_repo(
     )
     committed = False
     if diff.returncode != 0:
-        msg = commit_message or time.strftime("hq-pilot: sync memory %Y-%m-%d %H:%M:%S")
+        msg = commit_message or time.strftime("herdr-bot: sync memory %Y-%m-%d %H:%M:%S")
         subprocess.run(
             ["git", "commit", "-m", msg],
             cwd=str(root),

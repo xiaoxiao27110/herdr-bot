@@ -44,7 +44,7 @@ class TelegramChannel(MessagingChannel):
             data=data,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "hq-pilot/1.0",
+                "User-Agent": "herdr-bot/1.0",
             },
             method="POST",
         )

@@ -34,22 +34,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class TestHerdrBotPolish(unittest.TestCase):
-    def test_topic_idle_seal_minutes_seals_active_but_never_pinned(self) -> None:
+    def test_topic_sessions_are_not_auto_sealed_on_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "demo-hq"
             hq_main(["init", str(hq_dir)])
-            update_tuning_value(hq_dir, "topic_idle_seal_minutes", "30")
 
             wt_active = hq_dir / ".hq" / "worktrees" / "wt-active"
             wt_pinned = hq_dir / ".hq" / "worktrees" / "wt-pinned"
             wt_active.mkdir(parents=True, exist_ok=True)
             wt_pinned.mkdir(parents=True, exist_ok=True)
 
+            ch = FakeChannel()
             daemon = HQDaemon(
                 hq_dir,
                 agent_adapter=AgyAdapter(),
                 terminal_driver=DummyTerminal(),
-                channel=FakeChannel(),
+                channel=ch,
             )
             try:
                 daemon.db.create_session(
@@ -78,22 +78,17 @@ class TestHerdrBotPolish(unittest.TestCase):
                     now=1000,
                 )
 
-                # Before 30 minutes (1799s idle) -> still active
-                daemon.run_once(now=1000 + 1799)
+                # Even after 48 hours idle, #Topic sessions stay active (no idle auto-seal, no Feishu push)
+                daemon.run_once(now=1000 + 48 * 3600)
                 self.assertEqual(daemon.db.get_session("task:gw:feat-a:100")["status"], "active")
                 self.assertEqual(daemon.db.get_session("task:gw:legacy-c:100")["status"], "active")
-                self.assertEqual(daemon.db.get_session("task:gw:pinned-b:100")["status"], "pinned")
-
-                # At 30 minutes (1800s idle) -> non-pinned active TOPIC/C sealed, worktree preserved, pinned untouched
-                daemon.run_once(now=1000 + 1800)
-                self.assertEqual(daemon.db.get_session("task:gw:feat-a:100")["status"], "sealed")
-                self.assertEqual(daemon.db.get_session("task:gw:legacy-c:100")["status"], "sealed")
                 self.assertTrue(wt_active.exists())
 
                 pinned_after = daemon.db.get_session("task:gw:pinned-b:100")
                 self.assertEqual(pinned_after["status"], "pinned")
                 self.assertEqual(pinned_after["pinned"], 1)
                 self.assertTrue(wt_pinned.exists())
+                self.assertEqual(ch.sent, [])
             finally:
                 daemon.close()
 
@@ -121,18 +116,18 @@ class TestHerdrBotPolish(unittest.TestCase):
                 skey = sess["session_key"]
                 wt_path = Path(sess["worktree_path"])
                 self.assertTrue(wt_path.exists())
+                self.assertIsNone(sess["channel_thread_id"])
+                self.assertEqual(ch.created_threads, [])
 
                 sealed = daemon.seal_session(skey, reason="tests green", now=600)
                 self.assertEqual(sealed["status"], "sealed")
                 self.assertTrue(wt_path.exists())
-                # v3: Topic seal pushes Chinese summary to main window (thread_id=None) and appends to today.md
-                self.assertIsNone(ch.sent[-1]["thread_id"])
-                self.assertIn("✅ 任务 auto-close 已完成", ch.sent[-1]["text"])
-                self.assertIn("hq/auto-close", ch.sent[-1]["text"])
-                self.assertIn("tests green", ch.sent[-1]["text"])
+                # Silent seal: no Feishu message pushed, task progress + WIP updated to sealed
+                self.assertEqual(ch.sent, [])
+                self.assertIn("- status: sealed", (hq_dir / "tasks" / "auto-close.md").read_text(encoding="utf-8"))
+                self.assertIn("status=sealed", (hq_dir / "tasks" / "active-wip.md").read_text(encoding="utf-8"))
                 today_text = (hq_dir / "notes" / "today.md").read_text(encoding="utf-8")
-                self.assertIn("[WIP] Topic auto-close 已封口", today_text)
-                self.assertIn("hq/auto-close", today_text)
+                self.assertNotIn("[WIP] Topic auto-close 已封口", today_text)
             finally:
                 daemon.close()
 
@@ -245,7 +240,8 @@ class TestHerdrBotPolish(unittest.TestCase):
             self.assertEqual(cfg.repos["api-svc"].default_branch, "develop")
             self.assertEqual(cfg.repos["worker-svc"].git_url, "")
             self.assertEqual(cfg.repos["worker-svc"].default_branch, "main")
-            self.assertEqual(cfg.tuning.topic_idle_seal_minutes, 120)
+            self.assertFalse(hasattr(cfg.tuning, "topic_idle_seal_minutes"))
+            self.assertEqual(cfg.tuning.general_idle_seal_minutes, 1440)
 
             local_data = yaml.safe_load((hq_dir / ".hq" / "local.yaml").read_text(encoding="utf-8"))
             self.assertEqual(Path(local_data["python_bin"]).resolve(), Path(sys.executable).resolve())

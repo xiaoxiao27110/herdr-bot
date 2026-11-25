@@ -185,12 +185,13 @@ class TestReviewFixes(unittest.TestCase):
                 sess = daemon.spawn_task("gateway-svc", "fix-cors", "Fix CORS headers", now=500)
                 self.assertEqual(sess["track"], "TOPIC")
                 self.assertEqual(sess["pane_name"], "hq-fix-cors")
-                self.assertEqual(sess["channel_thread_id"], "thread-101")
+                self.assertIsNone(sess["channel_thread_id"])
+                self.assertEqual(ch.created_threads, [])
                 self.assertEqual(len(term.bg_calls), 1)
                 self.assertIn(f"HQ_SESSION_KEY={sess['session_key']}", term.bg_calls[0]["cmd"])
                 self.assertTrue((Path(sess["worktree_path"]) / ".agents" / "hooks.json").exists())
 
-                # Stop hook for daemon-spawned Topic turn pushes progress reply to Topic thread-101
+                # Stop hook for daemon-spawned Topic (without channel_thread_id) records last_reply silently
                 tfile = Path(tmp) / "t_cors.jsonl"
                 tfile.write_text(
                     json.dumps({"role": "user", "content": "Fix CORS headers"}) + "\n"
@@ -209,9 +210,12 @@ class TestReviewFixes(unittest.TestCase):
                         channel=ch,
                         now=520,
                     )
-                self.assertTrue(res["reply_pushed"])
-                self.assertEqual(ch.sent[-1]["text"], "CORS + unit tests done.")
-                self.assertEqual(ch.sent[-1]["thread_id"], "thread-101")
+                self.assertFalse(res["reply_pushed"])
+                self.assertEqual(ch.sent, [])
+                self.assertEqual(
+                    daemon.db.get_meta(f"last_reply:{sess['session_key']}"),
+                    "CORS + unit tests done.",
+                )
 
                 # User reply inside Topic thread routes to #General (single-window), NOT Topic pane
                 ch.updates.append(

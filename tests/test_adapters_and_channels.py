@@ -47,6 +47,7 @@ class FakeChannel(MessagingChannel):
     def __init__(self, updates=None):
         self.updates = list(updates or [])
         self.sent = []
+        self.created_threads = []
         self.closed_threads = []
         self.answered = []
 
@@ -61,6 +62,7 @@ class FakeChannel(MessagingChannel):
         return mid
 
     def create_thread(self, title):
+        self.created_threads.append(title)
         return "thread-101"
 
     def close_thread(self, thread_id):

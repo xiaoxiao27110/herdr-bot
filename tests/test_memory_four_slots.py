@@ -155,11 +155,12 @@ class TestMemoryFourSlots(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            ch = FakeChannel()
             daemon = HQDaemon(
                 hq_dir,
                 agent_adapter=AgyAdapter(),
                 terminal_driver=DummyTerminal(),
-                channel=FakeChannel(),
+                channel=ch,
             )
             try:
                 sess = daemon.spawn_task(
@@ -168,6 +169,8 @@ class TestMemoryFourSlots(unittest.TestCase):
                     "Fix token refresh race condition",
                     now=1000,
                 )
+                self.assertIsNone(sess["channel_thread_id"])
+                self.assertEqual(ch.created_threads, [])
                 task_file = hq_dir / "tasks" / "fix-auth.md"
                 wip_file = hq_dir / "tasks" / "active-wip.md"
 
@@ -195,6 +198,7 @@ class TestMemoryFourSlots(unittest.TestCase):
 
                 sealed = daemon.seal_session(sess["session_key"], reason="verified", now=1200)
                 self.assertEqual(sealed["status"], "sealed")
+                self.assertEqual(ch.sent, [])
 
                 task_after = task_file.read_text(encoding="utf-8")
                 self.assertIn("- status: sealed", task_after)
@@ -244,8 +248,8 @@ class TestMemoryFourSlots(unittest.TestCase):
                     "Add token bucket limiter",
                     now=1000,
                 )
-                thread_id = sess["channel_thread_id"]
-                self.assertIsNotNone(thread_id)
+                self.assertIsNone(sess["channel_thread_id"])
+                self.assertEqual(ch.created_threads, [])
 
                 # Simulate topic pane having exited so next channel event wakes and rebuilds prompt
                 term.panes.pop(sess["pane_name"], None)

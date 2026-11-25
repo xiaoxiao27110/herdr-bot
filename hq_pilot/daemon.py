@@ -90,60 +90,6 @@ def _format_merged_channel_batch(events: List[EventRow]) -> str:
     return "\n".join(lines)
 
 
-def _append_topic_seal_to_today_wal(
-    hq_dir: Path,
-    slug: str,
-    branch_name: str,
-    summary_text: str,
-    max_lines: int = 60,
-) -> Path:
-    """Upsert a single-line `[WIP]` Topic seal summary into `notes/today.md` within `max_lines`."""
-    today_path = Path(hq_dir) / "notes" / "today.md"
-    today_path.parent.mkdir(parents=True, exist_ok=True)
-    if today_path.exists():
-        lines = today_path.read_text(encoding="utf-8").splitlines()
-    else:
-        lines = ["# Today WAL [UNVERIFIED / TODAY ONLY]", ""]
-
-    compact = " ".join((summary_text or "").split())
-    if len(compact) > 160:
-        compact = compact[:157] + "..."
-    if not compact:
-        compact = "已完成并封口"
-    branch_suffix = f"（分支 {branch_name}）" if branch_name else ""
-    entry = f"- [WIP] Topic {slug} 已封口：{compact}{branch_suffix}"
-    prefix = f"- [WIP] Topic {slug} "
-
-    replaced = False
-    new_lines: List[str] = []
-    for line in lines:
-        if line.strip().startswith(prefix):
-            new_lines.append(entry)
-            replaced = True
-        else:
-            new_lines.append(line)
-    if not replaced:
-        new_lines.append(entry)
-
-    limit = int(max_lines)
-    if limit > 0 and len(new_lines) > limit:
-        header_end = 0
-        for idx, line in enumerate(new_lines):
-            if idx == 0 and line.startswith("#"):
-                header_end = 1
-            elif idx == 1 and header_end == 1 and not line.strip():
-                header_end = 2
-            else:
-                break
-        header = new_lines[:header_end]
-        body = new_lines[header_end:]
-        keep_body = max(1, limit - len(header))
-        new_lines = header + body[-keep_body:]
-
-    today_path.write_text("\n".join(new_lines).rstrip() + "\n", encoding="utf-8")
-    return today_path
-
-
 def _upsert_task_progress_file(
     hq_dir: Path,
     slug: str,
@@ -334,7 +280,7 @@ class HQDaemon:
                 if self.channel:
                     self.channel.send_message(
                         f"已启动任务 `{sess['session_key']}`（面板 `{sess['pane_name']}`，分支 `{sess['branch_name']}`），"
-                        "可在 herdr 查看；飞书话题仅作进度通知区。"
+                        "可在 herdr 查看。"
                     )
                 return
 
@@ -581,7 +527,7 @@ class HQDaemon:
         prompt: str,
         now: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Spawn a #Topic interactive worktree + thread + TerminalDriver agent pane."""
+        """Spawn a #Topic interactive worktree + TerminalDriver agent pane."""
         ts = int(now if now is not None else time.time())
         repo_path = self.config.get_repo_path(repo_name)
         base_branch = (
@@ -593,10 +539,6 @@ class HQDaemon:
         wt_path = self.hq_dir / ".hq" / "worktrees" / f"{repo_name}-{slug}"
         git_worktree_add(repo_path, wt_path, branch_name, base_branch=base_branch)
 
-        thread_id = None
-        if self.channel is not None:
-            thread_id = self.channel.create_thread(f"[{repo_name}] {slug}")
-
         pane_name = f"hq-{slug}"
         skey = f"task:{repo_name}:{slug}:{ts}"
         sess = self.db.create_session(
@@ -604,7 +546,7 @@ class HQDaemon:
             track="TOPIC",
             agent_backend=self.agent_adapter.name,
             status="active",
-            channel_thread_id=thread_id,
+            channel_thread_id=None,
             topic_slug=slug,
             repo_name=repo_name,
             branch_name=branch_name,
@@ -963,119 +905,14 @@ class HQDaemon:
                 self.rotate_general_session(now, force=False, reason="night")
                 break
 
-    def _extract_topic_last_reply(self, sess: Dict[str, Any]) -> str:
-        """0-LLM read of a Topic's latest assistant reply from meta_state or transcript."""
-        skey = str(sess["session_key"])
-        meta_reply = (self.db.get_meta(f"last_reply:{skey}") or "").strip()
-        if meta_reply:
-            return meta_reply
-        tpath = sess.get("transcript_path")
-        if tpath and Path(str(tpath)).exists():
-            try:
-                turns, _ = self.agent_adapter.read_transcript_slice(str(tpath), from_line=0)
-                assistants = [t.text.strip() for t in turns if t.role == "assistant" and t.text.strip()]
-                if assistants:
-                    return assistants[-1]
-            except Exception:
-                pass
-        return ""
-
-    def _read_topic_recent_commit(self, sess: Dict[str, Any]) -> str:
-        wt_str = sess.get("worktree_path")
-        if not wt_str or not Path(str(wt_str)).exists():
-            return ""
-        try:
-            res = subprocess.run(
-                ["git", "-C", str(wt_str), "log", "-1", "--format=%h %s"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if res.returncode == 0:
-                return res.stdout.strip()
-        except Exception:
-            pass
-        return ""
-
-    def _emit_topic_seal_summary(
-        self,
-        sess: Dict[str, Any],
-        reason: str = "",
-        now: Optional[int] = None,
-    ) -> None:
-        """0-LLM Topic result reflow: push Chinese summary to main window and append `[WIP]` to `notes/today.md`."""
-        _ = now
-        if sess.get("track") not in TOPIC_TRACKS:
-            return
-        skey = str(sess["session_key"])
-        slug = str(sess.get("topic_slug") or skey)
-        branch_name = str(sess.get("branch_name") or "").strip()
-        raw_reply = self._extract_topic_last_reply(sess)
-        reason_clean = (reason or "").strip()
-
-        summary_body = raw_reply
-        if not summary_body:
-            if reason_clean:
-                summary_body = reason_clean
-            else:
-                recent_commit = self._read_topic_recent_commit(sess)
-                summary_body = f"最近提交 {recent_commit}" if recent_commit else "已完成并封口"
-        elif reason_clean and reason_clean not in summary_body:
-            summary_body = f"{summary_body}\n（封口说明：{reason_clean}）"
-
-        if len(summary_body) > 600:
-            summary_body = summary_body[:597] + "..."
-
-        _append_topic_seal_to_today_wal(
-            self.hq_dir,
-            slug=slug,
-            branch_name=branch_name,
-            summary_text=summary_body,
-            max_lines=self.config.tuning.today_wal_max_lines,
-        )
-
-        if self.channel is not None:
-            branch_suffix = f"（分支 {branch_name}）" if branch_name else ""
-            msg_text = f"✅ 任务 {slug} 已完成：{summary_body}{branch_suffix}"
-            try:
-                self.channel.send_message(msg_text, thread_id=None)
-            except Exception:
-                pass
-
-    def _seal_idle_topic_sessions(self, now: int) -> None:
-        idle_limit = self.config.tuning.topic_idle_seal_minutes * 60
-        if idle_limit <= 0:
-            return
-        for s in self.db.list_sessions(statuses=["active"]):
-            if s["track"] not in TOPIC_TRACKS:
-                continue
-            if int(s.get("pinned") or 0) != 0:
-                continue
-            idle_sec = now - int(s["last_active_at"])
-            if idle_sec >= idle_limit:
-                skey = str(s["session_key"])
-                if self.db.seal_session(skey, now=now):
-                    updated = self.db.get_session(skey) or s
-                    if updated.get("topic_slug"):
-                        t_slug = str(updated["topic_slug"])
-                        t_repo = str(updated.get("repo_name") or "")
-                        t_branch = str(updated.get("branch_name") or "")
-                        _upsert_task_progress_file(
-                            self.hq_dir, t_slug, t_repo, t_branch, skey, "", status="sealed"
-                        )
-                        _upsert_active_wip_index(
-                            self.hq_dir, t_slug, t_repo, t_branch, status="sealed"
-                        )
-                    self._emit_topic_seal_summary(updated, reason="空闲超时自动封口", now=now)
-
     def seal_session(
         self,
         session_key: str,
         reason: str = "",
         now: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Explicitly seal a session (preserving its worktree until nightly safe archive)."""
+        """Silently seal a session (preserving its worktree until nightly safe archive)."""
+        _ = reason
         ts = int(now if now is not None else time.time())
         sess = self.db.find_session(session_key)
         if not sess:
@@ -1102,20 +939,6 @@ class HQDaemon:
             _upsert_active_wip_index(
                 self.hq_dir, t_slug, t_repo, t_branch, status="sealed"
             )
-        if not was_sealed:
-            if updated.get("track") in TOPIC_TRACKS:
-                self._emit_topic_seal_summary(updated, reason=reason, now=ts)
-            else:
-                thread_id = updated.get("channel_thread_id")
-                if thread_id and self.channel is not None:
-                    reason_note = f"（原因：{reason.strip()}）" if reason and reason.strip() else ""
-                    try:
-                        self.channel.send_message(
-                            f"会话 `{skey}` 已封口（工作树保留至夜间安全归档）{reason_note}。",
-                            thread_id=None,
-                        )
-                    except Exception:
-                        pass
         return updated
 
     def _resolve_pane_name(self, session: Dict[str, Any]) -> str:
@@ -1953,7 +1776,6 @@ class HQDaemon:
                     self.db, sess, terminal_driver=self.terminal_driver, now=ts
                 )
         self._seal_idle_general_sessions(ts)
-        self._seal_idle_topic_sessions(ts)
         summary.timers_fired = self._tick_custom_timers(ts)
         self._wake_waiting_events(ts)
 

@@ -33,11 +33,25 @@ class TestConfigAndTuning(unittest.TestCase):
         self.assertTrue(t.general_nightly_reset)
         self.assertEqual(t.general_rotation_quiet_minutes, 60)
         self.assertEqual(t.transcript_busy_window_sec, 120)
-        self.assertEqual(t.topic_idle_seal_minutes, 120)
+        self.assertFalse(hasattr(t, "topic_idle_seal_minutes"))
         self.assertEqual(t.distill_idle_minutes, 20)
         self.assertEqual(t.distill_min_new_turns, 3)
         self.assertEqual(t.dirty_worktree_warn_hours, 48)
         self.assertEqual(t.git_sync_debounce_minutes, 120)
+
+    def test_load_config_ignores_legacy_unknown_tuning_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "legacy-hq"
+            self.assertEqual(hq_main(["init", str(hq_dir)]), 0)
+            hq_yaml = hq_dir / "hq.yaml"
+            hq_yaml.write_text(
+                hq_yaml.read_text(encoding="utf-8").rstrip()
+                + "\n  topic_idle_seal_minutes: 120\n  legacy_removed_key: 99\n",
+                encoding="utf-8",
+            )
+            cfg = load_config(hq_dir)
+            self.assertFalse(hasattr(cfg.tuning, "topic_idle_seal_minutes"))
+            self.assertEqual(cfg.tuning.general_idle_seal_minutes, 1440)
 
     def test_cli_config_list_and_set_and_hot_reload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

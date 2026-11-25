@@ -1,5 +1,5 @@
 """Tests for v3 interaction design: Feishu single-window routing to #General,
-button-less busy batch queuing & merging, Topic seal result reflow,
+button-less busy batch queuing & merging, silent Topic seal without idle auto-seal,
 daytime + nightly quiet rotation with handoff summary, and pane recovery."""
 
 from __future__ import annotations
@@ -73,12 +73,14 @@ class TestV2InteractionFlows(unittest.TestCase):
             self.assertIn("未经用户明确要求", prompt)
             self.assertIn("严禁擅自创建新 `#Topic`", prompt)
             self.assertIn("飞书单窗口只对 `#General`", prompt)
-            self.assertIn("进度通知区", prompt)
+            self.assertNotIn("进度通知区", prompt)
+            self.assertNotIn("空闲超时", prompt)
 
             agents_md = (hq_dir / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("未经用户明确要求永不擅自新开 `#Topic`", agents_md)
             self.assertIn("飞书单窗口只对 `#General`", agents_md)
-            self.assertIn("进度通知区", agents_md)
+            self.assertNotIn("进度通知区", agents_md)
+            self.assertNotIn("空闲超时", agents_md)
 
     def test_jurisdiction_guide_in_prompt_and_agents_scaffolds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -843,21 +845,21 @@ class TestV2InteractionFlows(unittest.TestCase):
             finally:
                 daemon.close()
 
-    def test_topic_seal_manual_and_idle_timeout_reflows_summary_to_main_and_today_wal(self) -> None:
-        """Topic seal (manual or idle timeout) pushes 0-LLM Chinese summary (<=600 chars + branch) to main window
-        and upserts `[WIP]` to `notes/today.md` without violating the 60-line memory guard."""
+    def test_topic_spawn_no_thread_and_silent_seal_without_idle_auto_seal(self) -> None:
+        """spawn_task creates no Feishu thread; Topic never auto-seals on idle; seal_session seals silently."""
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "demo-hq"
             hq_main(["init", str(hq_dir)])
-            update_tuning_value(hq_dir, "topic_idle_seal_minutes", "30")
+            repo_dir = Path(tmp) / "gateway-svc"
+            _init_git_repo(repo_dir)
+            (hq_dir / ".hq" / "local.yaml").write_text(
+                f"python_bin: {sys.executable}\nrepo_paths:\n  gateway-svc: {repo_dir}\n",
+                encoding="utf-8",
+            )
 
-            # Pre-fill notes/today.md to exactly 60 lines to verify line cap preservation
             today_path = hq_dir / "notes" / "today.md"
-            prefill = ["# Today WAL [UNVERIFIED / TODAY ONLY]", ""] + [
-                f"- [WIP] earlier item {i}" for i in range(1, 59)
-            ]
-            self.assertEqual(len(prefill), 60)
-            today_path.write_text("\n".join(prefill) + "\n", encoding="utf-8")
+            initial_today = "# Today WAL [UNVERIFIED / TODAY ONLY]\n\n- [WIP] existing item\n"
+            today_path.write_text(initial_today, encoding="utf-8")
 
             ch = IndicatorFakeChannel()
             term = StatusAwareTerminal()
@@ -868,77 +870,39 @@ class TestV2InteractionFlows(unittest.TestCase):
                 channel=ch,
             )
             try:
-                # 1. Manual seal with >600-char last_reply -> truncated to 600 chars, main window push, today.md updated
-                s1 = daemon.db.create_session(
-                    "task:gw:fix-auth:100",
-                    "TOPIC",
-                    "agy",
-                    status="active",
-                    channel_thread_id="th-auth",
-                    topic_slug="fix-auth",
-                    repo_name="gateway-svc",
-                    branch_name="hq/fix-auth",
-                    pane_name="hq-fix-auth",
+                sess = daemon.spawn_task(
+                    "gateway-svc",
+                    "fix-auth",
+                    "Fix auth race condition",
                     now=100,
                 )
-                long_reply = "已完成认证竞态修复并补齐回归单测。" + ("细节" * 400)
-                daemon.db.set_meta(f"last_reply:{s1['session_key']}", long_reply, now=120)
+                skey = sess["session_key"]
+                self.assertIsNone(sess["channel_thread_id"])
+                self.assertEqual(ch.created_threads, [])
+                self.assertEqual(ch.sent, [])
 
-                daemon.seal_session(s1["session_key"], now=200)
-                self.assertEqual(len(ch.sent), 1)
-                self.assertIsNone(ch.sent[0]["thread_id"])
-                pushed1 = ch.sent[0]["text"]
-                self.assertTrue(pushed1.startswith("✅ 任务 fix-auth 已完成："))
-                self.assertIn("（分支 hq/fix-auth）", pushed1)
-                self.assertIn("已完成认证竞态修复", pushed1)
-                self.assertIn("...", pushed1)
-                # Body inside prefix+suffix is capped at 600 chars
-                body1 = pushed1.split("已完成：", 1)[1].rsplit("（分支 hq/fix-auth）", 1)[0]
-                self.assertLessEqual(len(body1), 600)
+                # Long idle period does NOT auto-seal Topic session or push to Feishu
+                daemon.run_once(now=100 + 24 * 3600)
+                self.assertEqual(daemon.db.get_session(skey)["status"], "active")
+                self.assertEqual(ch.sent, [])
 
-                # Idempotent: sealing again does NOT send a duplicate summary
-                daemon.seal_session(s1["session_key"], now=210)
-                self.assertEqual(len(ch.sent), 1)
-
-                # 2. Idle timeout auto-seal reads fallback reply from transcript and reflows to main window & today.md
-                tfile = Path(tmp) / "topic_idle.jsonl"
-                tfile.write_text(
-                    json.dumps({"type": "USER_INPUT", "content": "修一下超时"}, ensure_ascii=False)
-                    + "\n"
-                    + json.dumps({"type": "PLANNER_RESPONSE", "content": "已调大连接池超时并通过全部单测"}, ensure_ascii=False)
-                    + "\n",
-                    encoding="utf-8",
+                # Manual seal is silent: updates DB + tasks/<slug>.md + tasks/active-wip.md, sends nothing to Feishu
+                sealed = daemon.seal_session(skey, reason="done", now=200)
+                self.assertEqual(sealed["status"], "sealed")
+                self.assertEqual(ch.sent, [])
+                self.assertIn(
+                    "- status: sealed",
+                    (hq_dir / "tasks" / "fix-auth.md").read_text(encoding="utf-8"),
                 )
-                daemon.db.create_session(
-                    "task:gw:pool-timeout:300",
-                    "TOPIC",
-                    "agy",
-                    status="active",
-                    channel_thread_id="th-pool",
-                    topic_slug="pool-timeout",
-                    repo_name="gateway-svc",
-                    branch_name="hq/pool-timeout",
-                    pane_name="hq-pool-timeout",
-                    transcript_path=str(tfile),
-                    now=300,
+                self.assertIn(
+                    "- [fix-auth](tasks/fix-auth.md) | repo=gateway-svc | branch=hq/fix-auth | status=sealed",
+                    (hq_dir / "tasks" / "active-wip.md").read_text(encoding="utf-8"),
                 )
-                daemon._seal_idle_topic_sessions(now=300 + 30 * 60)
-                self.assertEqual(daemon.db.get_session("task:gw:pool-timeout:300")["status"], "sealed")
-                self.assertEqual(len(ch.sent), 2)
-                self.assertIsNone(ch.sent[1]["thread_id"])
-                self.assertIn("✅ 任务 pool-timeout 已完成：", ch.sent[1]["text"])
-                self.assertIn("已调大连接池超时并通过全部单测", ch.sent[1]["text"])
-                self.assertIn("（分支 hq/pool-timeout）", ch.sent[1]["text"])
+                self.assertEqual(today_path.read_text(encoding="utf-8"), initial_today)
 
-                # Verify notes/today.md contains both [WIP] entries AND stays <= 60 lines (memory_guard PASS)
-                today_lines = today_path.read_text(encoding="utf-8").splitlines()
-                self.assertLessEqual(len(today_lines), 60)
-                today_text = "\n".join(today_lines)
-                self.assertIn("- [WIP] Topic fix-auth 已封口：", today_text)
-                self.assertIn("（分支 hq/fix-auth）", today_text)
-                self.assertIn("- [WIP] Topic pool-timeout 已封口：", today_text)
-                self.assertIn("（分支 hq/pool-timeout）", today_text)
-                # Ensure no broken logical path or line violation in memory_guard
+                # Idempotent: sealing again still sends nothing
+                daemon.seal_session(skey, now=210)
+                self.assertEqual(ch.sent, [])
                 (hq_dir / "AGENTS.md").write_text("# Index\n", encoding="utf-8")
                 guard_res = run_memory_guard(hq_dir)
                 self.assertTrue(guard_res.ok, msg=guard_res.violations)

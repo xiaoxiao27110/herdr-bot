@@ -139,10 +139,10 @@ def _build_agents_md(
             "- Active cross-repo work is tracked in `tasks/active-wip.md`.",
             "",
             "## #General & #Topic Collaboration",
-            "- **飞书单窗口只对 `#General`**：用户在主窗口或任意话题内发送的消息一律由 `#General` 承接并回复主窗口；话题卡片仅作为 `#Topic` 进度通知区，不承接直达对话。",
+            "- **飞书单窗口只对 `#General`**：用户在主窗口或任意话题内发送的消息一律由 `#General` 承接并回复主窗口。",
             "- **默认在 `#General` 完成**：日常问答、排查与常规开发默认在 `#General` 连贯推进（可派子 Agent），未经用户明确要求永不擅自新开 `#Topic`。",
-            "- **按用户要求开 `#Topic`**：仅当用户明确要求单独开任务跟进时，执行 `herdr-bot task spawn <repo> <slug> \"<含背景摘要的需求>\" --hq-dir \"$HQ_DIR\"` 拉起独立 worktree + Herdr 面板 + 进度通知话题。",
-            "- **验收后封口与结果回流**：`#Topic` 完成并验收通过后，可调用 `herdr-bot seal \"$HQ_SESSION_KEY\" --hq-dir \"$HQ_DIR\"` 封口（自动向主窗口推送中文小结并写入 `notes/today.md`，非 `pinned` 话题空闲超时也会自动封口回流）。",
+            "- **按用户要求开 `#Topic`**：仅当用户明确要求单独开任务跟进时，执行 `herdr-bot task spawn <repo> <slug> \"<含背景摘要的需求>\" --hq-dir \"$HQ_DIR\"` 拉起独立 worktree 与 Herdr 面板（在 Herdr 终端中并行交互）。",
+            "- **手动封口与夜间归档**：`#Topic` 完成并验收通过后，可手动调用 `herdr-bot seal \"$HQ_SESSION_KEY\" --hq-dir \"$HQ_DIR\"` 静默封口（更新任务状态为 `sealed`，保留 worktree 至夜间安全归档）。",
             "",
         ]
     )

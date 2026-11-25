@@ -353,7 +353,13 @@ class TestCLIAndEdgeCases(unittest.TestCase):
                 self.assertIn("已启动任务 `task:gateway-svc:fix-zh:1000`", ch.sent[-1]["text"])
                 self.assertIn("面板 `hq-fix-zh`", ch.sent[-1]["text"])
                 self.assertIn("分支 `hq/fix-zh`", ch.sent[-1]["text"])
+                self.assertIn("可在 herdr 查看。", ch.sent[-1]["text"])
+                self.assertNotIn("飞书话题", ch.sent[-1]["text"])
                 self.assertNotIn("Spawned #Topic", ch.sent[-1]["text"])
+                self.assertEqual(ch.created_threads, [])
+                self.assertIsNone(
+                    daemon.db.get_session("task:gateway-svc:fix-zh:1000")["channel_thread_id"]
+                )
 
                 # 2. pane_blocked card & buttons are Chinese (remote approval card)
                 daemon.db.enqueue_event(

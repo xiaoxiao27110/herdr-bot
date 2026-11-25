@@ -31,7 +31,6 @@ TUNING_DESCRIPTIONS: Dict[str, str] = {
     "general_nightly_reset": "If true, mark #General for in-place /new rotation after nightly closeout",
     "general_rotation_quiet_minutes": "Continuous quiet minutes required before executing due nightly #General /new rotation",
     "transcript_busy_window_sec": "Seconds since post-Stop transcript write within which a session is treated as busy",
-    "topic_idle_seal_minutes": "Idle timeout in minutes before sealing non-pinned #Topic session",
     "distill_idle_minutes": "Idle threshold in minutes for incremental session distillation",
     "distill_min_new_turns": "Minimum new turns required for incremental distillation",
     "dirty_worktree_warn_hours": "Hours before dirty worktree triggers morning digest warning",
@@ -66,7 +65,6 @@ class TuningConfig:
     general_nightly_reset: bool = True
     general_rotation_quiet_minutes: int = 60
     transcript_busy_window_sec: int = 120
-    topic_idle_seal_minutes: int = 120
     distill_idle_minutes: int = 20
     distill_min_new_turns: int = 3
     dirty_worktree_warn_hours: int = 48

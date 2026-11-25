@@ -358,7 +358,7 @@ class TestV2InteractionFlows(unittest.TestCase):
                 self.assertIsNone(ch.sent[0]["thread_id"])
                 self.assertEqual(
                     ch.sent[0]["text"],
-                    "⏳ 总管正在处理「v38 镜像注册」，你的消息已排队，忙完后一并回复",
+                    "⏳ 收到，正在排队处理...",
                 )
                 card1_id = ch.sent[0]["id"]
 
@@ -370,7 +370,7 @@ class TestV2InteractionFlows(unittest.TestCase):
                 self.assertEqual(ch.card_updates[-1]["message_id"], card1_id)
                 self.assertEqual(
                     ch.card_updates[-1]["text"],
-                    "⏳ 总管正在处理「v38 镜像注册」，已收到 2 条，忙完后一并回复",
+                    "⏳ 收到，正在排队处理（共 2 条）...",
                 )
 
                 # Timer event also arrives while busy -> parked independently, NOT mixed into user batch
@@ -401,7 +401,7 @@ class TestV2InteractionFlows(unittest.TestCase):
                 self.assertEqual(ch.card_updates[-1]["message_id"], card1_id)
                 self.assertEqual(
                     ch.card_updates[-1]["text"],
-                    "⏳ 总管正在处理「v38 镜像注册」，已收到 3 条，忙完后一并回复",
+                    "⏳ 收到，正在排队处理（共 3 条）...",
                 )
 
                 # General becomes idle -> entire 3-msg batch merges into 1 turn & refreshes card1 in-place
@@ -547,7 +547,10 @@ class TestV2InteractionFlows(unittest.TestCase):
                 self.assertEqual(len(ch.sent), 1)
                 self.assertIsNone(ch.sent[0]["buttons"])
                 self.assertIsNone(ch.sent[0]["thread_id"])
-                self.assertIn("总管正在等待审批，请打开 herdr 处理；你的消息已排队", ch.sent[0]["text"])
+                self.assertEqual(
+                    ch.sent[0]["text"],
+                    "⏸️ 正在等待审批，请打开 herdr 处理；消息已排队",
+                )
                 card_id = ch.sent[0]["id"]
 
                 # Second message while still blocked updates card count in-place
@@ -555,8 +558,10 @@ class TestV2InteractionFlows(unittest.TestCase):
                 daemon.run_once(now=1020)
                 self.assertEqual(len(ch.sent), 1)
                 self.assertEqual(ch.card_updates[-1]["message_id"], card_id)
-                self.assertIn("总管正在等待审批，请打开 herdr 处理", ch.card_updates[-1]["text"])
-                self.assertIn("已收到 2 条", ch.card_updates[-1]["text"])
+                self.assertEqual(
+                    ch.card_updates[-1]["text"],
+                    "⏸️ 正在等待审批，请打开 herdr 处理；消息已排队（共 2 条）",
+                )
             finally:
                 daemon.close()
 

@@ -60,14 +60,15 @@ def _format_digest_category(category: str) -> str:
 
 def _build_busy_queue_card_text(busy_kind: str, hint: str, count: int) -> str:
     """Format button-less Feishu queuing card text for a busy `#General` batch."""
+    _ = hint
     n = max(1, int(count))
     if busy_kind == "blocked":
         if n <= 1:
-            return "⏸️ 总管正在等待审批，请打开 herdr 处理；你的消息已排队"
-        return f"⏸️ 总管正在等待审批，请打开 herdr 处理；你的消息已排队（已收到 {n} 条，忙完后一并回复）"
+            return "⏸️ 正在等待审批，请打开 herdr 处理；消息已排队"
+        return f"⏸️ 正在等待审批，请打开 herdr 处理；消息已排队（共 {n} 条）"
     if n <= 1:
-        return f"⏳ 总管正在处理{hint}，你的消息已排队，忙完后一并回复"
-    return f"⏳ 总管正在处理{hint}，已收到 {n} 条，忙完后一并回复"
+        return "⏳ 收到，正在排队处理..."
+    return f"⏳ 收到，正在排队处理（共 {n} 条）..."
 
 
 def _format_merged_channel_batch(events: List[EventRow]) -> str:

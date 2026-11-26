@@ -2436,6 +2436,567 @@ class TestV2InteractionFlows(unittest.TestCase):
             self.assertIn(["systemctl", "--user", "disable", "--now", "herdr-bot.service"], invoked_cmds)
             self.assertFalse((fake_home / ".config" / "systemd" / "user" / "herdr-bot.service").exists())
 
+    def test_manual_herdr_pane_hook_binding_filters_subagents_and_updates_on_new_top_level(self) -> None:
+        """Manual Herdr panes bind top-level conversation_id, ignore subagents without USER_INPUT, and update on new human prompts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "manual-hq"
+            hq_main(["init", str(hq_dir)])
+
+            sub_tfile = Path(tmp) / "subagent.jsonl"
+            sub_tfile.write_text(
+                json.dumps({"type": "SYSTEM_MESSAGE", "content": "Subagent task brief"}, ensure_ascii=False)
+                + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "content": "Subagent done"}, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+            human_tfile = Path(tmp) / "human_top.jsonl"
+            human_tfile.write_text(
+                json.dumps({"type": "USER_INPUT", "content": "<USER_REQUEST>继续排查</USER_REQUEST>"}, ensure_ascii=False)
+                + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "content": "已排查完成"}, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            env_manual = {"HERDR_PANE_ID": "w8:p1", "HERDR_WORKSPACE_ID": "w8"}
+            with patch.dict(os.environ, env_manual, clear=False):
+                os.environ.pop("HQ_SESSION_KEY", None)
+                os.environ.pop("HQ_EPHEMERAL", None)
+
+                # 1) Initial SessionStart on an unbound manual pane binds conv-main-1
+                r1 = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "SessionStart",
+                        "conversationId": "conv-main-1",
+                        "cwd": str(hq_dir),
+                    },
+                    hq_dir=hq_dir,
+                    channel=FakeChannel(),
+                    now=1000,
+                )
+                self.assertEqual(r1["status"], "ok")
+
+                # 2) Subagent SessionStart + Stop (no user_prompt, no USER_INPUT) must be ignored
+                r_sub_start = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "SessionStart",
+                        "conversationId": "conv-sub-1",
+                        "cwd": str(hq_dir),
+                    },
+                    hq_dir=hq_dir,
+                    channel=FakeChannel(),
+                    now=1005,
+                )
+                self.assertEqual(r_sub_start["status"], "ignored")
+                self.assertEqual(r_sub_start["reason"], "manual_pane_subagent")
+
+                r_sub_stop = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "Stop",
+                        "conversationId": "conv-sub-1",
+                        "transcriptPath": str(sub_tfile),
+                        "cwd": str(hq_dir),
+                    },
+                    hq_dir=hq_dir,
+                    channel=FakeChannel(),
+                    now=1010,
+                )
+                self.assertEqual(r_sub_stop["status"], "ignored")
+                self.assertEqual(r_sub_stop["reason"], "manual_pane_subagent")
+
+            from hq_pilot.db import HQDatabase
+
+            db = HQDatabase(hq_dir / ".hq" / "runtime.sqlite")
+            try:
+                # Verify list_meta_prefix escapes underscores accurately
+                db.set_meta("herdrXmanualXpane:w8:p1", "noise", now=1011)
+                prefixed = db.list_meta_prefix("herdr_manual_pane:")
+                self.assertEqual(list(prefixed.keys()), ["herdr_manual_pane:w8:p1"])
+
+                bound = json.loads(prefixed["herdr_manual_pane:w8:p1"])
+                self.assertEqual(bound["pane_id"], "w8:p1")
+                self.assertEqual(bound["workspace_id"], "w8")
+                self.assertEqual(bound["conversation_id"], "conv-main-1")
+                self.assertEqual(bound["session_key"], "local:conv-main-1")
+                self.assertEqual(bound["cwd"], str(hq_dir.resolve()))
+                self.assertIsNone(db.get_session("local:conv-sub-1"))
+
+                # Seed workspace_label to confirm subsequent updates preserve it
+                bound["workspace_label"] = "manual-hq"
+                db.set_meta("herdr_manual_pane:w8:p1", json.dumps(bound, ensure_ascii=False), now=1012)
+            finally:
+                db.close()
+
+            # 3) New top-level conversation via PreInvocation with user_prompt updates binding & keeps workspace_label
+            with patch.dict(os.environ, env_manual, clear=False):
+                os.environ.pop("HQ_SESSION_KEY", None)
+                os.environ.pop("HQ_EPHEMERAL", None)
+                r2 = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "PreInvocation",
+                        "conversationId": "conv-main-2",
+                        "lastUserInput": "<USER_REQUEST>开启新对话</USER_REQUEST>",
+                        "cwd": str(hq_dir),
+                    },
+                    hq_dir=hq_dir,
+                    channel=FakeChannel(),
+                    now=1020,
+                )
+                self.assertEqual(r2["status"], "ok")
+
+                # 4) New top-level conversation confirmed via Stop with USER_INPUT in transcript updates binding
+                r3 = handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "Stop",
+                        "conversationId": "conv-main-3",
+                        "transcriptPath": str(human_tfile),
+                        "cwd": str(hq_dir),
+                    },
+                    hq_dir=hq_dir,
+                    channel=FakeChannel(),
+                    now=1030,
+                )
+                self.assertEqual(r3["status"], "ok")
+
+            # 5) Managed session with HQ_SESSION_KEY must NOT bind as manual pane
+            with patch.dict(
+                os.environ,
+                {"HQ_SESSION_KEY": "general:1", "HERDR_PANE_ID": "w9:p1", "HERDR_WORKSPACE_ID": "w9"},
+                clear=False,
+            ):
+                os.environ.pop("HQ_EPHEMERAL", None)
+                db = HQDatabase(hq_dir / ".hq" / "runtime.sqlite")
+                try:
+                    db.create_session(
+                        "general:1",
+                        "GENERAL",
+                        "agy",
+                        status="active",
+                        pane_name=GENERAL_PANE_NAME,
+                        now=1035,
+                    )
+                finally:
+                    db.close()
+                handle_hook_event(
+                    "agy",
+                    {
+                        "hookEventName": "PreInvocation",
+                        "conversationId": "conv-gen-1",
+                        "lastUserInput": "managed prompt",
+                        "cwd": str(hq_dir),
+                    },
+                    hq_dir=hq_dir,
+                    channel=FakeChannel(),
+                    now=1040,
+                )
+
+            db = HQDatabase(hq_dir / ".hq" / "runtime.sqlite")
+            try:
+                prefixed = db.list_meta_prefix("herdr_manual_pane:")
+                self.assertEqual(list(prefixed.keys()), ["herdr_manual_pane:w8:p1"])
+                bound_final = json.loads(prefixed["herdr_manual_pane:w8:p1"])
+                self.assertEqual(bound_final["conversation_id"], "conv-main-3")
+                self.assertEqual(bound_final["session_key"], "local:conv-main-3")
+                self.assertEqual(bound_final["workspace_label"], "manual-hq")
+                self.assertIsNone(db.get_meta("herdr_manual_pane:w9:p1"))
+            finally:
+                db.close()
+
+    def test_manual_herdr_session_in_place_restore_and_label_fallback(self) -> None:
+        """After reboot, empty-shell manual panes are restored in-place via start_agent_in_pane with --conversation, add_dirs, and label fallback."""
+
+        class ManualPaneTerminal(StatusAwareTerminal):
+            def __init__(self) -> None:
+                super().__init__()
+                self.start_agent_in_pane_calls = []
+
+            def start_agent_in_pane(
+                self,
+                name: str,
+                pane_id: str,
+                kind: str,
+                agent_args=None,
+                timeout_ms: int = 60000,
+            ) -> None:
+                self.start_agent_in_pane_calls.append(
+                    {
+                        "name": name,
+                        "pane_id": pane_id,
+                        "kind": kind,
+                        "agent_args": list(agent_args or []),
+                        "timeout_ms": timeout_ms,
+                    }
+                )
+                for key, p in list(self.panes.items()):
+                    if p.pane_id == pane_id:
+                        self.panes[key] = PaneInfo(
+                            name=p.name,
+                            status="idle",
+                            attached=p.attached,
+                            cwd=p.cwd,
+                            agent_live=True,
+                            pane_id=p.pane_id,
+                            workspace_id=p.workspace_id,
+                        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "manual-hq"
+            other_dir = Path(tmp) / "side-ws"
+            other_dir.mkdir()
+            repo_dir = Path(tmp) / "svc-alpha"
+            _init_git_repo(repo_dir)
+            hq_main(["init", str(hq_dir)])
+            (hq_dir / "hq.yaml").write_text(
+                "version: 1\n"
+                "project_name: demo-proj\n"
+                "agent:\n"
+                "  backend: agy\n"
+                "  permission_mode: turbo\n"
+                "repos:\n"
+                "  svc-alpha:\n"
+                "    git_url: ''\n"
+                "    default_branch: main\n",
+                encoding="utf-8",
+            )
+            (hq_dir / ".hq" / "local.yaml").write_text(
+                f"repo_paths:\n  svc-alpha: {repo_dir}\n",
+                encoding="utf-8",
+            )
+
+            term = ManualPaneTerminal()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=FakeChannel(),
+            )
+            try:
+                daemon.db.set_meta(
+                    "herdr_manual_pane:w8:p1",
+                    json.dumps(
+                        {
+                            "pane_id": "w8:p1",
+                            "workspace_id": "w8",
+                            "workspace_label": "manual-hq",
+                            "conversation_id": "conv-manual-42",
+                            "session_key": "local:conv-manual-42",
+                            "cwd": str(hq_dir),
+                            "updated_at": 900,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now=900,
+                )
+                daemon.db.set_meta(
+                    "herdr_manual_pane:w7:p1",
+                    json.dumps(
+                        {
+                            "pane_id": "w7:p1",
+                            "workspace_id": "w7",
+                            "workspace_label": "side-ws",
+                            "conversation_id": "conv-side-99",
+                            "session_key": "local:conv-side-99",
+                            "cwd": str(other_dir),
+                            "updated_at": 900,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now=900,
+                )
+                daemon.db.set_meta(
+                    "herdr_manual_pane:w6:p1",
+                    json.dumps(
+                        {
+                            "pane_id": "w6:p1",
+                            "workspace_id": "w6",
+                            "workspace_label": "closed-ws",
+                            "conversation_id": "conv-closed-1",
+                            "session_key": "local:conv-closed-1",
+                            "cwd": str(hq_dir),
+                            "updated_at": 900,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now=900,
+                )
+
+                # Simulate restored empty shells after reboot (plus hq-general which must be ignored here)
+                term.panes["hq-general"] = PaneInfo(
+                    name=GENERAL_PANE_NAME,
+                    status="unknown",
+                    cwd=str(hq_dir),
+                    agent_live=False,
+                    pane_id="w9:p1",
+                    workspace_id="w9",
+                )
+                term.panes["manual-hq"] = PaneInfo(
+                    name="manual-hq",
+                    status="unknown",
+                    cwd=str(hq_dir),
+                    agent_live=False,
+                    pane_id="w8:p1",
+                    workspace_id="w8",
+                )
+                term.panes["side-ws"] = PaneInfo(
+                    name="side-ws",
+                    status="exited",
+                    cwd=str(other_dir),
+                    agent_live=False,
+                    pane_id="w12:p1",
+                    workspace_id="w12",
+                )
+
+                restored = daemon._restore_manual_herdr_sessions(now=2000)
+                self.assertEqual(set(restored), {"w8:p1", "w12:p1"})
+                self.assertEqual(term.start_agent_calls, [])
+                self.assertEqual(len(term.start_agent_in_pane_calls), 2)
+
+                calls_by_pane = {c["pane_id"]: c for c in term.start_agent_in_pane_calls}
+                c_hq = calls_by_pane["w8:p1"]
+                self.assertEqual(c_hq["name"], "manual-hq")
+                self.assertEqual(c_hq["kind"], "agy")
+                conv_idx = c_hq["agent_args"].index("--conversation")
+                self.assertEqual(c_hq["agent_args"][conv_idx + 1], "conv-manual-42")
+                self.assertIn("--add-dir", c_hq["agent_args"])
+                self.assertIn(str(repo_dir.resolve()), c_hq["agent_args"])
+                s_idx = c_hq["agent_args"].index("--settings")
+                s_obj = json.loads(c_hq["agent_args"][s_idx + 1])
+                self.assertEqual(s_obj.get("toolPermission"), "always-proceed")
+                self.assertIn(str(hq_dir.resolve()), s_obj.get("trustedWorkspaces", []))
+                self.assertIn(str(repo_dir.resolve()), s_obj.get("trustedWorkspaces", []))
+
+                c_side = calls_by_pane["w12:p1"]
+                self.assertEqual(c_side["name"], "side-ws")
+                conv_idx2 = c_side["agent_args"].index("--conversation")
+                self.assertEqual(c_side["agent_args"][conv_idx2 + 1], "conv-side-99")
+                self.assertNotIn("--add-dir", c_side["agent_args"])
+
+                # Closed pane deleted; renumbered pane migrated to w12:p1
+                self.assertIsNone(daemon.db.get_meta("herdr_manual_pane:w6:p1"))
+                self.assertIsNone(daemon.db.get_meta("herdr_manual_pane:w7:p1"))
+                migrated = json.loads(daemon.db.get_meta("herdr_manual_pane:w12:p1") or "{}")
+                self.assertEqual(migrated["pane_id"], "w12:p1")
+                self.assertEqual(migrated["workspace_id"], "w12")
+                self.assertEqual(migrated["conversation_id"], "conv-side-99")
+                self.assertIn("w8:p1", daemon._seen_live_manual_panes)
+                self.assertIn("w12:p1", daemon._seen_live_manual_panes)
+
+                # Calling restore again while both are live must be a no-op
+                restored_again = daemon._restore_manual_herdr_sessions(now=2010)
+                self.assertEqual(restored_again, [])
+                self.assertEqual(len(term.start_agent_in_pane_calls), 2)
+            finally:
+                daemon.close()
+
+    def test_manual_herdr_reconcile_unbinds_on_user_exit_or_window_close(self) -> None:
+        """Runtime user exit (/exit or Ctrl-C) or window close unbinds manual panes so subsequent boot never resurrects them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "manual-hq"
+            hq_main(["init", str(hq_dir)])
+
+            term = StatusAwareTerminal()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=FakeChannel(),
+            )
+            try:
+                daemon.db.set_meta(
+                    "herdr_manual_pane:w8:p1",
+                    json.dumps(
+                        {
+                            "pane_id": "w8:p1",
+                            "workspace_id": "w8",
+                            "conversation_id": "conv-exit-1",
+                            "session_key": "local:conv-exit-1",
+                            "cwd": str(hq_dir),
+                            "updated_at": 1000,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now=1000,
+                )
+                daemon.db.set_meta(
+                    "herdr_manual_pane:w10:p1",
+                    json.dumps(
+                        {
+                            "pane_id": "w10:p1",
+                            "workspace_id": "w10",
+                            "conversation_id": "conv-close-2",
+                            "session_key": "local:conv-close-2",
+                            "cwd": str(hq_dir),
+                            "updated_at": 1000,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now=1000,
+                )
+
+                term.panes["manual-hq"] = PaneInfo(
+                    name="manual-hq",
+                    status="idle",
+                    cwd=str(hq_dir),
+                    agent_live=True,
+                    pane_id="w8:p1",
+                    workspace_id="w8",
+                )
+                term.panes["extra-ws"] = PaneInfo(
+                    name="extra-ws",
+                    status="idle",
+                    cwd=str(hq_dir),
+                    agent_live=True,
+                    pane_id="w10:p1",
+                    workspace_id="w10",
+                )
+
+                # First tick observes both live and backfills workspace_label
+                daemon.run_once(now=1010)
+                self.assertIn("w8:p1", daemon._seen_live_manual_panes)
+                self.assertIn("w10:p1", daemon._seen_live_manual_panes)
+                b8 = json.loads(daemon.db.get_meta("herdr_manual_pane:w8:p1") or "{}")
+                self.assertEqual(b8.get("workspace_label"), "manual-hq")
+
+                # User actively exits agy in w8:p1 (becomes bare shell) AND closes w10:p1 window
+                term.panes["manual-hq"] = PaneInfo(
+                    name="manual-hq",
+                    status="unknown",
+                    cwd=str(hq_dir),
+                    agent_live=False,
+                    pane_id="w8:p1",
+                    workspace_id="w8",
+                )
+                term.panes.pop("extra-ws")
+
+                daemon.run_once(now=1020)
+                self.assertIsNone(daemon.db.get_meta("herdr_manual_pane:w8:p1"))
+                self.assertIsNone(daemon.db.get_meta("herdr_manual_pane:w10:p1"))
+                self.assertNotIn("w8:p1", daemon._seen_live_manual_panes)
+                self.assertNotIn("w10:p1", daemon._seen_live_manual_panes)
+            finally:
+                daemon.close()
+
+            # Simulate next boot: fresh daemon must NOT resurrect either unbound pane
+            daemon2 = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=FakeChannel(),
+            )
+            try:
+                restored = daemon2._restore_manual_herdr_sessions(now=2000)
+                self.assertEqual(restored, [])
+                self.assertEqual(term.start_agent_calls, [])
+            finally:
+                daemon2.close()
+
+    def test_herdr_start_agent_in_pane_and_list_panes_ids(self) -> None:
+        """HerdrDriver.start_agent_in_pane invokes `agent start <name> --kind <kind> --pane <pane_id>` without creating workspaces; list_panes fills pane_id/workspace_id."""
+        calls = []
+
+        def fake_run(self_drv, args, check=True):
+            calls.append(list(args))
+            if args == ["status", "--json"]:
+                return subprocess.CompletedProcess(
+                    args, 0, stdout=json.dumps({"server": {"running": True}}), stderr=""
+                )
+            if args == ["workspace", "list"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "result": {
+                                "workspaces": [
+                                    {"workspace_id": "w8", "label": "manual-hq", "pane_count": 1, "agent_status": "unknown"},
+                                ]
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            if args == ["agent", "list"]:
+                return subprocess.CompletedProcess(
+                    args, 0, stdout=json.dumps({"result": {"agents": []}}), stderr=""
+                )
+            if args == ["pane", "list"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "result": {
+                                "panes": [
+                                    {"workspace_id": "w8", "pane_id": "w8:p1", "agent_status": "unknown", "cwd": "/tmp/manual-hq"},
+                                ]
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            if args[:2] == ["agent", "start"]:
+                return subprocess.CompletedProcess(args, 0, stdout='{"result":{}}', stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        drv = HerdrDriver(bin_path="herdr")
+        with patch.object(HerdrDriver, "_run", fake_run):
+            panes = drv.list_panes()
+            self.assertEqual(len(panes), 1)
+            self.assertEqual(panes[0].name, "manual-hq")
+            self.assertEqual(panes[0].pane_id, "w8:p1")
+            self.assertEqual(panes[0].workspace_id, "w8")
+            self.assertIs(panes[0].agent_live, False)
+
+            calls.clear()
+            drv.start_agent_in_pane(
+                name="Manual HQ",
+                pane_id="w8:p1",
+                kind="agy",
+                agent_args=["--conversation", "cid-1", "--effort", "high"],
+                timeout_ms=45000,
+            )
+
+        self.assertEqual([c for c in calls if c[:2] == ["workspace", "create"]], [])
+        self.assertEqual([c for c in calls if c[:2] == ["workspace", "close"]], [])
+        self.assertIn(
+            [
+                "agent",
+                "start",
+                "manual-hq",
+                "--kind",
+                "agy",
+                "--pane",
+                "w8:p1",
+                "--timeout",
+                "45000",
+                "--",
+                "--conversation",
+                "cid-1",
+                "--effort",
+                "high",
+            ],
+            calls,
+        )
+
+        # Default TerminalDriver.start_agent_in_pane falls back to start_agent
+        fallback_term = StatusAwareTerminal()
+        fallback_term.start_agent_in_pane(
+            name="fallback-pane",
+            pane_id="w1:p1",
+            kind="agy",
+            agent_args=["--conversation", "cid-fb"],
+            timeout_ms=30000,
+        )
+        self.assertEqual(len(fallback_term.start_agent_calls), 1)
+        self.assertEqual(fallback_term.start_agent_calls[0]["name"], "fallback-pane")
+        self.assertEqual(fallback_term.start_agent_calls[0]["agent_args"], ["--conversation", "cid-fb"])
+
 
 if __name__ == "__main__":
     unittest.main()

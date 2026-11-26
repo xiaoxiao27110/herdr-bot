@@ -29,6 +29,8 @@ class PaneInfo:
     attached: bool = False
     cwd: str = ""
     agent_live: Optional[bool] = None
+    pane_id: str = ""
+    workspace_id: str = ""
 
 
 class TerminalDriver(ABC):
@@ -86,6 +88,24 @@ class TerminalDriver(ABC):
         if agent_args:
             cmd.extend(agent_args)
         self.run_bg(name=name, cwd=cwd, cmd=cmd)
+
+    def start_agent_in_pane(
+        self,
+        name: str,
+        pane_id: str,
+        kind: str,
+        agent_args: Optional[List[str]] = None,
+        timeout_ms: int = 60000,
+    ) -> None:
+        """Start an interactive coding agent in-place inside an existing shell pane."""
+        _ = pane_id
+        self.start_agent(
+            name=name,
+            cwd=".",
+            kind=kind,
+            agent_args=agent_args,
+            timeout_ms=timeout_ms,
+        )
 
     def prompt_agent(
         self,

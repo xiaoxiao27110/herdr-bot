@@ -55,6 +55,16 @@ def _extract_user_request_text(raw: str) -> str:
     return text.strip()
 
 
+def _transcript_has_user_input(adapter: Any, tpath: str) -> bool:
+    if not tpath:
+        return False
+    p = Path(tpath)
+    if not p.exists():
+        return False
+    turns, _ = adapter.read_transcript_slice(str(p), from_line=0)
+    return any(t.role == "user" and t.text.strip() for t in turns)
+
+
 def handle_hook_event(
     agent_name: str,
     payload: Dict[str, Any],
@@ -127,6 +137,35 @@ def handle_hook_event(
 
         sess = None
         env_session_key = os.environ.get("HQ_SESSION_KEY", "").strip()
+        herdr_pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
+        herdr_ws_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+        if not herdr_ws_id and ":" in herdr_pane_id:
+            herdr_ws_id = herdr_pane_id.split(":", 1)[0]
+
+        is_manual_herdr = (not env_session_key) and bool(herdr_pane_id) and bool(agent_sid)
+        manual_meta_key = f"herdr_manual_pane:{herdr_pane_id}" if is_manual_herdr else ""
+        existing_manual_binding: Optional[Dict[str, Any]] = None
+        bound_cid = ""
+        if is_manual_herdr:
+            raw_binding = db.get_meta(manual_meta_key)
+            if raw_binding:
+                try:
+                    parsed_binding = json.loads(raw_binding)
+                    if isinstance(parsed_binding, dict):
+                        existing_manual_binding = parsed_binding
+                        bound_cid = str(parsed_binding.get("conversation_id") or "").strip()
+                except json.JSONDecodeError:
+                    existing_manual_binding = None
+
+        has_user_prompt = bool(str(user_prompt or "").strip())
+        _transcript_user_checked: Optional[bool] = None
+
+        def _has_transcript_user(tpath_candidate: str) -> bool:
+            nonlocal _transcript_user_checked
+            if _transcript_user_checked is None:
+                _transcript_user_checked = _transcript_has_user_input(adapter, tpath_candidate)
+            return _transcript_user_checked
+
         if env_session_key:
             sess = db.get_session(env_session_key)
             if (
@@ -164,6 +203,19 @@ def handle_hook_event(
                 }
         if sess is None and agent_sid:
             sess = db.get_session_by_agent_id(agent_sid)
+        if (
+            sess is None
+            and is_manual_herdr
+            and bound_cid
+            and agent_sid != bound_cid
+            and not has_user_prompt
+            and not _has_transcript_user(transcript_path)
+        ):
+            return {
+                "status": "ignored",
+                "reason": "manual_pane_subagent",
+                "event": event_type,
+            }
         if sess is None and agent_sid:
             # Local direct session started outside daemon -> default pinned!
             sess = db.create_session(
@@ -190,6 +242,53 @@ def handle_hook_event(
         db.update_session(skey, **updates)
         if updates:
             sess = db.get_session(skey) or sess
+
+        if is_manual_herdr and str(sess.get("track") or "") not in {"GENERAL", "B"}:
+            effective_tpath = transcript_path or str(sess.get("transcript_path") or "")
+            is_confirmed_top_level = (
+                (event_type in {"PreInvocation", "UserPromptSubmit"} and has_user_prompt)
+                or (event_type == "Stop" and _has_transcript_user(effective_tpath))
+                or (
+                    event_type == "SessionStart"
+                    and (
+                        existing_manual_binding is None
+                        or not bound_cid
+                        or bound_cid == agent_sid
+                        or has_user_prompt
+                    )
+                )
+            )
+            if is_confirmed_top_level:
+                raw_cwd = payload.get("cwd") or payload.get("workspace")
+                if (
+                    not raw_cwd
+                    and isinstance(payload.get("workspacePaths"), list)
+                    and payload["workspacePaths"]
+                ):
+                    raw_cwd = payload["workspacePaths"][0]
+                if raw_cwd:
+                    cwd_str = str(Path(str(raw_cwd)).expanduser().resolve())
+                elif existing_manual_binding and existing_manual_binding.get("cwd"):
+                    cwd_str = str(existing_manual_binding["cwd"])
+                else:
+                    cwd_str = str(root)
+                binding_record: Dict[str, Any] = {
+                    "pane_id": herdr_pane_id,
+                    "workspace_id": herdr_ws_id,
+                    "conversation_id": agent_sid,
+                    "session_key": skey,
+                    "cwd": cwd_str,
+                    "updated_at": ts,
+                }
+                if existing_manual_binding and existing_manual_binding.get("workspace_label"):
+                    binding_record["workspace_label"] = str(
+                        existing_manual_binding["workspace_label"]
+                    )
+                db.set_meta(
+                    manual_meta_key,
+                    json.dumps(binding_record, ensure_ascii=False),
+                    now=ts,
+                )
 
         is_general_sess = str(sess.get("track") or "") in {"GENERAL", "B"}
         pane_name_cur = str(sess.get("pane_name") or "").strip()

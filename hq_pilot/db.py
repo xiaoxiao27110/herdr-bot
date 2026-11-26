@@ -907,6 +907,14 @@ class HQDatabase:
     def delete_meta(self, key: str) -> None:
         self.conn.execute("DELETE FROM meta_state WHERE key = ?", (key,))
 
+    def list_meta_prefix(self, prefix: str) -> Dict[str, str]:
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self.conn.execute(
+            "SELECT key, value FROM meta_state WHERE key LIKE ? ESCAPE '\\' ORDER BY key ASC",
+            (f"{escaped}%",),
+        ).fetchall()
+        return {str(r["key"]): str(r["value"]) for r in rows}
+
     # ------------------------------------------------------------------
     # Local Channel Storage (local_messages & local_threads)
     # ------------------------------------------------------------------

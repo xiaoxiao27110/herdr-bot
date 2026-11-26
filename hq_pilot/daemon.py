@@ -232,6 +232,7 @@ class HQDaemon:
         self.cmd_runner: CmdRunner = cmd_runner or default_cmd_runner
         self._stop_requested = False
         self._ephemeral_panes_used: Set[str] = set()
+        self._seen_live_manual_panes: Set[str] = set()
 
     def close(self) -> None:
         self.db.close()
@@ -1037,6 +1038,217 @@ class HQDaemon:
         )
         return sess
 
+    def _restore_manual_herdr_sessions(self, now: Optional[int] = None) -> List[str]:
+        """Restore manual Herdr agent sessions in-place when their panes recover as bare shells."""
+        ts = int(now if now is not None else time.time())
+        bindings = self.db.list_meta_prefix("herdr_manual_pane:")
+        if not bindings:
+            return []
+
+        ensure_fn = getattr(self.terminal_driver, "ensure_server", None)
+        if callable(ensure_fn):
+            ensure_fn()
+
+        all_panes = self.terminal_driver.list_panes()
+        general_pane_names: Set[str] = {GENERAL_PANE_NAME}
+        for s in self.db.list_sessions(statuses=["active", "pinned"]):
+            if s.get("track") in GENERAL_TRACKS and s.get("pane_name"):
+                general_pane_names.add(str(s["pane_name"]).strip())
+        general_pane_ids: Set[str] = {
+            p.pane_id for p in all_panes if p.pane_id and p.name in general_pane_names
+        }
+
+        unique_panes: List[PaneInfo] = []
+        panes_by_id: Dict[str, PaneInfo] = {}
+        for p in all_panes:
+            if p.name in general_pane_names:
+                continue
+            if p.pane_id and p.pane_id in general_pane_ids:
+                continue
+            if p.pane_id:
+                if p.pane_id in panes_by_id:
+                    continue
+                panes_by_id[p.pane_id] = p
+            unique_panes.append(p)
+
+        restored: List[str] = []
+        for meta_key, raw_val in bindings.items():
+            pane_id = meta_key[len("herdr_manual_pane:"):]
+            try:
+                binding = json.loads(raw_val)
+                if not isinstance(binding, dict):
+                    raise ValueError("binding must be dict")
+            except (json.JSONDecodeError, ValueError):
+                self.db.delete_meta(meta_key)
+                self._seen_live_manual_panes.discard(pane_id)
+                continue
+
+            conversation_id = str(binding.get("conversation_id") or "").strip()
+            if not conversation_id:
+                self.db.delete_meta(meta_key)
+                self._seen_live_manual_panes.discard(pane_id)
+                continue
+
+            workspace_label = str(binding.get("workspace_label") or "").strip()
+            matched = panes_by_id.get(pane_id) if pane_id else None
+            if matched is None and workspace_label:
+                label_matches = [p for p in unique_panes if p.name == workspace_label]
+                if len(label_matches) == 1:
+                    matched = label_matches[0]
+
+            if matched is None:
+                self.db.delete_meta(meta_key)
+                self._seen_live_manual_panes.discard(pane_id)
+                continue
+
+            eff_pane_id = (matched.pane_id or pane_id).strip()
+            eff_meta_key = f"herdr_manual_pane:{eff_pane_id}"
+
+            if self._is_pane_live(matched):
+                self._seen_live_manual_panes.add(eff_pane_id)
+                changed = eff_meta_key != meta_key
+                if eff_pane_id and binding.get("pane_id") != eff_pane_id:
+                    binding["pane_id"] = eff_pane_id
+                    changed = True
+                if matched.workspace_id and binding.get("workspace_id") != matched.workspace_id:
+                    binding["workspace_id"] = matched.workspace_id
+                    changed = True
+                if matched.name and binding.get("workspace_label") != matched.name:
+                    binding["workspace_label"] = matched.name
+                    changed = True
+                if matched.cwd and binding.get("cwd") != matched.cwd:
+                    binding["cwd"] = matched.cwd
+                    changed = True
+                if changed:
+                    binding["updated_at"] = ts
+                    if eff_meta_key != meta_key:
+                        self.db.delete_meta(meta_key)
+                        self._seen_live_manual_panes.discard(pane_id)
+                    self.db.set_meta(
+                        eff_meta_key,
+                        json.dumps(binding, ensure_ascii=False),
+                        now=ts,
+                    )
+                continue
+
+            cwd_raw = (matched.cwd or str(binding.get("cwd") or "") or str(self.hq_dir)).strip()
+            cwd_path = Path(cwd_raw).expanduser().resolve()
+            add_dirs = (
+                [
+                    self.config.get_repo_path(r)
+                    for r in sorted(self.config.repos.keys())
+                    if self.config.get_repo_path(r).exists()
+                ]
+                if cwd_path == self.hq_dir.resolve()
+                else None
+            )
+            interactive_cmd = self.agent_adapter.build_interactive_cmd(
+                initial_prompt=None,
+                session_id=conversation_id,
+                model=self.config.agent.model,
+                effort=self.config.agent.default_effort,
+                add_dirs=add_dirs,
+            )
+            trust_args = self.agent_adapter.extra_trust_args(
+                [cwd_path, *(add_dirs or [])],
+                permission_mode=self.config.agent.permission_mode,
+            )
+            target_name = (matched.name or workspace_label or eff_pane_id).strip()
+            try:
+                self.terminal_driver.start_agent_in_pane(
+                    name=target_name,
+                    pane_id=eff_pane_id,
+                    kind=self.agent_adapter.name,
+                    agent_args=[*interactive_cmd[1:], *trust_args],
+                )
+            except Exception as exc:
+                print(
+                    f"[hq-daemon] warn: failed to restore manual session "
+                    f"pane={eff_pane_id} name={target_name} conversation={conversation_id}: {exc}",
+                    flush=True,
+                )
+                continue
+
+            self._seen_live_manual_panes.add(eff_pane_id)
+            binding["pane_id"] = eff_pane_id
+            if matched.workspace_id:
+                binding["workspace_id"] = matched.workspace_id
+            if target_name:
+                binding["workspace_label"] = target_name
+            binding["cwd"] = str(cwd_path)
+            binding["updated_at"] = ts
+            if eff_meta_key != meta_key:
+                self.db.delete_meta(meta_key)
+                self._seen_live_manual_panes.discard(pane_id)
+            self.db.set_meta(
+                eff_meta_key,
+                json.dumps(binding, ensure_ascii=False),
+                now=ts,
+            )
+            restored.append(eff_pane_id)
+            print(
+                f"[hq-daemon] restored manual session pane={eff_pane_id} "
+                f"name={target_name} conversation={conversation_id}",
+                flush=True,
+            )
+        return restored
+
+    def _reconcile_manual_herdr_bindings(self, now: int) -> None:
+        """Keep manual Herdr pane bindings in sync: supplement labels and unbind on exit/close."""
+        bindings = self.db.list_meta_prefix("herdr_manual_pane:")
+        if not bindings:
+            self._seen_live_manual_panes.clear()
+            return
+
+        server_running_fn = getattr(self.terminal_driver, "_server_running", None)
+        if callable(server_running_fn) and not server_running_fn():
+            return
+
+        panes_by_id: Dict[str, PaneInfo] = {}
+        for p in self.terminal_driver.list_panes():
+            if p.pane_id and p.pane_id not in panes_by_id:
+                panes_by_id[p.pane_id] = p
+
+        for meta_key, raw_val in bindings.items():
+            pane_id = meta_key[len("herdr_manual_pane:"):]
+            try:
+                binding = json.loads(raw_val)
+                if not isinstance(binding, dict):
+                    raise ValueError("binding must be dict")
+            except (json.JSONDecodeError, ValueError):
+                self.db.delete_meta(meta_key)
+                self._seen_live_manual_panes.discard(pane_id)
+                continue
+
+            p = panes_by_id.get(pane_id)
+            if p is None:
+                self.db.delete_meta(meta_key)
+                self._seen_live_manual_panes.discard(pane_id)
+                continue
+
+            if self._is_pane_live(p):
+                self._seen_live_manual_panes.add(pane_id)
+                changed = False
+                if p.name and binding.get("workspace_label") != p.name:
+                    binding["workspace_label"] = p.name
+                    changed = True
+                if p.cwd and binding.get("cwd") != p.cwd:
+                    binding["cwd"] = p.cwd
+                    changed = True
+                if p.workspace_id and binding.get("workspace_id") != p.workspace_id:
+                    binding["workspace_id"] = p.workspace_id
+                    changed = True
+                if changed:
+                    binding["updated_at"] = now
+                    self.db.set_meta(
+                        meta_key,
+                        json.dumps(binding, ensure_ascii=False),
+                        now=now,
+                    )
+            elif pane_id in self._seen_live_manual_panes:
+                self._seen_live_manual_panes.discard(pane_id)
+                self.db.delete_meta(meta_key)
+
     def _materialize_long_prompt(self, prompt: str, tag: str, now: int) -> str:
         """Persist long prompts (>2KB) or distill/dream prompts to a file and return a short instruction."""
         if len(prompt.encode("utf-8")) <= 2048 and not tag.startswith(("distill", "dream")):
@@ -1832,6 +2044,7 @@ class HQDaemon:
             )
         )
         scan_pane_blocked(self.db, self.terminal_driver, self.config, now=ts)
+        self._reconcile_manual_herdr_bindings(ts)
         for sess in self.db.list_sessions(statuses=["active", "sealed"]):
             if int(sess.get("pinned") or 0) == 0 and sess.get("pane_name"):
                 detect_manual_touch(
@@ -2042,6 +2255,14 @@ class HQDaemon:
         except Exception as exc:
             print(
                 f"[hq-daemon] warn: failed to pre-start {GENERAL_PANE_NAME}: {exc}",
+                flush=True,
+            )
+
+        try:
+            self._restore_manual_herdr_sessions()
+        except Exception as exc:
+            print(
+                f"[hq-daemon] warn: failed to restore manual Herdr sessions: {exc}",
                 flush=True,
             )
 

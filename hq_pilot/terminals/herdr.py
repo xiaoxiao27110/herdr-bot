@@ -290,6 +290,43 @@ class HerdrDriver(TerminalDriver):
                 f"Herdr agent start failed for {agent_name!r} (rc={res.returncode}): {err_detail}"
             )
 
+    def start_agent_in_pane(
+        self,
+        name: str,
+        pane_id: str,
+        kind: str,
+        agent_args: Optional[List[str]] = None,
+        timeout_ms: int = 60000,
+    ) -> None:
+        """Start an interactive coding agent in-place inside an existing Herdr shell pane."""
+        self.ensure_server()
+        pid = (pane_id or "").strip()
+        if not pid:
+            raise ValueError("pane_id must not be empty for start_agent_in_pane")
+        agent_name = sanitize_herdr_agent_name(name)
+        start_cmd = [
+            "agent",
+            "start",
+            agent_name,
+            "--kind",
+            kind,
+            "--pane",
+            pid,
+            "--timeout",
+            str(int(timeout_ms)),
+        ]
+        if agent_args:
+            start_cmd.append("--")
+            start_cmd.extend(agent_args)
+
+        res = self._run(start_cmd, check=False)
+        if res.returncode != 0:
+            err_detail = (res.stderr or res.stdout or "").strip()
+            raise RuntimeError(
+                f"Herdr agent start failed for {agent_name!r} in pane {pid!r} "
+                f"(rc={res.returncode}): {err_detail}"
+            )
+
     @staticmethod
     def _parse_json_payload(raw: str) -> Dict[str, Any]:
         text = (raw or "").strip()
@@ -404,6 +441,8 @@ class HerdrDriver(TerminalDriver):
                     attached=False,
                     cwd=str(item.get("cwd", "")),
                     agent_live=is_live,
+                    pane_id=pid,
+                    workspace_id=wid,
                 )
             )
             seen_names.add(label)
@@ -415,6 +454,8 @@ class HerdrDriver(TerminalDriver):
                         attached=False,
                         cwd=str(ag.get("cwd") or item.get("cwd", "")),
                         agent_live=is_live,
+                        pane_id=pid,
+                        workspace_id=str(ag.get("workspace_id") or wid),
                     )
                 )
                 seen_names.add(ag_name)
@@ -422,6 +463,11 @@ class HerdrDriver(TerminalDriver):
             ag_name = str(ag.get("name", ""))
             if ag_name and ag_name not in seen_names:
                 ag_status = str(ag.get("agent_status") or "running")
+                ag_pid = str(ag.get("pane_id", ""))
+                ag_wid = str(
+                    ag.get("workspace_id")
+                    or (ag_pid.split(":", 1)[0] if ":" in ag_pid else "")
+                )
                 panes.append(
                     PaneInfo(
                         name=ag_name,
@@ -429,6 +475,8 @@ class HerdrDriver(TerminalDriver):
                         attached=False,
                         cwd=str(ag.get("cwd", "")),
                         agent_live=(ag_status.strip().lower() != "exited"),
+                        pane_id=ag_pid,
+                        workspace_id=ag_wid,
                     )
                 )
                 seen_names.add(ag_name)

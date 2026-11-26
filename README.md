@@ -73,7 +73,7 @@ herdr-bot setup \
 # 前台启动 7x24 编排守护进程（自动预热 hq-general 交互面板）
 herdr-bot up --hq-dir ~/herdr-hq
 
-# 推荐：安装为 systemd --user 常驻服务（开机自启 + 异常自动拉起，KillMode=process 重启不杀 Herdr 面板）
+# 推荐：安装为 systemd --user 常驻服务（开机自启 + 异常自动拉起，KillMode=process 重启不杀 Herdr 面板；主机重启后自动原地恢复 hq-general 及关机前存活的手动 Herdr agy 面板，尊重用户主动退出/关窗）
 herdr-bot service install --hq-dir ~/herdr-hq
 herdr-bot service status
 herdr-bot service restart

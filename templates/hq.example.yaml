@@ -2,12 +2,17 @@ version: 1
 project_name: acme-cloud
 
 agent:
+  # Supported built-in backends: agy | codex
+  # Custom adapters can also be loaded dynamically via "some.module:ClassName"
   backend: agy
   index_file: AGENTS.md
   default_effort: high
   light_effort: low
   # Permission mode: default | turbo (always-proceed) | accept-edits | skip-all
   permission_mode: "default"
+  # Auto-trust managed HQ / repo / worktree dirs in $CODEX_HOME/config.toml (codex backend)
+  # Set to false to skip writing config.toml and print the TOML snippet for manual setup instead.
+  auto_trust_project: true
 
 terminal:
   backend: auto

@@ -109,7 +109,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     cfg = load_config(args.hq_dir)
     print(f"Project: {cfg.project_name} ({cfg.hq_dir})")
     print(f"git: {shutil.which('git') or 'MISSING'}")
-    agent_bin = cfg.local.bin_overrides.get(cfg.agent.backend) or shutil.which(cfg.agent.backend)
+    agent_bin = cfg.get_agent_bin_override() or shutil.which(cfg.agent.backend)
+    try:
+        adapter = get_agent_adapter(cfg.agent.backend, bin_path=cfg.get_agent_bin_override())
+        override = cfg.get_agent_bin_override(adapter_name=adapter.name) or ""
+        agent_bin = adapter.detect_bin(existing_override=override) or None
+    except Exception:
+        pass
     print(f"agent ({cfg.agent.backend}): {agent_bin or 'NOT FOUND'}")
     herdr_path = (
         cfg.local.bin_overrides.get("herdr")
@@ -413,7 +419,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_resume(args: argparse.Namespace) -> int:
     cfg = load_config(args.hq_dir)
     db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
-    adapter = get_agent_adapter(cfg.agent.backend)
+    adapter = get_agent_adapter(
+        cfg.agent.backend,
+        bin_path=cfg.get_agent_bin_override(),
+    )
     try:
         sess = db.find_session(args.id_or_slug)
         if not sess:
@@ -441,6 +450,18 @@ def cmd_resume(args: argparse.Namespace) -> int:
         print("Resume command:", " ".join(cmd))
         if not args.dry_run:
             cwd = Path(str(wt_str)) if wt_str and Path(str(wt_str)).exists() else cfg.hq_dir
+            trust_dirs: List[Path] = [cwd, cfg.hq_dir]
+            if repo_name:
+                trust_dirs.append(cfg.get_repo_path(str(repo_name)))
+            trust_res = adapter.ensure_project_trusted(
+                trust_dirs,
+                auto_trust=cfg.agent.auto_trust_project,
+            )
+            if trust_res.supported and not trust_res.auto_trust and trust_res.manual_snippet:
+                print(
+                    f"[herdr-bot] agent.auto_trust_project=false; add the following to "
+                    f"{trust_res.config_path}:\n{trust_res.manual_snippet}"
+                )
             os.chdir(cwd)
             os.execvp(cmd[0], cmd)
         return 0

@@ -1,7 +1,7 @@
 # herdr-bot
 
-**把 Anthropic 的长期记忆（Auto-Dream）与常驻 Agent 架构，跑在原生的 [Herdr](https://herdr.dev) + Antigravity CLI (`agy`) 终端上。**  
-*An open-source implementation of Anthropic's [The components of agent memory](https://www.anthropic.com/research/components-of-agent-memory) and [Building always-on agents](https://claude.com/resources/articles/building-always-on-agents/), running natively on [Herdr](https://herdr.dev) + Antigravity CLI (`agy`).*
+**把 Anthropic 的长期记忆（Auto-Dream）与常驻 Agent 架构，跑在原生的 [Herdr](https://herdr.dev) + Coding Agent CLI（`agy` / `codex` / 自定义适配器）终端上。**  
+*An open-source implementation of Anthropic's [The components of agent memory](https://www.anthropic.com/research/components-of-agent-memory) and [Building always-on agents](https://claude.com/resources/articles/building-always-on-agents/), running natively on [Herdr](https://herdr.dev) with pluggable Coding Agent CLIs (`agy`, `codex`, or custom adapters).*
 
 ---
 
@@ -108,6 +108,43 @@ herdr-bot setup --non-interactive \
 | `herdr-bot timer set / list / cancel` | 管理一次性或周期性自主跟进闹钟 |
 | `herdr-bot config list / set <key> <val>` | 热调整换新阈值、免打扰时段等调优参数 |
 | `herdr-bot guard / doctor --hq-dir <dir>` | 校验记忆体积边界 / 自检本机运行环境 |
+
+---
+
+## 支持的 Agent（`agy` / `codex` / 自定义接入）
+
+`herdr-bot` 通过开放的 `CodingAgentAdapter` 适配层支持多种 Coding Agent CLI，默认使用 `agy`，也可切换为 OpenAI Codex CLI 或接入自定义适配器：
+
+- **Antigravity CLI（`agent.backend: agy`，默认）**：开箱支持交互式会话、生命周期 Hook（`.agents/hooks.json`）与增量 transcript 同步。
+- **OpenAI Codex CLI（`agent.backend: codex`）**：详见下方「使用 Codex CLI」小节。
+- **自定义 Agent 接入**：无需改动核心代码，继承 `CodingAgentAdapter` 后可通过 `hq.yaml` 中的 `agent.backend: "your_pkg.adapter:YourAdapter"` 动态加载，或使用 `@register_agent_adapter("name")` 注册。详见 [docs/agent-adapters.md](docs/agent-adapters.md)。
+
+### 使用 Codex CLI
+
+1. **前置条件**：本机已安装并登录 Codex CLI（运行 `codex --version` 确认，推荐 `0.163+`），并已安装 `herdr`。
+2. **启用方式**：
+   - 新建工作区并直接启用 `codex` 后端：
+     ```bash
+     ./install.sh --agent codex
+     herdr-bot setup --agent-backend codex --hq-dir ~/herdr-hq
+     ```
+   - 或在现有 `hq.yaml` 中将 `agent.backend` 改为 `codex`；若 `codex` 不在默认 `PATH` 中，可传 `herdr-bot setup --agent-backend codex --agent-bin /path/to/codex` 或在 `.hq/local.yaml` 中设置 `bin_overrides.codex`。
+3. **自动信任与 Hook 信任跳过（及风险提示）**：
+   - Codex 0.163+ 仅在 `$CODEX_HOME/config.toml`（未设 `CODEX_HOME` 时为 `~/.codex/config.toml`）中存在 `[projects."<abs>"] trust_level = "trusted"` 时才会加载项目级 `.codex/hooks.json`，且子目录与独立 Git Worktree 不继承父目录信任。
+   - 默认 `agent.auto_trust_project: true`：`herdr-bot setup` 及 daemon 在拉起会话 / 创建 worktree 前，会自动且幂等地将 `$HQ_DIR`、托管仓库与 worktree 根写入 `$CODEX_HOME/config.toml`（仅在实际改动前创建 `config.toml.bak-herdr-<时间戳>` 备份，不改动或重排原有配置与注释，原子写入并校验 TOML 合法性）。
+   - 启动会话时 `CodexAdapter` 会自动附带 `--dangerously-bypass-hook-trust`，使 `herdr-bot` 自动写入的项目级 `.codex/hooks.json` 得以免交互触发；在 `#Topic` 独立 Git Worktree 场景下，为适配 Codex 0.163 的 worktree Hook 查找机制，`herdr-bot` 会同时合并写入 worktree 与其主仓的 `.codex/hooks.json`，并将未跟踪的 `/.codex/hooks.json` 幂等加入 `<git-common-dir>/info/exclude` 以免弄脏 `git status`（若主仓直接手动运行 `codex`，`hq-agent-hook` 会安全忽略外部目录，不会误绑定或误推消息）。
+   - **风险提示与手动模式**：自动信任与跳过 Hook 校验意味着上述托管目录中的项目级 `.codex/hooks.json` 会在无人值守下自动执行；如不希望自动修改 `config.toml`，可在 `hq.yaml` 中设 `agent.auto_trust_project: false`（或 `setup --no-auto-trust-project`），此时仅打印需手动粘贴的 TOML 片段。
+4. **权限模式映射**（`hq.yaml` 中 `agent.permission_mode`）：
+
+   | `agent.permission_mode` | 传入 `codex` 的参数 | 行为说明 |
+   | --- | --- | --- |
+   | `default`（默认） | *(无额外权限参数)* | 沿用 `~/.codex/config.toml` 默认策略 |
+   | `accept-edits` | `-s workspace-write -a on-request` | 工作区可写，按需请求审批 |
+   | `turbo` / `always-proceed` | `-s workspace-write -a never` | 工作区可写且免确认（适合飞书无人值守） |
+   | `skip-all` | `--dangerously-bypass-approvals-and-sandbox` | 跳过全部审批与沙箱（仅限受控隔离环境） |
+
+5. **切回 `agy`**：将 `hq.yaml` 中的 `agent.backend` 改回 `agy`（或运行 `herdr-bot setup --agent-backend agy --hq-dir ~/herdr-hq`），然后重启 `herdr-bot` 服务即可。
+6. **接入其他 Agent CLI**：参见 [docs/agent-adapters.md](docs/agent-adapters.md)。
 
 ---
 

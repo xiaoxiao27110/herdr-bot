@@ -11,22 +11,31 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+from hq_pilot.agents.base import CodingAgentAdapter
 from hq_pilot.agents.registry import get_agent_adapter
 from hq_pilot.channels.base import MessagingChannel
 from hq_pilot.channels.registry import get_channel
-from hq_pilot.config import load_config, load_secrets_env
+from hq_pilot.config import HQConfig, load_config, load_secrets_env
 from hq_pilot.db import HQDatabase
 from hq_pilot.gatekeeper import detect_manual_touch
 
 
-def _discover_hq_dir(explicit: Optional[str], payload: Dict[str, Any]) -> Optional[Path]:
+def _discover_hq_dir(
+    explicit: Optional[str],
+    payload: Dict[str, Any],
+    cwd_hint: Optional[str] = None,
+) -> Optional[Path]:
     if explicit:
         return Path(explicit).expanduser().resolve()
     env_dir = os.environ.get("HQ_DIR")
     if env_dir:
         return Path(env_dir).expanduser().resolve()
-    cwd_str = payload.get("cwd") or payload.get("workspace")
-    if not cwd_str and isinstance(payload.get("workspacePaths"), list) and payload["workspacePaths"]:
+    cwd_str = cwd_hint or payload.get("cwd") or payload.get("workspace")
+    if (
+        not cwd_str
+        and isinstance(payload.get("workspacePaths"), list)
+        and payload["workspacePaths"]
+    ):
         cwd_str = payload["workspacePaths"][0]
     if cwd_str:
         cur = Path(str(cwd_str)).resolve()
@@ -36,12 +45,15 @@ def _discover_hq_dir(explicit: Optional[str], payload: Dict[str, Any]) -> Option
     return None
 
 
-def _hook_stdout_response(
-    event_type: str, inject_steps: Optional[List[Dict[str, Any]]] = None
-) -> Dict[str, Any]:
-    if event_type == "Stop":
-        return {"decision": "allow_stop"}
-    return {"injectSteps": list(inject_steps or [])}
+def _resolve_adapter(
+    agent_name: Optional[str],
+    cfg: Optional[HQConfig] = None,
+) -> CodingAgentAdapter:
+    backend = (agent_name or "").strip()
+    if not backend:
+        backend = (cfg.agent.backend if cfg is not None else "agy") or "agy"
+    bin_override = cfg.get_agent_bin_override(backend) if cfg is not None else None
+    return get_agent_adapter(backend, bin_path=bin_override)
 
 
 _USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", flags=re.DOTALL)
@@ -55,7 +67,7 @@ def _extract_user_request_text(raw: str) -> str:
     return text.strip()
 
 
-def _transcript_has_user_input(adapter: Any, tpath: str) -> bool:
+def _transcript_has_user_input(adapter: CodingAgentAdapter, tpath: str) -> bool:
     if not tpath:
         return False
     p = Path(tpath)
@@ -66,38 +78,47 @@ def _transcript_has_user_input(adapter: Any, tpath: str) -> bool:
 
 
 def handle_hook_event(
-    agent_name: str,
+    agent_name: Optional[str],
     payload: Dict[str, Any],
     hq_dir: Optional[str | Path] = None,
     channel: Optional[MessagingChannel] = None,
     now: Optional[int] = None,
 ) -> Dict[str, Any]:
     ts = int(now if now is not None else time.time())
-    event_type = str(
-        payload.get("hookEventName")
-        or payload.get("hook_event_name")
-        or payload.get("event")
-        or payload.get("type")
-        or ""
+    raw_payload = payload if isinstance(payload, dict) else {}
+
+    root = _discover_hq_dir(str(hq_dir) if hq_dir else None, raw_payload)
+    cfg: Optional[HQConfig] = (
+        load_config(root) if (root is not None and (root / "hq.yaml").exists()) else None
     )
-    root = _discover_hq_dir(str(hq_dir) if hq_dir else None, payload)
-    if root is None or not (root / "hq.yaml").exists():
-        return {"status": "ignored", "reason": "no_hq_dir", "event": event_type}
+    adapter = _resolve_adapter(agent_name, cfg=cfg)
+    event = adapter.parse_hook_payload(raw_payload)
+
+    if cfg is None and event.cwd:
+        root = _discover_hq_dir(None, raw_payload, cwd_hint=event.cwd)
+        if root is not None and (root / "hq.yaml").exists():
+            cfg = load_config(root)
+            if not (agent_name or "").strip():
+                adapter = _resolve_adapter(None, cfg=cfg)
+                event = adapter.parse_hook_payload(raw_payload)
+
+    if root is None or cfg is None:
+        return {
+            "status": "ignored",
+            "reason": "no_hq_dir",
+            "event": event.raw_event_name,
+        }
 
     if os.environ.get("HQ_EPHEMERAL") == "1":
-        if event_type != "Stop":
+        if event.kind != "stop":
             return {
                 "status": "ignored",
                 "reason": "ephemeral_bg_worker",
-                "event": event_type,
+                "event": event.raw_event_name,
             }
         reply_key = os.environ.get("HQ_EPHEMERAL_REPLY_KEY", "").strip()
-        transcript_path = str(
-            payload.get("transcriptPath") or payload.get("transcript_path") or ""
-        )
+        transcript_path = event.transcript_path
         if reply_key and transcript_path and Path(transcript_path).exists():
-            cfg = load_config(root)
-            adapter = get_agent_adapter(agent_name)
             turns, _ = adapter.read_transcript_slice(transcript_path, from_line=0)
             assistant_msgs = [
                 t.text for t in turns if t.role == "assistant" and t.text.strip()
@@ -110,30 +131,16 @@ def handle_hook_event(
                     db.close()
         return {
             "status": "ok",
-            "event": "Stop",
+            "event": event.raw_event_name or "Stop",
             "ephemeral": True,
             "reply_pushed": False,
         }
 
-    cfg = load_config(root)
     db = HQDatabase(cfg.hq_dir / ".hq" / "runtime.sqlite")
-    adapter = get_agent_adapter(agent_name)
     try:
-        agent_sid = str(
-            payload.get("conversationId")
-            or payload.get("conversation_id")
-            or payload.get("session_id")
-            or ""
-        )
-        transcript_path = str(
-            payload.get("transcriptPath") or payload.get("transcript_path") or ""
-        )
-        user_prompt = (
-            payload.get("lastUserInput")
-            or payload.get("prompt")
-            or payload.get("user_prompt")
-            or payload.get("input")
-        )
+        agent_sid = event.agent_session_id
+        transcript_path = event.transcript_path
+        user_prompt = event.user_prompt
 
         sess = None
         env_session_key = os.environ.get("HQ_SESSION_KEY", "").strip()
@@ -199,7 +206,7 @@ def handle_hook_event(
                 return {
                     "status": "ignored",
                     "reason": "subagent_session_mismatch",
-                    "event": event_type,
+                    "event": event.raw_event_name,
                 }
         if sess is None and agent_sid:
             sess = db.get_session_by_agent_id(agent_sid)
@@ -214,14 +221,14 @@ def handle_hook_event(
             return {
                 "status": "ignored",
                 "reason": "manual_pane_subagent",
-                "event": event_type,
+                "event": event.raw_event_name,
             }
         if sess is None and agent_sid:
             # Local direct session started outside daemon -> default pinned!
             sess = db.create_session(
                 session_key=f"local:{agent_sid}",
                 track="LOCAL",
-                agent_backend=agent_name,
+                agent_backend=adapter.name,
                 status="pinned",
                 pinned=True,
                 pinned_reason="local_direct",
@@ -231,7 +238,11 @@ def handle_hook_event(
             )
 
         if sess is None:
-            return {"status": "ignored", "reason": "no_session", "event": event_type}
+            return {
+                "status": "ignored",
+                "reason": "no_session",
+                "event": event.raw_event_name,
+            }
 
         skey = str(sess["session_key"])
         updates: Dict[str, Any] = {"last_active_at": ts}
@@ -246,10 +257,10 @@ def handle_hook_event(
         if is_manual_herdr and str(sess.get("track") or "") not in {"GENERAL", "B"}:
             effective_tpath = transcript_path or str(sess.get("transcript_path") or "")
             is_confirmed_top_level = (
-                (event_type in {"PreInvocation", "UserPromptSubmit"} and has_user_prompt)
-                or (event_type == "Stop" and _has_transcript_user(effective_tpath))
+                (event.kind == "user_prompt" and has_user_prompt)
+                or (event.kind == "stop" and _has_transcript_user(effective_tpath))
                 or (
-                    event_type == "SessionStart"
+                    event.kind == "session_start"
                     and (
                         existing_manual_binding is None
                         or not bound_cid
@@ -259,15 +270,8 @@ def handle_hook_event(
                 )
             )
             if is_confirmed_top_level:
-                raw_cwd = payload.get("cwd") or payload.get("workspace")
-                if (
-                    not raw_cwd
-                    and isinstance(payload.get("workspacePaths"), list)
-                    and payload["workspacePaths"]
-                ):
-                    raw_cwd = payload["workspacePaths"][0]
-                if raw_cwd:
-                    cwd_str = str(Path(str(raw_cwd)).expanduser().resolve())
+                if event.cwd:
+                    cwd_str = str(Path(str(event.cwd)).expanduser().resolve())
                 elif existing_manual_binding and existing_manual_binding.get("cwd"):
                     cwd_str = str(existing_manual_binding["cwd"])
                 else:
@@ -299,8 +303,8 @@ def handle_hook_event(
         pending_approval_cur = db.get_meta(f"pending_approval_reply:{skey}") == "1"
 
         pinned_reason = None
-        inject_steps: List[Dict[str, Any]] = []
-        if event_type in {"PreInvocation", "UserPromptSubmit", "SessionStart"} and user_prompt:
+        inject_messages: List[str] = []
+        if event.kind in {"user_prompt", "session_start"} and user_prompt:
             cleaned_prompt = _extract_user_request_text(str(user_prompt))
             pinned_reason = detect_manual_touch(
                 db,
@@ -308,20 +312,20 @@ def handle_hook_event(
                 input_text=cleaned_prompt,
                 now=ts,
             )
-            if event_type in {"PreInvocation", "UserPromptSubmit"}:
+            if event.kind == "user_prompt":
                 if pinned_reason == "manual_input":
                     db.set_meta(f"last_input_origin:{skey}", "local_tty", now=ts)
                     db.delete_meta(f"pending_approval_reply:{skey}")
                 elif daemon_waiting_cur or pending_approval_cur:
                     db.set_meta(f"last_input_origin:{skey}", "daemon", now=ts)
 
-        # Inject post-rotation handoff summary on local Herdr turn (SessionStart with user input or PreInvocation)
+        # Inject post-rotation handoff summary on local Herdr turn (session_start with user input or user_prompt)
         if (
             is_general_sess
-            and event_type in {"SessionStart", "PreInvocation"}
+            and event.kind in {"session_start", "user_prompt"}
             and not daemon_waiting_cur
             and db.get_meta("general_handoff_pending") == "1"
-            and (event_type == "PreInvocation" or bool(user_prompt))
+            and (event.kind == "user_prompt" or bool(user_prompt))
         ):
             handoff_text = (db.get_meta("general_handoff_summary") or "").strip()
             handoff_reason = (db.get_meta("general_handoff_reason") or "night").strip()
@@ -332,15 +336,9 @@ def handle_hook_event(
                     if handoff_reason in {"night", "1", ""}
                     else "[上一轮会话交接摘要]"
                 )
-                inject_steps.append(
-                    {
-                        "systemMessage": {
-                            "systemMessage": f"{header}\n{handoff_text}"
-                        }
-                    }
-                )
+                inject_messages.append(f"{header}\n{handoff_text}")
 
-        if event_type == "Stop":
+        if event.kind == "stop":
             tpath = transcript_path or sess.get("transcript_path")
             reply_pushed = False
             if tpath and Path(str(tpath)).exists():
@@ -451,14 +449,23 @@ def handle_hook_event(
             if not daemon_waiting_cur and pending_approval_cur:
                 db.delete_meta(f"pending_approval_reply:{skey}")
                 db.delete_meta(f"last_input_origin:{skey}")
-            return {"status": "ok", "event": "Stop", "session_key": skey, "reply_pushed": reply_pushed}
+            return {
+                "status": "ok",
+                "event": event.raw_event_name or "Stop",
+                "session_key": skey,
+                "reply_pushed": reply_pushed,
+            }
 
+        hook_response = adapter.render_hook_response(event, inject_messages)
         return {
             "status": "ok",
-            "event": event_type,
+            "event": event.raw_event_name,
+            "event_kind": event.kind,
             "session_key": skey,
             "pinned_reason": pinned_reason,
-            "inject_steps": inject_steps,
+            "inject_messages": inject_messages,
+            "inject_steps": list(hook_response.get("injectSteps", [])),
+            "hook_response": hook_response,
         }
     finally:
         db.close()
@@ -466,7 +473,11 @@ def handle_hook_event(
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="hq-agent-hook")
-    p.add_argument("--agent", default="agy")
+    p.add_argument(
+        "--agent",
+        default=None,
+        help="Coding agent backend name (defaults to hq.yaml agent.backend, or 'agy')",
+    )
     p.add_argument("--hq-dir", default=None)
     args = p.parse_args(argv)
 
@@ -481,14 +492,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             payload = {}
 
     result = handle_hook_event(args.agent, payload, hq_dir=args.hq_dir)
-    event_type = str(
-        result.get("event")
-        or payload.get("hookEventName")
-        or payload.get("hook_event_name")
-        or ""
-    )
-    inject_steps = result.get("inject_steps") if isinstance(result, dict) else None
-    print(json.dumps(_hook_stdout_response(event_type, inject_steps=inject_steps), ensure_ascii=False))
+    response = result.get("hook_response") if isinstance(result, dict) else None
+    if not isinstance(response, dict):
+        root = _discover_hq_dir(args.hq_dir, payload)
+        cfg = (
+            load_config(root) if (root is not None and (root / "hq.yaml").exists()) else None
+        )
+        adapter = _resolve_adapter(args.agent, cfg=cfg)
+        event = adapter.parse_hook_payload(payload)
+        inject_messages = (
+            result.get("inject_messages") if isinstance(result, dict) else None
+        )
+        response = adapter.render_hook_response(event, inject_messages)
+
+    print(json.dumps(response, ensure_ascii=False))
     return 0
 
 

@@ -11,7 +11,9 @@ import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import yaml
 
-from hq_pilot.config import TuningConfig, _read_yaml_file, load_secrets_env
+from hq_pilot.agents.base import detect_executable_bin
+from hq_pilot.agents.registry import get_agent_adapter, list_agent_backends
+from hq_pilot.config import TuningConfig, _parse_bool, _read_yaml_file, load_secrets_env
 from hq_pilot.guards import run_memory_guard
 
 InputFn = Callable[[str], str]
@@ -22,21 +24,11 @@ def _detect_executable(
     explicit: str = "",
     existing_override: str = "",
 ) -> str:
-    for candidate in (explicit, existing_override):
-        if candidate:
-            p = Path(candidate).expanduser()
-            if p.is_file() and os.access(p, os.X_OK):
-                return str(p.resolve())
-            found = shutil.which(candidate)
-            if found:
-                return str(Path(found).resolve())
-    which_hit = shutil.which(name)
-    if which_hit:
-        return str(Path(which_hit).resolve())
-    local_bin = Path.home() / ".local" / "bin" / name
-    if local_bin.is_file() and os.access(local_bin, os.X_OK):
-        return str(local_bin.resolve())
-    return ""
+    return detect_executable_bin(
+        name,
+        explicit=explicit,
+        existing_override=existing_override,
+    )
 
 
 def inspect_git_repo(repo_path: Path) -> Tuple[str, str]:
@@ -270,12 +262,27 @@ def run_setup(
         existing_hq.get("tuning") if isinstance(existing_hq.get("tuning"), dict) else None
     )
 
+    agent_backend = (
+        (getattr(args, "agent_backend", None) or "").strip()
+        or str(agent_block.get("backend") or "agy").strip()
+        or "agy"
+    )
+    adapter = get_agent_adapter(agent_backend)
+    agent_desc = adapter.describe()
+    agent_tool_name = str(agent_desc.get("name") or agent_backend).strip()
+    default_index_file = str(agent_desc.get("index_filename") or "AGENTS.md")
+
+    if getattr(args, "no_auto_trust_project", False):
+        auto_trust_project = False
+    else:
+        auto_trust_project = _parse_bool(agent_block.get("auto_trust_project"), default=True)
+
     hq_yaml_obj: Dict[str, Any] = {
         "version": int(existing_hq.get("version", 1)),
         "project_name": project_name,
         "agent": {
-            "backend": str(agent_block.get("backend", "agy")),
-            "index_file": str(agent_block.get("index_file", "AGENTS.md")),
+            "backend": agent_backend,
+            "index_file": str(agent_block.get("index_file") or default_index_file),
             "default_effort": str(agent_block.get("default_effort", "high")),
             "light_effort": str(agent_block.get("light_effort", "low")),
             **(
@@ -283,6 +290,12 @@ def run_setup(
                 if agent_block.get("model") is not None
                 else {}
             ),
+            **(
+                {"permission_mode": agent_block["permission_mode"]}
+                if agent_block.get("permission_mode") is not None
+                else {}
+            ),
+            "auto_trust_project": auto_trust_project,
         },
         "terminal": {
             "backend": str(term_block.get("backend", "auto")),
@@ -378,10 +391,18 @@ def run_setup(
     )
     python_bin = str(Path(python_bin).expanduser().resolve())
 
-    agy_bin = _detect_executable(
-        "agy",
-        explicit=getattr(args, "agy_bin", ""),
-        existing_override=str(existing_local.get("agy_bin") or existing_overrides.get("agy") or ""),
+    explicit_agent_bin = (
+        getattr(args, "agent_bin", "") or getattr(args, "agy_bin", "")
+    ).strip()
+    existing_agent_override = str(
+        existing_overrides.get(agent_backend)
+        or existing_overrides.get(agent_tool_name)
+        or existing_local.get(f"{agent_tool_name}_bin")
+        or ""
+    )
+    agent_bin = adapter.detect_bin(
+        explicit=explicit_agent_bin,
+        existing_override=existing_agent_override,
     )
     herdr_bin = _detect_executable(
         "herdr",
@@ -397,16 +418,18 @@ def run_setup(
     bin_overrides_out: Dict[str, str] = {
         str(k): str(v) for k, v in existing_overrides.items() if v
     }
-    if agy_bin:
-        bin_overrides_out["agy"] = agy_bin
+    if agent_bin:
+        bin_overrides_out[agent_backend] = agent_bin
+        if agent_tool_name and agent_tool_name != agent_backend:
+            bin_overrides_out[agent_tool_name] = agent_bin
     if herdr_bin:
         bin_overrides_out["herdr"] = herdr_bin
 
     local_yaml_obj: Dict[str, Any] = {
         "python_bin": python_bin,
     }
-    if agy_bin:
-        local_yaml_obj["agy_bin"] = agy_bin
+    if agent_bin and ":" not in agent_tool_name and agent_tool_name.replace("-", "_").isidentifier():
+        local_yaml_obj[f"{agent_tool_name}_bin"] = agent_bin
     if herdr_bin:
         local_yaml_obj["herdr_bin"] = herdr_bin
     local_yaml_obj["repo_paths"] = repo_paths_out
@@ -458,10 +481,35 @@ def run_setup(
         for v in guard_res.violations:
             print(f"[WARN] memory_guard: {v}", file=sys.stderr)
 
+    trust_dirs: List[Path] = [hq_dir]
+    for info in repo_meta.values():
+        if info.get("path"):
+            trust_dirs.append(Path(str(info["path"])))
+    trust_res = adapter.ensure_project_trusted(
+        trust_dirs,
+        auto_trust=auto_trust_project,
+    )
+
     print(f"Configured herdr-bot workspace at {hq_dir}")
-    print(f"  - Config:  {hq_dir / 'hq.yaml'} (channel={channel}, repos={len(repo_meta)})")
-    print(f"  - Local:   {local_yaml_path} (python={python_bin}, agy={agy_bin or 'NOT FOUND'}, herdr={herdr_bin or 'NOT FOUND'})")
+    print(f"  - Config:  {hq_dir / 'hq.yaml'} (agent={agent_backend}, channel={channel}, repos={len(repo_meta)})")
+    print(f"  - Local:   {local_yaml_path} (python={python_bin}, {agent_tool_name}={agent_bin or 'NOT FOUND'}, herdr={herdr_bin or 'NOT FOUND'})")
     print(f"  - Secrets: {secrets_path} (mode 0600)")
+    if trust_res.supported and trust_res.config_path is not None:
+        if trust_res.auto_trust:
+            if trust_res.changed:
+                touched = len(trust_res.added) + len(trust_res.updated)
+                detail = "created" if trust_res.created else f"backup={trust_res.backup_path}"
+                print(f"  - Trust:   {trust_res.config_path} (trusted {touched} project(s), {detail})")
+            else:
+                print(f"  - Trust:   {trust_res.config_path} (already trusted)")
+        elif trust_res.manual_snippet:
+            print(
+                f"  - Trust:   skipped (agent.auto_trust_project=false). "
+                f"Add the following to {trust_res.config_path}:"
+            )
+            print(trust_res.manual_snippet)
+        else:
+            print(f"  - Trust:   {trust_res.config_path} (already trusted)")
     print("\nNext steps:")
     print(f"  1. Start the orchestrator daemon:\n     herdr-bot up --hq-dir {hq_dir}")
     print("  2. Attach to live interactive agent panes anytime:\n     herdr")
@@ -494,9 +542,31 @@ def register_setup_subparser(sub: argparse._SubParsersAction) -> None:  # type: 
     sp.add_argument("--feishu-chat-id", default="", help="Feishu allowed chat_id (e.g. oc_xxx)")
     sp.add_argument("--telegram-bot-token", default="", help="Telegram Bot Token")
     sp.add_argument("--telegram-chat-id", default="", help="Telegram allowed chat_id")
+    sp.add_argument(
+        "--agent-backend",
+        default=None,
+        help=(
+            "Coding agent backend name "
+            f"(built-in: {', '.join(list_agent_backends())}; or 'module.path:ClassName')"
+        ),
+    )
+    sp.add_argument(
+        "--agent-bin",
+        default="",
+        help="Override the selected coding agent binary path in .hq/local.yaml",
+    )
     sp.add_argument("--python-bin", default="", help="Override python_bin in .hq/local.yaml")
-    sp.add_argument("--agy-bin", default="", help="Override agy_bin in .hq/local.yaml")
+    sp.add_argument(
+        "--agy-bin",
+        default="",
+        help="Deprecated alias for --agent-bin (override agy binary in .hq/local.yaml)",
+    )
     sp.add_argument("--herdr-bin", default="", help="Override herdr_bin in .hq/local.yaml")
+    sp.add_argument(
+        "--no-auto-trust-project",
+        action="store_true",
+        help="Disable automatic project trust writes to $CODEX_HOME/config.toml and print TOML snippet instead",
+    )
     sp.add_argument(
         "--non-interactive",
         action="store_true",

@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
-from hq_pilot.agents.base import CodingAgentAdapter, HeadlessResult, Turn
+from hq_pilot.agents.base import (
+    CodingAgentAdapter,
+    HeadlessResult,
+    HookEvent,
+    HookEventKind,
+    Turn,
+)
 
 
 def _extract_text(raw: Any) -> str:
@@ -74,6 +80,7 @@ def _parse_transcript_line(obj: Dict[str, Any], line_no: int) -> Optional[Turn]:
 
 class AgyAdapter(CodingAgentAdapter):
     name = "agy"
+    default_bin = "agy"
     index_filename = "AGENTS.md"
 
     def __init__(self, bin_path: str = "agy") -> None:
@@ -251,3 +258,79 @@ class AgyAdapter(CodingAgentAdapter):
             encoding="utf-8",
         )
         return hooks_file
+
+    def parse_hook_payload(self, payload: Dict[str, Any]) -> HookEvent:
+        data = payload if isinstance(payload, dict) else {}
+        raw_name = str(
+            data.get("hookEventName")
+            or data.get("hook_event_name")
+            or data.get("event")
+            or data.get("type")
+            or ""
+        )
+        kind: HookEventKind
+        if raw_name == "SessionStart":
+            kind = "session_start"
+        elif raw_name == "PreInvocation":
+            kind = "user_prompt"
+        elif raw_name == "Stop":
+            kind = "stop"
+        else:
+            kind = "other"
+
+        agent_sid = str(
+            data.get("conversationId")
+            or data.get("conversation_id")
+            or data.get("session_id")
+            or ""
+        )
+        transcript_path = str(
+            data.get("transcriptPath") or data.get("transcript_path") or ""
+        )
+        raw_prompt = (
+            data.get("lastUserInput")
+            if data.get("lastUserInput") is not None
+            else (
+                data.get("prompt")
+                if data.get("prompt") is not None
+                else (
+                    data.get("user_prompt")
+                    if data.get("user_prompt") is not None
+                    else data.get("input")
+                )
+            )
+        )
+        user_prompt = str(raw_prompt) if raw_prompt is not None else None
+
+        cwd_val = data.get("cwd") or data.get("workspace")
+        if (
+            not cwd_val
+            and isinstance(data.get("workspacePaths"), list)
+            and data["workspacePaths"]
+        ):
+            cwd_val = data["workspacePaths"][0]
+        cwd = str(cwd_val) if cwd_val else None
+
+        return HookEvent(
+            kind=kind,
+            raw_event_name=raw_name,
+            agent_session_id=agent_sid,
+            transcript_path=transcript_path,
+            user_prompt=user_prompt,
+            cwd=cwd,
+            raw=dict(data),
+        )
+
+    def render_hook_response(
+        self,
+        event: HookEvent,
+        inject_messages: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        if event.kind == "stop":
+            return {"decision": "allow_stop"}
+        steps = [
+            {"systemMessage": {"systemMessage": str(msg)}}
+            for msg in (inject_messages or [])
+            if str(msg)
+        ]
+        return {"injectSteps": steps}

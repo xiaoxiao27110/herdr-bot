@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import json
 import os
 import re
@@ -13,7 +13,7 @@ import signal
 import subprocess
 import time
 
-from hq_pilot.agents.base import CodingAgentAdapter
+from hq_pilot.agents.base import CodingAgentAdapter, ProjectTrustResult
 from hq_pilot.agents.registry import get_agent_adapter
 from hq_pilot.archiver import ArchiveReport, archive_eligible_sessions
 from hq_pilot.channels.base import InboundMessage, InlineButton, MessagingChannel
@@ -345,7 +345,7 @@ class HQDaemon:
 
         self.agent_adapter: CodingAgentAdapter = agent_adapter or get_agent_adapter(
             self.config.agent.backend,
-            bin_path=self.config.local.bin_overrides.get(self.config.agent.backend),
+            bin_path=self.config.get_agent_bin_override(),
         )
         self.terminal_driver: TerminalDriver = terminal_driver or get_terminal_driver(
             self.config.terminal.backend,
@@ -366,6 +366,7 @@ class HQDaemon:
         self._stop_requested = False
         self._ephemeral_panes_used: Set[str] = set()
         self._seen_live_manual_panes: Set[str] = set()
+        self._printed_manual_trust_keys: Set[Tuple[str, Tuple[str, ...]]] = set()
         self.last_digest_text: str = ""
 
     def close(self) -> None:
@@ -376,6 +377,36 @@ class HQDaemon:
             "hq-agent-hook",
             str(Path(__file__).resolve().parent.parent / "bin" / "hq-agent-hook"),
         )
+
+    def _ensure_agent_project_trust(
+        self,
+        dirs: Sequence[str | Path],
+    ) -> ProjectTrustResult:
+        """Persist project trust (or print manual TOML snippet) before launching agent."""
+        res = self.agent_adapter.ensure_project_trusted(
+            dirs,
+            auto_trust=self.config.agent.auto_trust_project,
+        )
+        if not res.supported:
+            return res
+        if res.auto_trust:
+            if res.changed:
+                touched = [*res.added, *res.updated]
+                print(
+                    f"[hq-daemon] auto-trusted project(s) in {res.config_path}: "
+                    f"{', '.join(touched)}",
+                    flush=True,
+                )
+        elif res.manual_snippet:
+            dedupe_key = (str(res.config_path or ""), tuple(res.pending_manual))
+            if dedupe_key not in self._printed_manual_trust_keys:
+                self._printed_manual_trust_keys.add(dedupe_key)
+                print(
+                    f"[hq-daemon] agent.auto_trust_project=false; add the following to "
+                    f"{res.config_path} so project hooks can load:\n{res.manual_snippet}",
+                    flush=True,
+                )
+        return res
 
     # ------------------------------------------------------------------
     # Channel Inbound Handling
@@ -700,6 +731,7 @@ class HQDaemon:
             if prompt
             else ""
         )
+        self._ensure_agent_project_trust([wt_path, self.hq_dir, repo_path])
         self.agent_adapter.ensure_hooks_installed(wt_path, self._hook_bin_path())
         self.db.record_dispatch(skey, None, delivery_prompt, now=ts)
         self.db.set_meta(f"last_input_origin:{skey}", "daemon", now=ts)
@@ -1128,7 +1160,6 @@ class HQDaemon:
                     )
                     git_worktree_add(rpath, cwd, str(fresh["branch_name"]), base_branch=base_br)
             cwd.mkdir(parents=True, exist_ok=True)
-            self.agent_adapter.ensure_hooks_installed(cwd, self._hook_bin_path())
             add_dirs = (
                 [
                     self.config.get_repo_path(r)
@@ -1138,6 +1169,11 @@ class HQDaemon:
                 if cwd.resolve() == self.hq_dir.resolve()
                 else None
             )
+            trust_targets: List[Path] = [cwd, self.hq_dir, *(add_dirs or [])]
+            if fresh.get("repo_name"):
+                trust_targets.append(self.config.get_repo_path(str(fresh["repo_name"])))
+            self._ensure_agent_project_trust(trust_targets)
+            self.agent_adapter.ensure_hooks_installed(cwd, self._hook_bin_path())
             interactive_cmd = self.agent_adapter.build_interactive_cmd(
                 initial_prompt=None,
                 session_id=fresh.get("agent_session_id"),
@@ -1276,6 +1312,7 @@ class HQDaemon:
                 if cwd_path == self.hq_dir.resolve()
                 else None
             )
+            self._ensure_agent_project_trust([cwd_path, self.hq_dir, *(add_dirs or [])])
             interactive_cmd = self.agent_adapter.build_interactive_cmd(
                 initial_prompt=None,
                 session_id=conversation_id,
@@ -1435,12 +1472,13 @@ class HQDaemon:
         delivery_prompt = self._materialize_long_prompt(prompt, tag=tag, now=now)
 
         self.hq_dir.mkdir(parents=True, exist_ok=True)
-        self.agent_adapter.ensure_hooks_installed(self.hq_dir, self._hook_bin_path())
         repo_paths = [
             self.config.get_repo_path(r)
             for r in sorted(self.config.repos.keys())
             if self.config.get_repo_path(r).exists()
         ]
+        self._ensure_agent_project_trust([self.hq_dir, *repo_paths])
+        self.agent_adapter.ensure_hooks_installed(self.hq_dir, self._hook_bin_path())
         interactive_cmd = self.agent_adapter.build_interactive_cmd(
             initial_prompt=None,
             model=self.config.agent.model,

@@ -4,15 +4,17 @@ set -eu
 
 ASSUME_YES=0
 PYTHON_ARG=""
+AGENT_ARG=""
 
 usage() {
     cat <<'EOF'
-Usage: ./install.sh [--yes] [--python <path>]
+Usage: ./install.sh [--yes] [--python <path>] [--agent <backend>]
 
 Options:
-  --yes, -y         Non-interactive mode (auto-confirm optional installs)
-  --python <path>   Explicit Python 3.10+ interpreter path
-  --help, -h        Show this help message
+  --yes, -y           Non-interactive mode (auto-confirm optional installs)
+  --python <path>     Explicit Python 3.10+ interpreter path
+  --agent <backend>   Coding agent CLI to check (e.g. agy, codex; default: auto-detect)
+  --help, -h          Show this help message
 EOF
 }
 
@@ -32,6 +34,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         --python=*)
             PYTHON_ARG="${1#*=}"
+            shift
+            ;;
+        --agent)
+            if [ "$#" -lt 2 ]; then
+                echo "Error: --agent requires a backend name argument." >&2
+                exit 1
+            fi
+            AGENT_ARG="$2"
+            shift 2
+            ;;
+        --agent=*)
+            AGENT_ARG="${1#*=}"
             shift
             ;;
         --help|-h)
@@ -74,15 +88,38 @@ if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) els
 fi
 echo "[ok] Python: $PYTHON_BIN"
 
-# 1. Check coding agent CLI (`agy`)
-if command -v agy >/dev/null 2>&1; then
-    echo "[ok] agy: $(command -v agy)"
-elif [ -x "${BIN_DIR}/agy" ]; then
-    echo "[ok] agy: ${BIN_DIR}/agy"
+# 1. Check coding agent CLI (supports agy, codex, or explicit --agent <backend>)
+check_agent_cli() {
+    agent_cli="$1"
+    if command -v "$agent_cli" >/dev/null 2>&1; then
+        echo "[ok] ${agent_cli}: $(command -v "$agent_cli")"
+        return 0
+    elif [ -x "${BIN_DIR}/${agent_cli}" ]; then
+        echo "[ok] ${agent_cli}: ${BIN_DIR}/${agent_cli}"
+        return 0
+    fi
+    return 1
+}
+
+if [ -n "$AGENT_ARG" ]; then
+    if ! check_agent_cli "$AGENT_ARG"; then
+        echo "[warn] ${AGENT_ARG} CLI not found in PATH."
+        echo "       Install '${AGENT_ARG}' and ensure it is in PATH,"
+        echo "       or specify --agent-backend ${AGENT_ARG} --agent-bin <path> during 'herdr-bot setup'."
+    fi
 else
-    echo "[warn] agy CLI not found in PATH."
-    echo "       Install your coding agent CLI (`agy`) and ensure it is in PATH,"
-    echo "       or specify --agy-bin during 'herdr-bot setup'."
+    FOUND_AGENT=0
+    if check_agent_cli agy; then
+        FOUND_AGENT=1
+    fi
+    if check_agent_cli codex; then
+        FOUND_AGENT=1
+    fi
+    if [ "$FOUND_AGENT" -eq 0 ]; then
+        echo "[warn] No supported coding agent CLI (agy / codex) found in PATH."
+        echo "       Install your coding agent CLI (agy or codex) and ensure it is in PATH,"
+        echo "       or specify --agent-backend <name> --agent-bin <path> during 'herdr-bot setup'."
+    fi
 fi
 
 # 2. Check Herdr terminal multiplexer (`herdr`)

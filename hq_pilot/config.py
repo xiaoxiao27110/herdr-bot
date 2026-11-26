@@ -107,6 +107,7 @@ class AgentConfig:
     light_effort: str = "low"
     model: Optional[str] = None
     permission_mode: str = "default"
+    auto_trust_project: bool = True
 
 
 @dataclass
@@ -176,6 +177,27 @@ class HQConfig:
             return Path(self.local.repo_paths[repo_name]).expanduser().resolve()
         return (self.hq_dir / ".hq" / "repos" / repo_name).resolve()
 
+    def get_agent_bin_override(
+        self,
+        backend: Optional[str] = None,
+        adapter_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve configured binary override for the active or given agent backend."""
+        candidates = [backend or self.agent.backend]
+        if adapter_name:
+            candidates.append(adapter_name)
+        candidates.append("agent")
+        for key in candidates:
+            if not key:
+                continue
+            stripped = str(key).strip()
+            if stripped in self.local.bin_overrides:
+                return self.local.bin_overrides[stripped]
+            lowered = stripped.lower()
+            if lowered in self.local.bin_overrides:
+                return self.local.bin_overrides[lowered]
+        return None
+
     def resolve_logical_path(self, logical_path: str) -> Path:
         """Resolve '<repo>:<relpath>' using .hq/local.yaml or default .hq/repos/<repo>."""
         if ":" not in logical_path:
@@ -211,6 +233,20 @@ class HQConfig:
         self.local = fresh.local
         self._mtimes = fresh._mtimes
         return True
+
+
+def _parse_bool(raw: Any, default: bool = True) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return bool(raw)
 
 
 def _read_yaml_file(path: Path) -> Dict[str, Any]:
@@ -259,6 +295,7 @@ def load_config(hq_dir: str | Path) -> HQConfig:
         light_effort=str(agent_raw.get("light_effort", "low")),
         model=agent_raw.get("model"),
         permission_mode=str(agent_raw.get("permission_mode", "default") or "default").strip(),
+        auto_trust_project=_parse_bool(agent_raw.get("auto_trust_project"), default=True),
     )
     term_cfg = TerminalConfig(backend=str(term_raw.get("backend", "auto")))
     chan_cfg = ChannelConfig(

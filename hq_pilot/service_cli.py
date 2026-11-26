@@ -12,6 +12,7 @@ import subprocess
 import sys
 from typing import Dict, List, Optional
 
+from hq_pilot.agents.registry import get_agent_adapter
 from hq_pilot.config import HQConfig, load_config
 
 
@@ -90,7 +91,20 @@ def build_service_path(
         str(Path(python_bin).parent),
         str(user_home / ".local" / "bin"),
     ]
-    for tool in ("herdr", cfg.agent.backend, "agy", "git", "tmux"):
+    agent_tools: List[str] = [cfg.agent.backend]
+    try:
+        adapter = get_agent_adapter(
+            cfg.agent.backend,
+            bin_path=cfg.get_agent_bin_override(),
+        )
+        desc = adapter.describe()
+        for t in (desc.get("name"), desc.get("default_bin")):
+            if t and str(t) not in agent_tools:
+                agent_tools.append(str(t))
+    except Exception:
+        pass
+
+    for tool in ("herdr", *agent_tools, "git", "tmux"):
         if not tool:
             continue
         tool_dir = _dir_of_executable(tool, cfg.local.bin_overrides)

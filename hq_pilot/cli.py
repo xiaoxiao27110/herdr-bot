@@ -30,6 +30,7 @@ from hq_pilot.config import (
 from hq_pilot.daemon import HQDaemon
 from hq_pilot.db import HQDatabase
 from hq_pilot.guards import run_memory_guard, run_oss_guard
+from hq_pilot.service_cli import register_service_subparser
 from hq_pilot.setup_cli import register_setup_subparser
 from hq_pilot.syncer import sync_hq_repo
 from hq_pilot.terminals.base import git_worktree_add
@@ -581,6 +582,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     register_setup_subparser(sub)
+    register_service_subparser(sub)
 
     sp_init = sub.add_parser("init", help="Initialize a new HQ memory repository")
     sp_init.add_argument("dir", nargs="?", default=".")

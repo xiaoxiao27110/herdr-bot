@@ -22,7 +22,7 @@ from hq_pilot.daemon import GENERAL_PANE_NAME, HQDaemon
 from hq_pilot.guards import run_memory_guard
 from hq_pilot.hook_cli import handle_hook_event
 from hq_pilot.prompt_builder import build_prompt
-from hq_pilot.terminals.base import AgentBlockedError
+from hq_pilot.terminals.base import AgentBlockedError, PaneInfo
 from hq_pilot.terminals.herdr import HerdrDriver
 from hq_pilot.terminals.tmux import TmuxDriver
 
@@ -2087,6 +2087,354 @@ class TestV2InteractionFlows(unittest.TestCase):
                 self.assertEqual(enq_fallback, ["gateway-svc"])
             finally:
                 db.close()
+
+    def test_herdr_list_panes_marks_agent_live_for_shell_vs_live_agent(self) -> None:
+        """Restored bare shell panes and exited agents must be marked agent_live=False; live agents True."""
+        def fake_run(self_drv, args, check=True):
+            if args == ["status", "--json"]:
+                return subprocess.CompletedProcess(
+                    args, 0, stdout=json.dumps({"server": {"running": True}}), stderr=""
+                )
+            if args == ["workspace", "list"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "result": {
+                                "workspaces": [
+                                    {"workspace_id": "w1", "label": "hq-general", "pane_count": 1, "agent_status": "unknown"},
+                                    {"workspace_id": "w2", "label": "hq-live", "pane_count": 1, "agent_status": "idle"},
+                                    {"workspace_id": "w3", "label": "hq-exited", "pane_count": 1, "agent_status": "exited"},
+                                ]
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            if args == ["agent", "list"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "result": {
+                                "agents": [
+                                    {
+                                        "name": "hq-live",
+                                        "agent": "agy",
+                                        "agent_status": "idle",
+                                        "pane_id": "w2:p1",
+                                        "workspace_id": "w2",
+                                        "cwd": "/tmp/hq",
+                                    },
+                                    {
+                                        "name": "hq-exited",
+                                        "agent": "agy",
+                                        "agent_status": "exited",
+                                        "pane_id": "w3:p1",
+                                        "workspace_id": "w3",
+                                        "cwd": "/tmp/hq",
+                                    },
+                                ]
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            if args == ["pane", "list"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "result": {
+                                "panes": [
+                                    {"workspace_id": "w1", "pane_id": "w1:p1", "agent_status": "unknown", "cwd": "/tmp/hq"},
+                                    {"workspace_id": "w2", "pane_id": "w2:p1", "agent_status": "idle", "cwd": "/tmp/hq"},
+                                    {"workspace_id": "w3", "pane_id": "w3:p1", "agent_status": "exited", "cwd": "/tmp/hq"},
+                                ]
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        drv = HerdrDriver(bin_path="herdr")
+        with patch.object(HerdrDriver, "_run", fake_run):
+            panes = drv.list_panes()
+
+        by_name = {p.name: p for p in panes}
+        self.assertIs(by_name["hq-general"].agent_live, False)
+        self.assertEqual(by_name["hq-general"].status, "unknown")
+        self.assertIs(by_name["hq-live"].agent_live, True)
+        self.assertEqual(by_name["hq-live"].status, "idle")
+        self.assertIs(by_name["hq-exited"].agent_live, False)
+        self.assertEqual(by_name["hq-exited"].status, "exited")
+
+    def test_herdr_start_agent_closes_only_single_pane_empty_shell_workspace(self) -> None:
+        """start_agent closes matching single-pane empty shell workspace before create, but never closes multi-pane or live-agent workspaces."""
+        calls = []
+
+        def make_fake_run(workspaces_payload, agents_payload):
+            def fake_run(self_drv, args, check=True):
+                calls.append(list(args))
+                if args == ["status", "--json"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, stdout=json.dumps({"server": {"running": True}}), stderr=""
+                    )
+                if args == ["agent", "list"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, stdout=json.dumps({"result": {"agents": agents_payload}}), stderr=""
+                    )
+                if args == ["workspace", "list"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, stdout=json.dumps({"result": {"workspaces": workspaces_payload}}), stderr=""
+                    )
+                if args[:2] == ["workspace", "close"]:
+                    return subprocess.CompletedProcess(args, 0, stdout='{"result":{}}', stderr="")
+                if args[:2] == ["workspace", "create"]:
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        stdout=json.dumps({"result": {"root_pane": {"pane_id": "w99:p1"}}}),
+                        stderr="",
+                    )
+                if args[:2] == ["agent", "start"]:
+                    return subprocess.CompletedProcess(args, 0, stdout='{"result":{}}', stderr="")
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return fake_run
+
+        drv = HerdrDriver(bin_path="herdr")
+
+        # Case 1: Single-pane empty shell `hq-general` (w1) + unrelated `work` (w2) -> close ONLY w1 before create
+        calls.clear()
+        ws_case1 = [
+            {"workspace_id": "w1", "label": "hq-general", "pane_count": 1, "tab_count": 1, "agent_status": "unknown"},
+            {"workspace_id": "w2", "label": "work", "pane_count": 1, "tab_count": 1, "agent_status": "unknown"},
+        ]
+        with patch.object(HerdrDriver, "_run", make_fake_run(ws_case1, [])), patch("hq_pilot.terminals.herdr.time.sleep"):
+            drv.start_agent(name="hq-general", cwd="/tmp/hq", kind="agy", agent_args=["--effort", "high"])
+
+        close_calls = [c for c in calls if c[:2] == ["workspace", "close"]]
+        create_idx = next(i for i, c in enumerate(calls) if c[:2] == ["workspace", "create"])
+        close_idx = next(i for i, c in enumerate(calls) if c == ["workspace", "close", "w1"])
+        self.assertEqual(close_calls, [["workspace", "close", "w1"]])
+        self.assertLess(close_idx, create_idx)
+
+        # Case 2: Multi-pane workspace (w3, pane_count=2) and live-agent workspace (w4) -> NEVER close either!
+        calls.clear()
+        ws_case2 = [
+            {"workspace_id": "w3", "label": "hq-general", "pane_count": 2, "tab_count": 1, "agent_status": "unknown"},
+            {"workspace_id": "w4", "label": "hq-general", "pane_count": 1, "tab_count": 1, "agent_status": "unknown"},
+            {"workspace_id": "w5", "label": "hq-general", "pane_count": 1, "tab_count": 1, "agent_status": "idle"},
+        ]
+        agents_case2 = [
+            {"name": "other-agent", "agent": "agy", "agent_status": "idle", "pane_id": "w4:p1", "workspace_id": "w4"},
+        ]
+        with patch.object(HerdrDriver, "_run", make_fake_run(ws_case2, agents_case2)), patch("hq_pilot.terminals.herdr.time.sleep"):
+            drv.start_agent(name="hq-general", cwd="/tmp/hq", kind="agy")
+
+        self.assertEqual([c for c in calls if c[:2] == ["workspace", "close"]], [])
+        self.assertEqual(len([c for c in calls if c[:2] == ["workspace", "create"]]), 1)
+
+    def test_daemon_recovers_empty_shell_pane_with_conversation_and_skips_live_pane(self) -> None:
+        """Daemon respawns hq-general with --conversation + add_dirs + turbo when agent_live=False, and reuses when agent_live=True."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "demo-hq"
+            hq_main(["init", str(hq_dir)])
+            repo_dir = Path(tmp) / "svc-alpha"
+            _init_git_repo(repo_dir)
+            (hq_dir / "hq.yaml").write_text(
+                "version: 1\n"
+                "project_name: demo-proj\n"
+                "agent:\n"
+                "  backend: agy\n"
+                "  permission_mode: turbo\n"
+                "repos:\n"
+                "  svc-alpha:\n"
+                "    git_url: ''\n"
+                "    default_branch: main\n",
+                encoding="utf-8",
+            )
+            (hq_dir / ".hq" / "local.yaml").write_text(
+                f"repo_paths:\n  svc-alpha: {repo_dir}\n",
+                encoding="utf-8",
+            )
+
+            term = StatusAwareTerminal()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=FakeChannel(),
+            )
+            try:
+                sess = daemon.db.create_session(
+                    "general:1",
+                    "GENERAL",
+                    "agy",
+                    status="active",
+                    pane_name=GENERAL_PANE_NAME,
+                    agent_session_id="conv-old-999",
+                    now=1000,
+                )
+
+                # Simulate restored empty shell after host reboot: pane exists with agent_live=False
+                term.panes[GENERAL_PANE_NAME] = PaneInfo(
+                    name=GENERAL_PANE_NAME,
+                    status="unknown",
+                    attached=False,
+                    cwd=str(hq_dir),
+                    agent_live=False,
+                )
+
+                # Busy check must NOT treat a dead shell as busy
+                term.panes[GENERAL_PANE_NAME].status = "working"
+                is_busy, _, _ = daemon._inspect_session_busy(sess, now=1010)
+                self.assertFalse(is_busy)
+                term.panes[GENERAL_PANE_NAME].status = "unknown"
+
+                # _ensure_session_pane must detect dead shell and respawn with --conversation + add_dirs + turbo
+                daemon._ensure_session_pane(sess, cwd=hq_dir, effort="high")
+                self.assertEqual(len(term.start_agent_calls), 1)
+                call = term.start_agent_calls[0]
+                self.assertEqual(call["name"], GENERAL_PANE_NAME)
+                self.assertIn("--conversation", call["agent_args"])
+                conv_idx = call["agent_args"].index("--conversation")
+                self.assertEqual(call["agent_args"][conv_idx + 1], "conv-old-999")
+                self.assertIn("--add-dir", call["agent_args"])
+                self.assertIn(str(repo_dir.resolve()), call["agent_args"])
+                self.assertIn("--settings", call["agent_args"])
+                settings_idx = call["agent_args"].index("--settings")
+                settings_obj = json.loads(call["agent_args"][settings_idx + 1])
+                self.assertEqual(settings_obj.get("toolPermission"), "always-proceed")
+                self.assertIn(str(hq_dir.resolve()), settings_obj.get("trustedWorkspaces", []))
+                self.assertIn(str(repo_dir.resolve()), settings_obj.get("trustedWorkspaces", []))
+                self.assertEqual(call["env"]["HQ_DIR"], str(hq_dir.resolve()))
+                self.assertEqual(call["env"]["HQ_SESSION_KEY"], "general:1")
+
+                # Now mark hq-general as truly live (agent_live=True) -> _ensure_session_pane must reuse without respawning
+                term.panes[GENERAL_PANE_NAME] = PaneInfo(
+                    name=GENERAL_PANE_NAME,
+                    status="idle",
+                    attached=False,
+                    cwd=str(hq_dir),
+                    agent_live=True,
+                )
+                daemon._ensure_session_pane(sess, cwd=hq_dir, effort="high")
+                self.assertEqual(len(term.start_agent_calls), 1)
+
+                # rotate_general_session must NOT send /new when agent_live=False
+                term.panes[GENERAL_PANE_NAME] = PaneInfo(
+                    name=GENERAL_PANE_NAME,
+                    status="unknown",
+                    attached=False,
+                    cwd=str(hq_dir),
+                    agent_live=False,
+                )
+                rotated = daemon.rotate_general_session(now=2000, force=True, reason="night")
+                self.assertTrue(rotated)
+                self.assertEqual(term.sent_texts, [])
+            finally:
+                daemon.close()
+
+    def test_service_cli_render_only_and_lifecycle_commands(self) -> None:
+        """`herdr-bot service install --render-only` renders valid systemd unit with KillMode=process; install/status/restart/uninstall work cleanly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            hq_dir = Path(tmp) / "acme-hq"
+            hq_main(["init", str(hq_dir)])
+            (hq_dir / "hq.yaml").write_text(
+                "version: 1\nproject_name: acme-platform\n",
+                encoding="utf-8",
+            )
+            fake_py = Path(tmp) / "pybin" / "python"
+            fake_py.parent.mkdir(parents=True)
+            fake_py.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_py.chmod(0o755)
+            fake_herdr = Path(tmp) / "herdr-bin" / "herdr"
+            fake_herdr.parent.mkdir(parents=True)
+            fake_herdr.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_herdr.chmod(0o755)
+            fake_agy = Path(tmp) / "agy-bin" / "agy"
+            fake_agy.parent.mkdir(parents=True)
+            fake_agy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_agy.chmod(0o755)
+            (hq_dir / ".hq" / "local.yaml").write_text(
+                f"python_bin: {fake_py}\nherdr_bin: {fake_herdr}\nagy_bin: {fake_agy}\n",
+                encoding="utf-8",
+            )
+
+            # 1) --render-only prints unit without writing file or invoking systemctl
+            buf = io.StringIO()
+            with patch("pathlib.Path.home", return_value=fake_home), patch("sys.stdout", buf):
+                rc = hq_main(["service", "install", "--hq-dir", str(hq_dir), "--render-only"])
+            self.assertEqual(rc, 0)
+            unit = buf.getvalue()
+            self.assertIn("Description=herdr-bot 24/7 R&D orchestrator (acme-platform)", unit)
+            self.assertIn("After=network-online.target", unit)
+            self.assertIn("Wants=network-online.target", unit)
+            self.assertIn("Type=simple", unit)
+            self.assertIn(f"WorkingDirectory={hq_dir.resolve()}", unit)
+            self.assertIn(f'Environment="HOME={fake_home.resolve()}"', unit)
+            self.assertIn("Restart=always", unit)
+            self.assertIn("RestartSec=5", unit)
+            self.assertIn("KillMode=process", unit)
+            self.assertIn("WantedBy=default.target", unit)
+
+            # PATH contains python_bin dir, ~/.local/bin, herdr dir, agy dir, /usr/local/bin:/usr/bin:/bin (deduped)
+            path_line = next(l for l in unit.splitlines() if l.startswith('Environment="PATH='))
+            path_val = path_line[len('Environment="PATH='):-1]
+            path_parts = path_val.split(":")
+            self.assertEqual(len(path_parts), len(set(path_parts)))
+            self.assertIn(str(fake_py.parent), path_parts)
+            self.assertIn(str(fake_home.resolve() / ".local" / "bin"), path_parts)
+            self.assertIn(str(fake_herdr.parent), path_parts)
+            self.assertIn(str(fake_agy.parent), path_parts)
+            self.assertIn("/usr/local/bin", path_parts)
+            self.assertIn("/usr/bin", path_parts)
+            self.assertIn("/bin", path_parts)
+
+            exec_line = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
+            self.assertIn(str(fake_py), exec_line)
+            self.assertIn("bin/herdr-bot up --hq-dir", exec_line)
+            self.assertIn(str(hq_dir.resolve()), exec_line)
+            self.assertFalse((fake_home / ".config" / "systemd" / "user" / "herdr-bot.service").exists())
+
+            # 2) Full install writes unit, calls daemon-reload, enable --now, and tolerates loginctl rejection
+            invoked_cmds = []
+
+            def fake_subproc_run(cmd, capture_output=True, text=True, check=False):
+                invoked_cmds.append(list(cmd))
+                if cmd[:2] == ["loginctl", "enable-linger"]:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Access denied")
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+
+            out_buf = io.StringIO()
+            with (
+                patch("pathlib.Path.home", return_value=fake_home),
+                patch("hq_pilot.service_cli.subprocess.run", side_effect=fake_subproc_run),
+                patch("sys.stdout", out_buf),
+            ):
+                rc_inst = hq_main(["service", "install", "--hq-dir", str(hq_dir), "--name", "herdr-bot"])
+                rc_stat = hq_main(["service", "status", "--name", "herdr-bot"])
+                rc_rest = hq_main(["service", "restart", "--name", "herdr-bot"])
+                rc_unin = hq_main(["service", "uninstall", "--name", "herdr-bot"])
+
+            self.assertEqual(rc_inst, 0)
+            self.assertEqual(rc_stat, 0)
+            self.assertEqual(rc_rest, 0)
+            self.assertEqual(rc_unin, 0)
+            self.assertIn("sudo loginctl enable-linger", out_buf.getvalue())
+            self.assertIn(["systemctl", "--user", "daemon-reload"], invoked_cmds)
+            self.assertIn(["systemctl", "--user", "enable", "--now", "herdr-bot.service"], invoked_cmds)
+            self.assertIn(["systemctl", "--user", "status", "herdr-bot.service", "--no-pager"], invoked_cmds)
+            self.assertIn(["systemctl", "--user", "restart", "herdr-bot.service"], invoked_cmds)
+            self.assertIn(["systemctl", "--user", "disable", "--now", "herdr-bot.service"], invoked_cmds)
+            self.assertFalse((fake_home / ".config" / "systemd" / "user" / "herdr-bot.service").exists())
 
 
 if __name__ == "__main__":

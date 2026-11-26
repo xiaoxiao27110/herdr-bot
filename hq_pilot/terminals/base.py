@@ -28,6 +28,7 @@ class PaneInfo:
     status: str = "running"  # running | blocked | exited | unknown
     attached: bool = False
     cwd: str = ""
+    agent_live: Optional[bool] = None
 
 
 class TerminalDriver(ABC):

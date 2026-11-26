@@ -111,7 +111,11 @@ def scan_repo_commits(
 
     active_working_repos = set()
     if terminal_driver is not None:
-        pane_names = {p.name for p in terminal_driver.list_panes() if p.status == "running"}
+        pane_names = {
+            p.name
+            for p in terminal_driver.list_panes()
+            if p.status == "running" and p.agent_live is not False
+        }
         for s in db.list_sessions(statuses=["active"]):
             if s.get("pane_name") in pane_names and s.get("repo_name"):
                 active_working_repos.add(str(s["repo_name"]))
@@ -444,7 +448,11 @@ def scan_pane_blocked(
 ) -> List[str]:
     """Enqueue pane_blocked events for non-pinned active panes blocked >= threshold."""
     ts = int(now if now is not None else time.time())
-    panes = {p.name: p for p in terminal_driver.list_panes()}
+    panes = {}
+    for p in terminal_driver.list_panes():
+        prev = panes.get(p.name)
+        if prev is None or (prev.agent_live is False and p.agent_live is not False):
+            panes[p.name] = p
     enqueued: List[str] = []
     notify_sec = int(config.tuning.pane_blocked_notify_sec)
     for sess in db.list_sessions(statuses=["active"]):
@@ -455,7 +463,7 @@ def scan_pane_blocked(
             continue
         skey = str(sess["session_key"])
         pane = panes[pname]
-        if pane.status != "blocked":
+        if pane.agent_live is False or str(pane.status or "").strip().lower() != "blocked":
             if db.get_meta(f"blocked_approval_card:{skey}") is not None:
                 db.delete_meta(f"blocked_approval_card:{skey}")
                 prev_ep = int(db.get_meta(f"blocked_epoch:{skey}") or "0")

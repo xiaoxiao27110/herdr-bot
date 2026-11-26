@@ -118,15 +118,16 @@ class HerdrDriver(TerminalDriver):
                 return
             time.sleep(0.2)
 
-    def _workspace_maps(self) -> tuple[Dict[str, str], Dict[str, str]]:
-        """Return (ws_id -> label, label -> ws_id)."""
+    def _list_workspaces(self) -> List[Dict[str, Any]]:
         ws_data = self._run_json(["workspace", "list"], check=False)
         workspaces = (ws_data.get("result") or {}).get("workspaces") or []
+        return [ws for ws in workspaces if isinstance(ws, dict)]
+
+    def _workspace_maps(self) -> tuple[Dict[str, str], Dict[str, str]]:
+        """Return (ws_id -> label, label -> ws_id)."""
         id_to_label: Dict[str, str] = {}
         label_to_id: Dict[str, str] = {}
-        for ws in workspaces:
-            if not isinstance(ws, dict):
-                continue
+        for ws in self._list_workspaces():
             wid = str(ws.get("workspace_id", ""))
             label = str(ws.get("label", ""))
             if wid:
@@ -140,12 +141,63 @@ class HerdrDriver(TerminalDriver):
         agents = (data.get("result") or {}).get("agents") or []
         return [a for a in agents if isinstance(a, dict)]
 
-    def _find_live_agent(self, name: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _is_agent_record_live(agent: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(agent, dict):
+            return False
+        st = str(agent.get("agent_status") or "").strip().lower()
+        return st != "exited"
+
+    def _find_live_agent(
+        self, name: str, agents: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional[Dict[str, Any]]:
         agent_name = sanitize_herdr_agent_name(name)
-        for item in self._list_agents():
-            if str(item.get("name", "")) in {name, agent_name}:
+        records = agents if agents is not None else self._list_agents()
+        for item in records:
+            if str(item.get("name", "")) in {name, agent_name} and self._is_agent_record_live(item):
                 return item
         return None
+
+    def _close_stale_shell_workspaces(
+        self, name: str, agents: List[Dict[str, Any]]
+    ) -> None:
+        """Close single-pane empty-shell workspaces matching `label == name` with no live agents."""
+        live_agent_wids: set[str] = set()
+        for ag in agents:
+            if not self._is_agent_record_live(ag):
+                continue
+            ag_wid = str(ag.get("workspace_id") or "").strip()
+            if not ag_wid:
+                ag_pid = str(ag.get("pane_id") or "").strip()
+                if ":" in ag_pid:
+                    ag_wid = ag_pid.split(":", 1)[0]
+            if ag_wid:
+                live_agent_wids.add(ag_wid)
+
+        for ws in self._list_workspaces():
+            wid = str(ws.get("workspace_id") or "").strip()
+            if not wid or str(ws.get("label") or "") != name:
+                continue
+            if wid in live_agent_wids:
+                continue
+            raw_pane_count = ws.get("pane_count")
+            if (
+                not isinstance(raw_pane_count, int)
+                or isinstance(raw_pane_count, bool)
+                or raw_pane_count != 1
+            ):
+                continue
+            raw_tab_count = ws.get("tab_count")
+            if raw_tab_count is not None and (
+                not isinstance(raw_tab_count, int)
+                or isinstance(raw_tab_count, bool)
+                or raw_tab_count != 1
+            ):
+                continue
+            ws_status = str(ws.get("agent_status") or "").strip().lower()
+            if ws_status not in {"unknown", "exited", ""}:
+                continue
+            self._run(["workspace", "close", wid], check=False)
 
     def _resolve_pane_id(self, name: str) -> str:
         _, label_to_id = self._workspace_maps()
@@ -189,9 +241,11 @@ class HerdrDriver(TerminalDriver):
     ) -> None:
         self.ensure_server()
         agent_name = sanitize_herdr_agent_name(name)
-        existing = self._find_live_agent(agent_name)
+        agents = self._list_agents()
+        existing = self._find_live_agent(name, agents=agents)
         if existing is not None:
             return
+        self._close_stale_shell_workspaces(name, agents)
 
         ws_cmd = [
             "workspace",
@@ -342,12 +396,14 @@ class HerdrDriver(TerminalDriver):
                 or item.get("agent_status")
                 or "running"
             )
+            is_live = (ag is not None) and (status.strip().lower() != "exited")
             panes.append(
                 PaneInfo(
                     name=label,
                     status=status,
                     attached=False,
                     cwd=str(item.get("cwd", "")),
+                    agent_live=is_live,
                 )
             )
             seen_names.add(label)
@@ -358,18 +414,21 @@ class HerdrDriver(TerminalDriver):
                         status=status,
                         attached=False,
                         cwd=str(ag.get("cwd") or item.get("cwd", "")),
+                        agent_live=is_live,
                     )
                 )
                 seen_names.add(ag_name)
         for ag in agents_raw:
             ag_name = str(ag.get("name", ""))
             if ag_name and ag_name not in seen_names:
+                ag_status = str(ag.get("agent_status") or "running")
                 panes.append(
                     PaneInfo(
                         name=ag_name,
-                        status=str(ag.get("agent_status") or "running"),
+                        status=ag_status,
                         attached=False,
                         cwd=str(ag.get("cwd", "")),
+                        agent_live=(ag_status.strip().lower() != "exited"),
                     )
                 )
                 seen_names.add(ag_name)

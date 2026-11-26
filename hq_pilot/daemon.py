@@ -30,7 +30,7 @@ from hq_pilot.gatekeeper import (
 )
 from hq_pilot.prompt_builder import build_prompt
 from hq_pilot.syncer import sync_hq_repo
-from hq_pilot.terminals.base import AgentBlockedError, TerminalDriver, git_worktree_add
+from hq_pilot.terminals.base import AgentBlockedError, PaneInfo, TerminalDriver, git_worktree_add
 from hq_pilot.terminals.registry import get_terminal_driver
 
 
@@ -435,7 +435,11 @@ class HQDaemon:
             screen_hash = str(card_meta.get("screen_hash") or "")
             is_still_blocked = False
             for p in self.terminal_driver.list_panes():
-                if p.name == pane_name and str(p.status or "").strip().lower() == "blocked":
+                if (
+                    p.name == pane_name
+                    and self._is_pane_live(p)
+                    and str(p.status or "").strip().lower() == "blocked"
+                ):
                     is_still_blocked = True
                     break
 
@@ -665,6 +669,19 @@ class HQDaemon:
             return f"「{hint}」"
         return "当前任务"
 
+    @staticmethod
+    def _is_pane_live(pane: PaneInfo) -> bool:
+        return (
+            pane.agent_live is not False
+            and str(pane.status or "").strip().lower() != "exited"
+        )
+
+    def _find_live_pane(self, pane_name: str) -> Optional[PaneInfo]:
+        for p in self.terminal_driver.list_panes():
+            if p.name == pane_name and self._is_pane_live(p):
+                return p
+        return None
+
     def _inspect_session_busy(
         self, session: Dict[str, Any], now: int
     ) -> Tuple[bool, str, str]:
@@ -685,11 +702,7 @@ class HQDaemon:
         ):
             return True, "daemon_waiting", hint
 
-        pane_info = None
-        for p in self.terminal_driver.list_panes():
-            if p.name == pane_name:
-                pane_info = p
-                break
+        pane_info = self._find_live_pane(pane_name)
         if pane_info is not None:
             pstatus = str(pane_info.status or "").strip().lower()
             if pstatus == "blocked":
@@ -781,16 +794,12 @@ class HQDaemon:
 
         skey = str(current["session_key"])
         pane_name = str(current.get("pane_name") or GENERAL_PANE_NAME)
-        pane_info = None
-        for p in self.terminal_driver.list_panes():
-            if p.name == pane_name:
-                pane_info = p
-                break
+        pane_info = self._find_live_pane(pane_name)
 
         pane_status = (
             str(pane_info.status or "").strip().lower() if pane_info is not None else ""
         )
-        pane_is_live = pane_info is not None and pane_status != "exited"
+        pane_is_live = pane_info is not None
 
         if not force:
             if pane_is_live and pane_status not in GENERAL_ROTATABLE_STATUSES:
@@ -967,8 +976,7 @@ class HQDaemon:
         fresh = self.db.get_session(str(session["session_key"])) or session
         pane_name = self._resolve_pane_name(fresh)
         session["pane_name"] = pane_name
-        live_panes = {p.name for p in self.terminal_driver.list_panes()}
-        if pane_name not in live_panes:
+        if self._find_live_pane(pane_name) is None:
             if (
                 not cwd.exists()
                 and fresh.get("track") in TOPIC_TRACKS
@@ -1449,8 +1457,7 @@ class HQDaemon:
             if compact_hint:
                 self.db.set_meta(f"current_work_hint:{sess['session_key']}", compact_hint, now=now)
 
-            live_panes = {p.name for p in self.terminal_driver.list_panes()}
-            is_live_pane = pane_name in live_panes
+            is_live_pane = self._find_live_pane(pane_name) is not None
             has_prior_turns = int(sess.get("turn_count") or 0) > 0
             use_raw_prompt = is_live_pane and has_prior_turns
             recent_outbound = self._get_recent_outbound()

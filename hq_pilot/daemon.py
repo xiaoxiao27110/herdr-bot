@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import json
@@ -57,6 +57,139 @@ def _format_digest_category(category: str) -> str:
     if raw and any(ord(ch) > 127 for ch in raw):
         return raw
     return "系统提醒"
+
+
+_NOOP_DISTILL_PREFIX_RE = re.compile(
+    r"^(?:[-*]\s*)?(?:无新增|暂无新增|没有新增|无可记录|no\s+new\b)",
+    re.IGNORECASE,
+)
+_DISTILL_ITEM_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*`?\[|`?\[(?:DECISION|CONTRACT_CHANGE|WIP)\b)",
+    re.IGNORECASE,
+)
+_DISTILL_COMMENT_LINE_RE = re.compile(r"^\s*<!--\s*distill:[^>]*-->\s*$")
+_TODAY_WAL_HEADER_RE = re.compile(r"^\s*#\s*Today\s+WAL\b", re.IGNORECASE)
+_ACTIVE_WIP_HEADER_RE = re.compile(r"^\s*#\s*Active\s+Cross-Repo\s+WIP\b", re.IGNORECASE)
+_DIGEST_HEADING_RE = re.compile(r"^\s*#{1,4}\s*.*晨报")
+_FENCE_BLOCK_RE = re.compile(
+    r"^\s*```(?:markdown|md)?\s*\n(.*?)\n```\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _is_noop_distill_reply(reply: str) -> bool:
+    """Return True when a distill reply carries no new structured entries (e.g. '无新增 ...')."""
+    text = (reply or "").strip()
+    if not text:
+        return True
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return True
+    if any(_DISTILL_ITEM_LINE_RE.match(ln) for ln in lines):
+        return False
+    return bool(_NOOP_DISTILL_PREFIX_RE.match(lines[0]))
+
+
+def _clean_wal_text(raw: str) -> str:
+    """Strip default WAL header, distill HTML comments, and noop distill noise lines."""
+    if not raw:
+        return ""
+    kept: List[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        if _DISTILL_COMMENT_LINE_RE.match(stripped):
+            continue
+        if _TODAY_WAL_HEADER_RE.match(stripped):
+            continue
+        if not _DISTILL_ITEM_LINE_RE.match(stripped) and _NOOP_DISTILL_PREFIX_RE.match(stripped):
+            continue
+        kept.append(line.rstrip())
+    return "\n".join(kept).strip()
+
+
+def _clean_active_wip_text(raw: str) -> str:
+    """Return stripped active-wip content, or empty string if only the default heading is present."""
+    if not raw:
+        return ""
+    substantive = [
+        ln for ln in raw.splitlines()
+        if ln.strip() and not _ACTIVE_WIP_HEADER_RE.match(ln.strip())
+    ]
+    if not substantive:
+        return ""
+    return raw.strip()
+
+
+def _strip_outer_markdown_fence(text: str) -> str:
+    cleaned = (text or "").strip()
+    match = _FENCE_BLOCK_RE.match(cleaned)
+    if match:
+        return match.group(1).strip()
+    return cleaned
+
+
+def _run_readonly_git(repo_path: Path, args: List[str]) -> Optional[str]:
+    try:
+        res = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout
+
+
+def _format_git_log_lines(raw_log: str) -> List[str]:
+    lines: List[str] = []
+    for raw in (raw_log or "").splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if " | " in stripped:
+            refs, subject = stripped.split(" | ", 1)
+            refs = refs.strip()
+            subject = subject.strip()
+            if refs and subject:
+                lines.append(f"{refs} | {subject}")
+            elif subject:
+                lines.append(subject)
+            elif refs:
+                lines.append(refs)
+        else:
+            lines.append(stripped)
+    return lines
+
+
+def _has_substantive_digest_material(ctx: Dict[str, Any]) -> bool:
+    if (ctx.get("yesterday_archive") or "").strip():
+        return True
+    if (ctx.get("today_wal") or "").strip():
+        return True
+    for rs in ctx.get("repo_states") or []:
+        if (
+            rs.get("recent_commits")
+            or rs.get("unpushed_branches")
+            or int(rs.get("dirty_files_count") or 0) > 0
+        ):
+            return True
+    return False
+
+
+def _truncate_digest_block(text: str, max_chars: int = 12000) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip() + "\n...(已截断)"
 
 
 _parse_blocked_prompt = parse_blocked_prompt
@@ -233,6 +366,7 @@ class HQDaemon:
         self._stop_requested = False
         self._ephemeral_panes_used: Set[str] = set()
         self._seen_live_manual_panes: Set[str] = set()
+        self.last_digest_text: str = ""
 
     def close(self) -> None:
         self.db.close()
@@ -1250,8 +1384,8 @@ class HQDaemon:
                 self.db.delete_meta(meta_key)
 
     def _materialize_long_prompt(self, prompt: str, tag: str, now: int) -> str:
-        """Persist long prompts (>2KB) or distill/dream prompts to a file and return a short instruction."""
-        if len(prompt.encode("utf-8")) <= 2048 and not tag.startswith(("distill", "dream")):
+        """Persist long prompts (>2KB) or distill/dream/digest prompts to a file and return a short instruction."""
+        if len(prompt.encode("utf-8")) <= 2048 and not tag.startswith(("distill", "dream", "digest")):
             return prompt
         prompts_dir = self.hq_dir / ".hq" / "prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -1266,6 +1400,8 @@ class HQDaemon:
                 seq += 1
             prompt_file = prompts_dir / f"{safe_tag}-{now}-{seq}.md"
         prompt_file.write_text(prompt, encoding="utf-8")
+        if tag.startswith("digest"):
+            return f"请读取并严格执行指令文件 `{prompt_file}` 中的全部要求，直接输出最终晨报正文。"
         return f"请读取并执行指令文件 `{prompt_file}` 中的全部要求，完成后直接给出简洁结论。"
 
     def _allocate_ephemeral_pane_name(self, tag: str, now: int) -> str:
@@ -1788,7 +1924,7 @@ class HQDaemon:
                 tag="distill",
             )
 
-            if reply.strip():
+            if reply.strip() and not _is_noop_distill_reply(reply):
                 today_path = self.hq_dir / "notes" / "today.md"
                 today_path.parent.mkdir(parents=True, exist_ok=True)
                 existing = today_path.read_text(encoding="utf-8") if today_path.exists() else ""
@@ -2000,26 +2136,322 @@ class HQDaemon:
         sync_hq_repo(self.hq_dir, commit_message="herdr-bot: nightly memory closeout", push=False)
         return report
 
-    def run_morning_digest(self, now: Optional[int] = None) -> bool:
-        ts = int(now if now is not None else time.time())
-        items = self.db.list_pending_digest_items()
-        warn_sec = self.config.tuning.dirty_worktree_warn_hours * 3600
-        lines: List[str] = ["### 🌅 每日晨报"]
-        for it in items:
-            cat_label = _format_digest_category(str(it.get("category") or ""))
-            lines.append(f"- 【{cat_label}】{it['message']}")
-        for sess in self.db.list_sessions(statuses=["sealed", "pinned"]):
-            if sess.get("archive_blocked_reason") and (ts - int(sess["last_active_at"])) >= warn_sec:
-                lines.append(
-                    f"- 【滞留脏工作区】会话 `{sess['session_key']}` 已有超过 "
-                    f"{self.config.tuning.dirty_worktree_warn_hours} 小时未清理"
-                    f"（路径：`{sess.get('worktree_path')}`）"
+    def _collect_morning_digest_context(self, now: int) -> Dict[str, Any]:
+        """Deterministically collect read-only facts from HQ memory and registered repos."""
+        dt = datetime.fromtimestamp(now)
+        today_date = dt.strftime("%Y-%m-%d")
+        yesterday_date = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        yesterday_path = self.hq_dir / "notes" / "archive" / f"{yesterday_date}.md"
+        yesterday_archive = (
+            _clean_wal_text(yesterday_path.read_text(encoding="utf-8", errors="replace"))
+            if yesterday_path.is_file()
+            else ""
+        )
+
+        today_path = self.hq_dir / "notes" / "today.md"
+        today_wal = (
+            _clean_wal_text(today_path.read_text(encoding="utf-8", errors="replace"))
+            if today_path.is_file()
+            else ""
+        )
+
+        wip_path = self.hq_dir / "tasks" / "active-wip.md"
+        active_wip = (
+            _clean_active_wip_text(wip_path.read_text(encoding="utf-8", errors="replace"))
+            if wip_path.is_file()
+            else ""
+        )
+
+        repo_states: List[Dict[str, Any]] = []
+        for repo_name in sorted(self.config.repos.keys()):
+            repo_path = self.config.get_repo_path(repo_name)
+            if not (repo_path / ".git").exists():
+                continue
+            branch = (
+                _run_readonly_git(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"]) or ""
+            ).strip()
+            porcelain = _run_readonly_git(repo_path, ["status", "--porcelain"]) or ""
+            dirty_files_count = sum(1 for ln in porcelain.splitlines() if ln.strip())
+
+            raw_recent = (
+                _run_readonly_git(
+                    repo_path,
+                    ["log", "--all", "--since=36 hours ago", "--format=%D | %s", "-n", "25"],
                 )
+                or ""
+            )
+            recent_commits = _format_git_log_lines(raw_recent)
+
+            remotes_out = _run_readonly_git(repo_path, ["remote"]) or ""
+            has_remotes = bool(remotes_out.strip())
+            unpushed_branches: List[str] = []
+            for_each = (
+                _run_readonly_git(
+                    repo_path,
+                    [
+                        "for-each-ref",
+                        "--format=%(refname:short)\t%(upstream:short)\t%(upstream:track)",
+                        "refs/heads/",
+                    ],
+                )
+                or ""
+            )
+            for line in for_each.splitlines():
+                parts = line.split("\t")
+                br = parts[0].strip() if len(parts) > 0 else ""
+                upstream = parts[1].strip() if len(parts) > 1 else ""
+                track = parts[2].strip() if len(parts) > 2 else ""
+                if not br:
+                    continue
+                if upstream and "ahead" in track:
+                    unpushed_branches.append(f"{br} ({track.strip('[]')})")
+                elif not upstream and has_remotes:
+                    cnt_raw = (
+                        _run_readonly_git(
+                            repo_path, ["rev-list", "--count", br, "--not", "--remotes"]
+                        )
+                        or ""
+                    ).strip()
+                    try:
+                        cnt = int(cnt_raw)
+                    except ValueError:
+                        cnt = 0
+                    if cnt > 0:
+                        unpushed_branches.append(f"{br} (未关联远端，+{cnt} 个未推提交)")
+
+            unpushed_commits: List[str] = []
+            if has_remotes and unpushed_branches:
+                raw_unpushed = (
+                    _run_readonly_git(
+                        repo_path,
+                        ["log", "--branches", "--not", "--remotes", "--format=%D | %s", "-n", "15"],
+                    )
+                    or ""
+                )
+                unpushed_commits = _format_git_log_lines(raw_unpushed)
+
+            repo_states.append(
+                {
+                    "repo": repo_name,
+                    "branch": branch or "-",
+                    "dirty_files_count": dirty_files_count,
+                    "recent_commits": recent_commits,
+                    "unpushed_branches": unpushed_branches,
+                    "unpushed_commits": unpushed_commits,
+                }
+            )
+
+        raw_items = self.db.list_pending_digest_items()
+        alerts: List[Dict[str, Any]] = [
+            {
+                "id": int(it["id"]),
+                "category": str(it.get("category") or ""),
+                "label": _format_digest_category(str(it.get("category") or "")),
+                "message": str(it.get("message") or ""),
+            }
+            for it in raw_items
+        ]
+
+        warn_hours = self.config.tuning.dirty_worktree_warn_hours
+        warn_sec = warn_hours * 3600
+        dirty_worktrees: List[Dict[str, Any]] = []
+        for sess in self.db.list_sessions(statuses=["sealed", "pinned"]):
+            if sess.get("archive_blocked_reason") and (now - int(sess["last_active_at"])) >= warn_sec:
+                dirty_worktrees.append(
+                    {
+                        "session_key": str(sess["session_key"]),
+                        "worktree_path": str(sess.get("worktree_path") or ""),
+                        "warn_hours": warn_hours,
+                        "reason": str(sess.get("archive_blocked_reason") or ""),
+                    }
+                )
+
+        active_timers: List[Dict[str, Any]] = []
+        for tm in self.db.list_timers(statuses=["active"]):
+            next_ts = int(tm.get("next_fire_at") or 0)
+            active_timers.append(
+                {
+                    "id": int(tm["id"]),
+                    "name": str(tm.get("name") or ""),
+                    "kind": str(tm.get("kind") or "once"),
+                    "next_fire_at": next_ts,
+                    "next_fire_str": (
+                        datetime.fromtimestamp(next_ts).strftime("%Y-%m-%d %H:%M")
+                        if next_ts > 0
+                        else "-"
+                    ),
+                    "reason": str(tm.get("reason") or ""),
+                    "session_key": str(tm.get("session_key") or "general"),
+                }
+            )
+
+        return {
+            "date": today_date,
+            "yesterday_date": yesterday_date,
+            "yesterday_archive": yesterday_archive,
+            "today_wal": today_wal,
+            "active_wip": active_wip,
+            "repo_states": repo_states,
+            "alerts": alerts,
+            "dirty_worktrees": dirty_worktrees,
+            "active_timers": active_timers,
+        }
+
+    def _format_fallback_morning_digest(self, ctx: Dict[str, Any]) -> str:
+        lines: List[str] = ["### 🌅 每日晨报"]
+        for alert in ctx.get("alerts") or []:
+            lines.append(f"- 【{alert['label']}】{alert['message']}")
+        for wt in ctx.get("dirty_worktrees") or []:
+            lines.append(
+                f"- 【滞留脏工作区】会话 `{wt['session_key']}` 已有超过 "
+                f"{wt['warn_hours']} 小时未清理（路径：`{wt['worktree_path']}`）"
+            )
         if len(lines) == 1:
             lines.append("- 一切正常，暂无待处理告警或滞留工作区。")
+        return "\n".join(lines)
+
+    def _build_morning_digest_prompt(self, ctx: Dict[str, Any], now: int) -> str:
+        _ = now
+        project_name = (self.config.project_name or "").strip() or "current-project"
+        today_date = str(ctx.get("date") or "")
+        yesterday_date = str(ctx.get("yesterday_date") or "")
+
+        repo_lines: List[str] = []
+        for rs in ctx.get("repo_states") or []:
+            unpushed_str = (
+                "、".join(rs.get("unpushed_branches") or [])
+                if rs.get("unpushed_branches")
+                else "无"
+            )
+            repo_lines.append(
+                f"- **{rs['repo']}**：当前分支 `{rs['branch']}`，"
+                f"未提交文件数 `{rs['dirty_files_count']}`，未推送分支：{unpushed_str}"
+            )
+            recent = rs.get("recent_commits") or []
+            if recent:
+                repo_lines.append("  - 近 36 小时提交（仅作提炼素材，切勿逐条照搬）：")
+                for c in recent[:25]:
+                    repo_lines.append(f"    - {c}")
+            else:
+                repo_lines.append("  - 近 36 小时提交：无")
+            unpushed_commits = rs.get("unpushed_commits") or []
+            if unpushed_commits:
+                repo_lines.append("  - 未推送提交参考（仅作提炼素材，切勿逐条照搬）：")
+                for uc in unpushed_commits[:15]:
+                    repo_lines.append(f"    - {uc}")
+
+        sys_lines: List[str] = []
+        alerts = ctx.get("alerts") or []
+        if alerts:
+            sys_lines.append("- 待处理系统告警：")
+            for a in alerts:
+                sys_lines.append(f"  - 【{a['label']}】{a['message']}")
+        else:
+            sys_lines.append("- 待处理系统告警：无")
+
+        dirty_wts = ctx.get("dirty_worktrees") or []
+        if dirty_wts:
+            sys_lines.append("- 滞留脏工作区：")
+            for wt in dirty_wts:
+                sys_lines.append(
+                    f"  - 会话 `{wt['session_key']}` 超过 {wt['warn_hours']} 小时未清理"
+                    f"（路径：`{wt['worktree_path']}`）"
+                )
+        else:
+            sys_lines.append("- 滞留脏工作区：无")
+
+        timers = ctx.get("active_timers") or []
+        if timers:
+            sys_lines.append("- 活跃定时器：")
+            for tm in timers[:12]:
+                name_part = f" [{tm['name']}]" if tm.get("name") else ""
+                sys_lines.append(
+                    f"  - timer#{tm['id']}{name_part} ({tm['kind']}, 下次触发 {tm['next_fire_str']}, "
+                    f"session={tm['session_key']}): {tm['reason']}"
+                )
+        else:
+            sys_lines.append("- 活跃定时器：无")
+
+        yesterday_block = _truncate_digest_block(str(ctx.get("yesterday_archive") or "")) or "（无）"
+        today_block = _truncate_digest_block(str(ctx.get("today_wal") or "")) or "（无）"
+        wip_block = _truncate_digest_block(str(ctx.get("active_wip") or ""), max_chars=6000) or "（无）"
+        repos_block = "\n".join(repo_lines) if repo_lines else "（无已注册仓库）"
+        sys_block = "\n".join(sys_lines)
+
+        return "\n".join(
+            [
+                f"# 每日研发晨报生成任务（项目：`{project_name}`，日期：{today_date}）",
+                "",
+                "请严格基于下方采集到的只读事实素材，撰写一份**简洁、高抽象层次的中文研发晨报**。",
+                "",
+                "## 输出要求（必须严格遵守）",
+                "1. 按业务主题与阶段里程碑高度归纳，**不要照搬逐条原始 commit 文案、Git SHA 或冗长文件路径列表**。",
+                "2. **严禁虚构**素材中不存在的事实、数据、结论或未注册仓库；不确定处按素材如实标注。",
+                "3. **只读总结，严禁修改任何文件、严禁执行写操作或修改仓库状态**。",
+                "4. **直接输出最终可发给用户的 Markdown 晨报正文**，不要写“已完成晨报撰写”“以下为晨报内容”等元话术，也不要用最外层代码块包裹。",
+                "5. 严格按以下 4 个一级模块组织（保留标题与 emoji）：",
+                f"   - 顶部标题：`### 🌅 每日研发晨报（{today_date}）`",
+                "   - `### 🚀 昨日推进与决策`：昨天整体推进了哪些核心任务、取得了什么阶段性成果、拍板了什么关键方案。",
+                "   - `### 🧩 遇到的问题与待确认`：踩到的坑、未闭环问题、需要用户确认/拍板/补充现场的事项；若无则写“暂无阻塞或待拍板事项。”",
+                "   - `### 📦 当前代码状态`：按已注册仓库/主题概括当前所在分支、改动是否已提交、哪些已推/未推或待合并打包、工作区是否干净（不要逐条列出 commit 原文）。",
+                "   - `### ⚠️ 系统与提醒`：汇总系统告警、滞留脏工作区及活跃定时器；若全部正常则一行写“系统运行正常，暂无告警或滞留工作区。”",
+                "",
+                f"## 素材 1：昨日归档（`notes/archive/{yesterday_date}.md`）",
+                yesterday_block,
+                "",
+                "## 素材 2：近期工作日志（`notes/today.md`，已过滤空噪点）",
+                today_block,
+                "",
+                "## 素材 3：进行中任务台账（`tasks/active-wip.md`）",
+                wip_block,
+                "",
+                "## 素材 4：已注册仓库只读 Git 状态",
+                repos_block,
+                "",
+                "## 素材 5：系统告警、滞留工作区与活跃定时器",
+                sys_block,
+                "",
+            ]
+        )
+
+    def run_morning_digest(self, now: Optional[int] = None, use_llm: bool = True) -> bool:
+        ts = int(now if now is not None else time.time())
+        ctx = self._collect_morning_digest_context(ts)
+        fallback_text = self._format_fallback_morning_digest(ctx)
+        digest_text = fallback_text
+
+        if use_llm and _has_substantive_digest_material(ctx):
+            prompt = self._build_morning_digest_prompt(ctx, ts)
+            try:
+                llm_reply = self._run_ephemeral_background_task(
+                    prompt,
+                    effort=self.config.agent.default_effort,
+                    now=ts,
+                    tag="digest",
+                )
+                cleaned = _strip_outer_markdown_fence(llm_reply)
+                if cleaned:
+                    if not _DIGEST_HEADING_RE.match(cleaned):
+                        digest_text = f"### 🌅 每日研发晨报（{ctx['date']}）\n\n{cleaned}"
+                    else:
+                        digest_text = cleaned
+                else:
+                    print(
+                        "[hq-daemon] warn: morning digest LLM returned empty reply; falling back to plain digest",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(
+                    f"[hq-daemon] warn: morning digest LLM failed ({exc}); falling back to plain digest",
+                    flush=True,
+                )
+
+        self.last_digest_text = digest_text
         if self.channel:
-            self.channel.send_message("\n".join(lines))
-        self.db.mark_digest_items_sent([int(i["id"]) for i in items], now=ts)
+            self.channel.send_message(digest_text, thread_id=None)
+        item_ids = [int(a["id"]) for a in ctx.get("alerts") or []]
+        self.db.mark_digest_items_sent(item_ids, now=ts)
         return True
 
     def run_once(self, now: Optional[int] = None) -> TickSummary:

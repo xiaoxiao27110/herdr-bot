@@ -4,7 +4,7 @@ daytime + nightly quiet rotation with handoff summary, and pane recovery."""
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import json
 import os
@@ -18,7 +18,7 @@ from unittest.mock import patch
 from hq_pilot.channels.base import InboundMessage
 from hq_pilot.cli import main as hq_main
 from hq_pilot.config import load_config, update_tuning_value
-from hq_pilot.daemon import GENERAL_PANE_NAME, HQDaemon
+from hq_pilot.daemon import GENERAL_PANE_NAME, HQDaemon, _is_noop_distill_reply
 from hq_pilot.guards import run_memory_guard
 from hq_pilot.hook_cli import handle_hook_event
 from hq_pilot.prompt_builder import build_prompt
@@ -2996,6 +2996,344 @@ class TestV2InteractionFlows(unittest.TestCase):
         self.assertEqual(len(fallback_term.start_agent_calls), 1)
         self.assertEqual(fallback_term.start_agent_calls[0]["name"], "fallback-pane")
         self.assertEqual(fallback_term.start_agent_calls[0]["agent_args"], ["--conversation", "cid-fb"])
+
+    def test_morning_digest_collects_facts_and_runs_ephemeral_llm_pane(self) -> None:
+        """Morning digest collects read-only HQ/git facts, strips noop WAL noise, runs ephemeral hq-bg-digest-* pane without touching hq-general, and clears digest buffer."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "digest-hq"
+            hq_main(["init", str(hq_dir)])
+
+            # Registered repo with bare remote (to test ahead + unpushed branch + dirty file)
+            bare_remote = Path(tmp) / "svc-alpha.git"
+            subprocess.run(["git", "init", "--bare", str(bare_remote)], check=True, capture_output=True)
+            repo_dir = Path(tmp) / "svc-alpha"
+            _init_git_repo(repo_dir)
+            subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=str(repo_dir), check=True, capture_output=True)
+            subprocess.run(["git", "push", "-u", "origin", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+            # Local commit ahead of origin/main
+            (repo_dir / "feature.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "commit", "-m", "feat: add health endpoint"], cwd=str(repo_dir), check=True, capture_output=True)
+            # Local branch without upstream with an unpushed commit
+            subprocess.run(["git", "checkout", "-b", "feat/local-wip"], cwd=str(repo_dir), check=True, capture_output=True)
+            (repo_dir / "wip.py").write_text("y = 2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "commit", "-m", "wip: prototype cache"], cwd=str(repo_dir), check=True, capture_output=True)
+            # Dirty untracked file
+            (repo_dir / "scratch.txt").write_text("dirty\n", encoding="utf-8")
+
+            # Unregistered repo must never be scanned or leaked
+            secret_repo = Path(tmp) / "unregistered-secret"
+            _init_git_repo(secret_repo)
+
+            (hq_dir / "hq.yaml").write_text(
+                "version: 1\n"
+                "project_name: acme-platform\n"
+                "repos:\n"
+                "  svc-alpha:\n"
+                "    git_url: ''\n"
+                "    default_branch: main\n",
+                encoding="utf-8",
+            )
+            (hq_dir / ".hq" / "local.yaml").write_text(
+                f"repo_paths:\n  svc-alpha: {repo_dir}\n",
+                encoding="utf-8",
+            )
+
+            now_ts = int(datetime.now().timestamp())
+            today_str = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d")
+            yesterday_str = (datetime.fromtimestamp(now_ts) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+            (hq_dir / "notes" / "archive" / f"{yesterday_str}.md").write_text(
+                "# Yesterday Summary\n- `[DECISION]` 完成核心鉴权方案定稿\n",
+                encoding="utf-8",
+            )
+            (hq_dir / "notes" / "today.md").write_text(
+                "# Today WAL [UNVERIFIED / TODAY ONLY]\n"
+                "<!-- distill:general:1:10 -->\n"
+                "- `[WIP]` 正在联调 `svc-alpha` 健康检查与缓存模块\n"
+                "<!-- distill:general:1:20 -->\n"
+                "无新增 `[DECISION]` / `[CONTRACT_CHANGE]` / `[WIP]`（仅为常规问答）。\n",
+                encoding="utf-8",
+            )
+            (hq_dir / "tasks" / "active-wip.md").write_text(
+                "# Active Cross-Repo WIP\n\n- `svc-alpha`: 推进健康检查与本地缓存联调\n",
+                encoding="utf-8",
+            )
+
+            llm_body = (
+                "### 🚀 昨日推进与决策\n"
+                "- 完成核心鉴权方案定稿并推进 `svc-alpha` 联调。\n\n"
+                "### 🧩 遇到的问题与待确认\n"
+                "- 暂无阻塞或待拍板事项。\n\n"
+                "### 📦 当前代码状态\n"
+                "- `svc-alpha` 当前在 `feat/local-wip` 分支，有未推送提交与 1 处未提交改动。\n\n"
+                "### ⚠️ 系统与提醒\n"
+                "- 存在 1 条失败事件告警与 1 个活跃定时器。\n"
+            )
+            term = StatusAwareTerminal(reply_fn=lambda name, text: llm_body)
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                # Keep #General busy to prove morning digest never touches it
+                daemon._ensure_general_session(now_ts - 60)
+                term.set_pane(GENERAL_PANE_NAME, status="working")
+
+                daemon.db.add_digest_item("alert", "dead_event", "事件 #9 重试失败", now=now_ts - 30)
+                daemon.db.create_session(
+                    "task:svc-alpha:old-wt:100",
+                    "TOPIC",
+                    "agy",
+                    status="sealed",
+                    worktree_path="/tmp/old-wt",
+                    now=now_ts - 60 * 3600,
+                )
+                daemon.db.update_session(
+                    "task:svc-alpha:old-wt:100",
+                    archive_blocked_reason="dirty_or_unpushed",
+                    last_active_at=now_ts - 60 * 3600,
+                )
+                daemon.db.create_timer(
+                    reason="跟进发布回归",
+                    fire_at=now_ts + 3600,
+                    kind="once",
+                    session_key="general:1",
+                    now=now_ts - 10,
+                )
+
+                ctx = daemon._collect_morning_digest_context(now_ts)
+                self.assertIn("完成核心鉴权方案定稿", ctx["yesterday_archive"])
+                self.assertIn("正在联调 `svc-alpha`", ctx["today_wal"])
+                self.assertNotIn("无新增", ctx["today_wal"])
+                self.assertIn("推进健康检查与本地缓存联调", ctx["active_wip"])
+                self.assertEqual(len(ctx["repo_states"]), 1)
+                rs = ctx["repo_states"][0]
+                self.assertEqual(rs["repo"], "svc-alpha")
+                self.assertEqual(rs["branch"], "feat/local-wip")
+                self.assertEqual(rs["dirty_files_count"], 1)
+                self.assertTrue(any("prototype cache" in c for c in rs["recent_commits"]))
+                self.assertTrue(any("main" in b and "ahead 1" in b for b in rs["unpushed_branches"]))
+                self.assertTrue(any("feat/local-wip" in b for b in rs["unpushed_branches"]))
+                self.assertEqual(len(ctx["alerts"]), 1)
+                self.assertEqual(len(ctx["dirty_worktrees"]), 1)
+                self.assertEqual(len(ctx["active_timers"]), 1)
+
+                ok = daemon.run_morning_digest(now=now_ts)
+                self.assertTrue(ok)
+
+                # Ephemeral digest pane used & closed immediately; hq-general untouched
+                self.assertEqual(len(term.start_agent_calls), 1)
+                digest_pane = term.start_agent_calls[0]["name"]
+                self.assertTrue(digest_pane.startswith("hq-bg-digest-"))
+                self.assertEqual(term.start_agent_calls[0]["env"]["HQ_EPHEMERAL"], "1")
+                self.assertIn(digest_pane, term.killed_panes)
+                self.assertNotIn(digest_pane, term.panes)
+                self.assertFalse(any(p["name"] == GENERAL_PANE_NAME for p in term.prompt_calls))
+                self.assertNotIn(GENERAL_PANE_NAME, term.killed_panes)
+
+                # Prompt materialized to .hq/prompts/digest-<ts>.md with clean facts & no unregistered repo
+                prompt_file = hq_dir / ".hq" / "prompts" / f"digest-{now_ts}.md"
+                self.assertTrue(prompt_file.exists())
+                prompt_text = prompt_file.read_text(encoding="utf-8")
+                self.assertIn("### 🚀 昨日推进与决策", prompt_text)
+                self.assertIn("### 🧩 遇到的问题与待确认", prompt_text)
+                self.assertIn("### 📦 当前代码状态", prompt_text)
+                self.assertIn("### ⚠️ 系统与提醒", prompt_text)
+                self.assertIn("完成核心鉴权方案定稿", prompt_text)
+                self.assertIn("跟进发布回归", prompt_text)
+                self.assertNotIn("unregistered-secret", prompt_text)
+                self.assertNotIn("无新增 `[DECISION]`", prompt_text)
+
+                # Delivered to main window with date header wrapped, and digest buffer cleared
+                self.assertEqual(len(ch.sent), 1)
+                self.assertIsNone(ch.sent[0]["thread_id"])
+                sent_text = ch.sent[0]["text"]
+                self.assertTrue(sent_text.startswith(f"### 🌅 每日研发晨报（{today_str}）\n\n"))
+                self.assertIn("### 🚀 昨日推进与决策", sent_text)
+                self.assertEqual(daemon.db.list_pending_digest_items(), [])
+            finally:
+                daemon.close()
+
+    def test_morning_digest_fallback_on_llm_error_and_empty_hq_skips_llm(self) -> None:
+        """LLM error or empty reply degrades cleanly to fallback Chinese digest; empty HQ skips LLM entirely."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "fallback-hq"
+            hq_main(["init", str(hq_dir)])
+            (hq_dir / "hq.yaml").write_text(
+                "version: 1\nproject_name: clean-proj\nrepos: {}\n",
+                encoding="utf-8",
+            )
+
+            class FlakyDigestTerminal(StatusAwareTerminal):
+                def __init__(self) -> None:
+                    super().__init__(reply_fn=lambda name, text: "")
+                    self.raise_err = False
+
+                def prompt_agent(self, name, text, wait=True, timeout_ms=300000):
+                    if self.raise_err:
+                        raise RuntimeError("ephemeral pane timeout")
+                    return super().prompt_agent(name, text, wait=wait, timeout_ms=timeout_ms)
+
+            term = FlakyDigestTerminal()
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                # 1. Empty HQ (only alert, no R&D material) -> skips LLM directly
+                daemon.db.add_digest_item("alert", "dead_event", "空仓告警测试", now=1000)
+                self.assertTrue(daemon.run_morning_digest(now=1100))
+                self.assertEqual(term.start_agent_calls, [])
+                self.assertEqual(len(ch.sent), 1)
+                self.assertTrue(ch.sent[0]["text"].startswith("### 🌅 每日晨报"))
+                self.assertIn("【失败事件】空仓告警测试", ch.sent[0]["text"])
+                self.assertEqual(daemon.db.list_pending_digest_items(), [])
+
+                # 2. Add substantive today.md entry, LLM raises -> degrades to fallback without throwing
+                (hq_dir / "notes" / "today.md").write_text(
+                    "# Today WAL [UNVERIFIED / TODAY ONLY]\n- `[DECISION]` 采用双写方案\n",
+                    encoding="utf-8",
+                )
+                daemon.db.add_digest_item("alert", "dream_error", "夜间整理超时", now=1200)
+                term.raise_err = True
+                self.assertTrue(daemon.run_morning_digest(now=1300))
+                self.assertEqual(len(term.start_agent_calls), 1)
+                pane_err = term.start_agent_calls[-1]["name"]
+                self.assertIn(pane_err, term.killed_panes)
+                self.assertTrue(ch.sent[-1]["text"].startswith("### 🌅 每日晨报"))
+                self.assertIn("【夜间整理异常】夜间整理超时", ch.sent[-1]["text"])
+                self.assertEqual(daemon.db.list_pending_digest_items(), [])
+
+                # 3. LLM returns empty reply -> degrades to fallback
+                term.raise_err = False
+                daemon.db.add_digest_item("alert", "outbox_dead", "外发失败 502", now=1400)
+                self.assertTrue(daemon.run_morning_digest(now=1500))
+                self.assertEqual(len(term.start_agent_calls), 2)
+                self.assertTrue(ch.sent[-1]["text"].startswith("### 🌅 每日晨报"))
+                self.assertIn("【外发投递失败】外发失败 502", ch.sent[-1]["text"])
+                self.assertEqual(daemon.db.list_pending_digest_items(), [])
+            finally:
+                daemon.close()
+
+    def test_cli_digest_command_with_no_llm_and_mark_sent(self) -> None:
+        """`herdr-bot digest --hq-dir ... --no-llm --mark-sent` sends fallback digest, clears alerts, and updates last_digest_date."""
+        from hq_pilot.db import HQDatabase
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "cli-digest-hq"
+            hq_main(["init", str(hq_dir)])
+            (hq_dir / "hq.yaml").write_text(
+                "version: 1\n"
+                "project_name: cli-proj\n"
+                "channel:\n"
+                "  backend: local\n"
+                "repos: {}\n",
+                encoding="utf-8",
+            )
+            (hq_dir / "notes" / "today.md").write_text(
+                "# Today WAL [UNVERIFIED / TODAY ONLY]\n- `[WIP]` 正在调试晨报 CLI\n",
+                encoding="utf-8",
+            )
+
+            db = HQDatabase(hq_dir / ".hq" / "runtime.sqlite")
+            try:
+                db.add_digest_item("alert", "dirty_worktree", "wt-cli 存在未提交改动", now=100)
+            finally:
+                db.close()
+
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                rc = hq_main(["digest", "--hq-dir", str(hq_dir), "--no-llm", "--mark-sent"])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("### 🌅 每日晨报", out)
+            self.assertIn("【脏工作区提醒】wt-cli 存在未提交改动", out)
+
+            db2 = HQDatabase(hq_dir / ".hq" / "runtime.sqlite")
+            try:
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                self.assertEqual(db2.get_meta("last_digest_date"), today_str)
+                self.assertEqual(db2.list_pending_digest_items(), [])
+                outbound = db2.list_recent_local_outbound(5)
+                self.assertEqual(len(outbound), 1)
+                self.assertIn("wt-cli 存在未提交改动", outbound[0]["text"])
+            finally:
+                db2.close()
+
+    def test_session_distill_skips_noop_reply_but_advances_cursor(self) -> None:
+        """When session_distill returns a noop '无新增 ...' reply, notes/today.md is not polluted while transcript cursor still advances."""
+        self.assertTrue(_is_noop_distill_reply(""))
+        self.assertTrue(
+            _is_noop_distill_reply(
+                "无新增 `[DECISION]` / `[CONTRACT_CHANGE]` / `[WIP]`（`general:1` `lines 10..20` 仅为蒸馏任务本身）。"
+            )
+        )
+        self.assertFalse(
+            _is_noop_distill_reply(
+                "无新增 `[DECISION]`\n- `[WIP]` 仍在推进网关鉴权联调"
+            )
+        )
+        self.assertFalse(_is_noop_distill_reply("[DECISION] 采用新契约"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hq_dir = Path(tmp) / "noop-distill-hq"
+            hq_main(["init", str(hq_dir)])
+            tfile = Path(tmp) / "noop_src.jsonl"
+            tfile.write_text(
+                json.dumps({"role": "user", "content": "hi"}) + "\n"
+                + json.dumps({"role": "assistant", "content": "hello"}) + "\n",
+                encoding="utf-8",
+            )
+            noop_text = "无新增 `[DECISION]` / `[CONTRACT_CHANGE]` / `[WIP]`（仅普通状态确认）。"
+            term = StatusAwareTerminal(reply_fn=lambda name, text: noop_text)
+            ch = IndicatorFakeChannel()
+            daemon = HQDaemon(
+                hq_dir,
+                agent_adapter=NoHeadlessAgyAdapter(),
+                terminal_driver=term,
+                channel=ch,
+            )
+            try:
+                before_today = (hq_dir / "notes" / "today.md").read_text(encoding="utf-8")
+                daemon.db.enqueue_event(
+                    source="session_distill",
+                    dedupe_key="sd:noop:1",
+                    priority=30,
+                    available_at=4000,
+                    payload={
+                        "session_key": "general:1",
+                        "agent_session_id": "conv-noop-1",
+                        "transcript_path": str(tfile),
+                        "from_line": 0,
+                        "to_line": 2,
+                        "turns": [{"role": "user", "text": "hi"}],
+                    },
+                    now=4000,
+                )
+                summary = daemon.run_once(now=4000)
+                self.assertEqual(summary.events_processed, 1)
+                self.assertEqual(summary.events_failed, 0)
+
+                # notes/today.md untouched (no noop noise written)
+                after_today = (hq_dir / "notes" / "today.md").read_text(encoding="utf-8")
+                self.assertEqual(after_today, before_today)
+                self.assertNotIn("无新增", after_today)
+                self.assertNotIn("<!-- distill:general:1:2 -->", after_today)
+
+                # Transcript cursor still advanced properly
+                cursor_info = daemon.cursors.get_transcript_cursor("conv-noop-1")
+                self.assertEqual(cursor_info.get("last_summarized_line"), 2)
+                self.assertEqual(daemon.db.get_meta("sessions_since_dream"), "1")
+            finally:
+                daemon.close()
 
 
 if __name__ == "__main__":

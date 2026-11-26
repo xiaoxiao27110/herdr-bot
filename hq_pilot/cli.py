@@ -365,6 +365,23 @@ def cmd_run_once(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_digest(args: argparse.Namespace) -> int:
+    daemon = HQDaemon(args.hq_dir)
+    try:
+        now_ts = int(time.time())
+        ok = daemon.run_morning_digest(now=now_ts, use_llm=not bool(args.no_llm))
+        if args.mark_sent:
+            today_str = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d")
+            daemon.db.set_meta("last_digest_date", today_str, now=now_ts)
+        if daemon.last_digest_text:
+            print(daemon.last_digest_text)
+        else:
+            print(f"Morning digest sent={ok}")
+        return 0 if ok else 1
+    finally:
+        daemon.close()
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     pid_file = Path(args.hq_dir).expanduser().resolve() / ".hq" / "daemon.pid"
     if not pid_file.exists():
@@ -615,6 +632,20 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     sp_ro = sub.add_parser("run-once", help="Run a single daemon tick")
     sp_ro.add_argument("--hq-dir", default=".")
     sp_ro.set_defaults(func=cmd_run_once)
+
+    sp_digest = sub.add_parser("digest", help="Generate and send the daily R&D morning digest now")
+    sp_digest.add_argument("--hq-dir", default=".")
+    sp_digest.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Skip ephemeral LLM summarization and send plain alert/status digest",
+    )
+    sp_digest.add_argument(
+        "--mark-sent",
+        action="store_true",
+        help="Record today's date in last_digest_date to avoid duplicate scheduled push",
+    )
+    sp_digest.set_defaults(func=cmd_digest)
 
     sp_stop = sub.add_parser("stop", help="Stop running daemon")
     sp_stop.add_argument("--hq-dir", default=".")

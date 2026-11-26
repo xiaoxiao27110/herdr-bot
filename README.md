@@ -136,6 +136,7 @@ herdr-bot chat --hq-dir ~/herdr-hq --standalone
 | `herdr-bot setup` | 交互式/非交互式配置向导（生成 `hq.yaml`、`.hq/local.yaml`、`0600` `secrets.env`） |
 | `herdr-bot up --hq-dir <dir>` | 启动 7×24 守护进程（Ctrl+C 或 `herdr-bot stop` 优雅退出） |
 | `herdr-bot service install / status / restart / uninstall` | 安装或管理 `systemd --user` 开机自启常驻服务（支持 `--render-only` 预览单元文件） |
+| `herdr-bot digest --hq-dir <dir> [--no-llm] [--mark-sent]` | 手动采集只读研发事实并通过临时面板提炼推送每日研发晨报（`--mark-sent` 避免当日定时点重复推送） |
 | `herdr-bot status --hq-dir <dir>` | 查看所有追踪中的 `#General` / `#Topic` 会话、分支与 4 态状态 |
 | `herdr-bot task spawn <repo> <slug> "<需求>"` | 拉起独立 Git Worktree + Herdr 交互面板 |
 | `herdr-bot seal <session_key> [--reason "..."]` | 静默封口指定会话（更新任务状态并保留 Worktree 至夜间 `23:30` 安全归档） |

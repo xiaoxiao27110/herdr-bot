@@ -18,7 +18,10 @@ class GuardResult:
 
 
 def run_memory_guard(
-    hq_dir: str | Path, config: Optional[HQConfig] = None
+    hq_dir: str | Path,
+    config: Optional[HQConfig] = None,
+    *,
+    check_today_wal_lines: bool = True,
 ) -> GuardResult:
     root = Path(hq_dir).expanduser().resolve()
     cfg = config or load_config(root)
@@ -38,7 +41,7 @@ def run_memory_guard(
             )
 
     today_path = root / "notes" / "today.md"
-    if today_path.exists():
+    if check_today_wal_lines and today_path.exists():
         t_lines = today_path.read_text(encoding="utf-8").splitlines()
         if len(t_lines) > cfg.tuning.today_wal_max_lines:
             violations.append(

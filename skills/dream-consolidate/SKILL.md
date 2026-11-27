@@ -24,7 +24,7 @@ Run during the nightly `23:30` closeout pipeline after Step 0 (`session-distill`
 - Update `tasks/active-wip.md` (cross off completed items, keep active cross-repo work).
 - Keep `<index_file>` concise (`<= index_max_lines`, `<= index_max_bytes`).
 
-### Phase 4: Prune
-- Archive `notes/today.md` into `notes/archive/YYYY-MM-DD.md`.
-- Reset `notes/today.md` to an empty WAL header (`<= today_wal_max_lines`).
-- Run `hq guard` to verify line/byte budgets and that all `<repo>:<relpath>` references exist.
+### Phase 4: Prune & Verify
+- Do NOT modify or clear `notes/today.md` or `notes/archive/` directly; the orchestrator archives and resets `notes/today.md` only after verifying `DREAM_DONE` and memory guard checks.
+- Run `herdr-bot guard --hq-dir <hq_dir>` to verify line/byte budgets and that all `<repo>:<relpath>` references exist.
+- End your final reply with `DREAM_DONE` on the last line (or `DREAM_DONE: no-op <reason>` if no promotions were needed).

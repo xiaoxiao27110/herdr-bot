@@ -101,6 +101,7 @@ herdr-bot setup --non-interactive \
 | --- | --- |
 | `herdr-bot setup` | 初始化工作区、托管仓库与消息通道 |
 | `herdr-bot service install / status / restart` | 管理开机自启常驻服务 |
+| `herdr-bot dream --hq-dir <dir> [--no-archive]` | 手动执行一次夜间记忆整理（`--no-archive` 仅晋升不归档 `today.md`） |
 | `herdr-bot digest --hq-dir <dir>` | 手动生成并推送「每日研发晨报」 |
 | `herdr-bot status --hq-dir <dir>` | 查看总管与各任务面板状态 |
 | `herdr-bot task spawn <repo> <slug> "<需求>"` | 按需开启独立 Git Worktree 与 Herdr 任务面板 |

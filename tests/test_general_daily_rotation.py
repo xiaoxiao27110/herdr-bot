@@ -412,7 +412,7 @@ class TestGeneralDailyRotation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hq_dir = Path(tmp) / "acme-hq"
             hq_main(["init", str(hq_dir)])
-            term = StatusAwareTerminal(reply_fn=lambda name, text: "dream done")
+            term = StatusAwareTerminal(reply_fn=lambda name, text: "DREAM_DONE")
             daemon = HQDaemon(
                 hq_dir,
                 agent_adapter=NoHeadlessAgyAdapter(),

@@ -920,7 +920,13 @@ class TestV2InteractionFlows(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            term = StatusAwareTerminal(reply_fn=lambda name, text: f"REPLY:{text[:30]}")
+            term = StatusAwareTerminal(
+                reply_fn=lambda name, text: (
+                    f"REPLY:{text[:30]}\nDREAM_DONE"
+                    if name.startswith("hq-bg-dream-")
+                    else f"REPLY:{text[:30]}"
+                )
+            )
             term.set_pane(GENERAL_PANE_NAME, status="idle")
             ch = IndicatorFakeChannel()
             daemon = HQDaemon(
@@ -1760,7 +1766,13 @@ class TestV2InteractionFlows(unittest.TestCase):
 
             class FailingEphemeralTerminal(StatusAwareTerminal):
                 def __init__(self):
-                    super().__init__(reply_fn=lambda name, text: f"ephemeral-ok:{name}")
+                    super().__init__(
+                        reply_fn=lambda name, text: (
+                            f"ephemeral-ok:{name}\nDREAM_DONE"
+                            if name.startswith("hq-bg-dream-")
+                            else f"ephemeral-ok:{name}"
+                        )
+                    )
                     self.raise_on_prompt = None
 
                 def prompt_agent(self, name, text, wait=True, timeout_ms=300000):

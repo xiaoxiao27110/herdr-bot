@@ -14,4 +14,4 @@ Triggered during idle windows (`distill_idle_minutes` & `distill_min_new_turns`)
   - `[CONTRACT_CHANGE]` — cross-repo interface change referencing `<repo>@<sha>` or `<repo>:<relpath>`
   - `[WIP]` — unfinished cross-repo task or blocker
 - Overwrite same-topic entries in `notes/today.md` rather than appending duplicates.
-- If the slice contains only routine chatter/status, output nothing.
+- If the slice contains only routine chatter/status with no new `[DECISION]`/`[CONTRACT_CHANGE]`/`[WIP]`, output a single line `NOOP` with no extra explanation.

@@ -259,7 +259,13 @@ class TestHerdrInteractiveMode(unittest.TestCase):
                 raise AssertionError(f"cmd_runner must NEVER be called: {cmd}")
 
             ch = IndicatorChannel()
-            term = RecordingTerminal(reply_fn=lambda name, text: f"interactive-reply@{name}")
+            term = RecordingTerminal(
+                reply_fn=lambda name, text: (
+                    f"interactive-reply@{name}\nDREAM_DONE"
+                    if name.startswith("hq-bg-dream-")
+                    else f"interactive-reply@{name}"
+                )
+            )
             daemon = HQDaemon(
                 hq_dir,
                 agent_adapter=NoHeadlessAgyAdapter(),

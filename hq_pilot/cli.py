@@ -388,6 +388,24 @@ def cmd_digest(args: argparse.Namespace) -> int:
         daemon.close()
 
 
+def cmd_dream(args: argparse.Namespace) -> int:
+    daemon = HQDaemon(args.hq_dir)
+    try:
+        res = daemon.run_dream(archive=not bool(args.no_archive))
+        if res.reply:
+            print(res.reply)
+        if res.ok:
+            archives_desc = ", ".join(res.included_archives) if res.included_archives else "(none)"
+            print(
+                f"dream: PASS (archived={res.archived}, included_archives={archives_desc})"
+            )
+            return 0
+        print(f"dream: FAIL ({res.error})", file=sys.stderr)
+        return 1
+    finally:
+        daemon.close()
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     pid_file = Path(args.hq_dir).expanduser().resolve() / ".hq" / "daemon.pid"
     if not pid_file.exists():
@@ -667,6 +685,15 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
         help="Record today's date in last_digest_date to avoid duplicate scheduled push",
     )
     sp_digest.set_defaults(func=cmd_digest)
+
+    sp_dream = sub.add_parser("dream", help="Run memory dreaming consolidation in an ephemeral pane")
+    sp_dream.add_argument("--hq-dir", default=".")
+    sp_dream.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="Promote verified memory without archiving or resetting notes/today.md",
+    )
+    sp_dream.set_defaults(func=cmd_dream)
 
     sp_stop = sub.add_parser("stop", help="Stop running daemon")
     sp_stop.add_argument("--hq-dir", default=".")

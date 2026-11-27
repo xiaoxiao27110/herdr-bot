@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -28,6 +28,7 @@ from hq_pilot.gatekeeper import (
     scan_pane_blocked,
     scan_repo_commits,
 )
+from hq_pilot.guards import run_memory_guard
 from hq_pilot.prompt_builder import build_prompt
 from hq_pilot.syncer import sync_hq_repo
 from hq_pilot.terminals.base import AgentBlockedError, PaneInfo, TerminalDriver, git_worktree_add
@@ -59,12 +60,54 @@ def _format_digest_category(category: str) -> str:
     return "系统提醒"
 
 
+EPHEMERAL_WORKER_CONTRACT = (
+    "## 执行契约（一次性后台 Worker，最高优先级）\n"
+    "- 你是编排器调度的一次性最终执行 Worker，本轮结束后当前临时会话会被立即销毁，任何异步或后台子任务都会被连带终止。\n"
+    "- **严禁调用 `invoke_subagent`、`define_subagent`、`swarm` 或任何方式派生子 Agent / 后台任务**。\n"
+    "- 必须在本轮内**亲自完成**全部读取、核验与文件修改（只读任务除外），确认产出完整后再结束本轮。"
+)
+
+_BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
+
+
+def _load_builtin_skill(skill_name: str, skills_root: Optional[Path] = None) -> str:
+    """Load `skills/<skill_name>/SKILL.md`; degrade gracefully to empty string on error."""
+    base = skills_root or _BUILTIN_SKILLS_DIR
+    skill_path = base / skill_name / "SKILL.md"
+    try:
+        if not skill_path.is_file():
+            return ""
+        return skill_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+_DREAM_DONE_LINE_RE = re.compile(r"^[`*\s]*DREAM_DONE(?:\s*[:：].*)?[`*\s]*$")
+
+
+def _has_dream_done_marker(reply: str) -> bool:
+    """Return True when the dream worker reply contains a standalone `DREAM_DONE` completion marker."""
+    text = (reply or "").strip()
+    if not text:
+        return False
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return any(_DREAM_DONE_LINE_RE.match(ln) for ln in lines)
+
+
+_NOOP_DISTILL_EXACT_RE = re.compile(
+    r"^[`*\s]*NOOP[`*\s.。！!]*$",
+    re.IGNORECASE,
+)
 _NOOP_DISTILL_PREFIX_RE = re.compile(
-    r"^(?:[-*]\s*)?(?:无新增|暂无新增|没有新增|无可记录|no\s+new\b)",
+    r"^(?:[-*]\s*)?(?:无新增|暂无新增|没有新增|无可记录|无需记录|no\s+new\b)",
+    re.IGNORECASE,
+)
+_NOOP_DISTILL_ANYWHERE_RE = re.compile(
+    r"(?:无新增|暂无新增|没有新增|无可记录|无需记录|已跳过写入|无需更新\s*`?notes/today\.md`?|no\s+new\b|nothing\s+to\s+record)",
     re.IGNORECASE,
 )
 _DISTILL_ITEM_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*`?\[|`?\[(?:DECISION|CONTRACT_CHANGE|WIP)\b)",
+    r"^\s*(?:[-*]\s*`?\[[^\]\n]+\]`?(?!\()|`?\[(?:DECISION|CONTRACT_CHANGE|WIP)\b)",
     re.IGNORECASE,
 )
 _DISTILL_COMMENT_LINE_RE = re.compile(r"^\s*<!--\s*distill:[^>]*-->\s*$")
@@ -78,7 +121,7 @@ _FENCE_BLOCK_RE = re.compile(
 
 
 def _is_noop_distill_reply(reply: str) -> bool:
-    """Return True when a distill reply carries no new structured entries (e.g. '无新增 ...')."""
+    """Return True when a distill reply carries no new structured entries (NOOP or '无新增 ...')."""
     text = (reply or "").strip()
     if not text:
         return True
@@ -87,7 +130,13 @@ def _is_noop_distill_reply(reply: str) -> bool:
         return True
     if any(_DISTILL_ITEM_LINE_RE.match(ln) for ln in lines):
         return False
-    return bool(_NOOP_DISTILL_PREFIX_RE.match(lines[0]))
+    if any(_NOOP_DISTILL_EXACT_RE.match(ln) for ln in lines):
+        return True
+    if _NOOP_DISTILL_PREFIX_RE.match(lines[0]):
+        return True
+    if _NOOP_DISTILL_ANYWHERE_RE.search(text):
+        return True
+    return False
 
 
 def _clean_wal_text(raw: str) -> str:
@@ -104,6 +153,8 @@ def _clean_wal_text(raw: str) -> str:
         if _DISTILL_COMMENT_LINE_RE.match(stripped):
             continue
         if _TODAY_WAL_HEADER_RE.match(stripped):
+            continue
+        if _NOOP_DISTILL_EXACT_RE.match(stripped):
             continue
         if not _DISTILL_ITEM_LINE_RE.match(stripped) and _NOOP_DISTILL_PREFIX_RE.match(stripped):
             continue
@@ -312,6 +363,17 @@ def default_cmd_runner(cmd: List[str], cwd: Path) -> subprocess.CompletedProcess
 
 class _EventParked(Exception):
     """Internal control-flow signal when an event is parked in `waiting_general`."""
+
+
+@dataclass
+class DreamResult:
+    ok: bool
+    reply: str = ""
+    archived: bool = False
+    guard_ok: bool = True
+    guard_violations: List[str] = field(default_factory=list)
+    error: str = ""
+    included_archives: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1438,8 +1500,20 @@ class HQDaemon:
             prompt_file = prompts_dir / f"{safe_tag}-{now}-{seq}.md"
         prompt_file.write_text(prompt, encoding="utf-8")
         if tag.startswith("digest"):
-            return f"请读取并严格执行指令文件 `{prompt_file}` 中的全部要求，直接输出最终晨报正文。"
-        return f"请读取并执行指令文件 `{prompt_file}` 中的全部要求，完成后直接给出简洁结论。"
+            return (
+                f"请读取并严格执行指令文件 `{prompt_file}` 中的全部要求"
+                "（严禁派生子 Agent），直接输出最终晨报正文。"
+            )
+        if tag.startswith("dream"):
+            return (
+                f"请读取并严格执行指令文件 `{prompt_file}` 中的全部要求"
+                "（严禁派生子 Agent，亲自完成全部读取、核验与文件修改），"
+                "完成后在最终回复最后一行严格输出 `DREAM_DONE`。"
+            )
+        return (
+            f"请读取并执行指令文件 `{prompt_file}` 中的全部要求"
+            "（严禁派生子 Agent），完成后直接给出简洁结论。"
+        )
 
     def _allocate_ephemeral_pane_name(self, tag: str, now: int) -> str:
         clean_tag = (
@@ -1469,7 +1543,12 @@ class HQDaemon:
         """Run a background task in a disposable `hq-bg-*` pane and close it immediately."""
         pane_name = self._allocate_ephemeral_pane_name(tag=tag, now=now)
         reply_key = f"ephemeral_reply:{pane_name}"
-        delivery_prompt = self._materialize_long_prompt(prompt, tag=tag, now=now)
+        effective_prompt = (
+            prompt
+            if prompt.lstrip().startswith("## 执行契约（一次性后台 Worker")
+            else f"{EPHEMERAL_WORKER_CONTRACT}\n\n{prompt}"
+        )
+        delivery_prompt = self._materialize_long_prompt(effective_prompt, tag=tag, now=now)
 
         self.hq_dir.mkdir(parents=True, exist_ok=True)
         repo_paths = [
@@ -1927,12 +2006,18 @@ class HQDaemon:
         if ev.source == "git_commit":
             repo_name = str(ev.payload.get("repo", ""))
             recent_outbound = self._get_recent_outbound()
-            prompt = build_prompt(
+            base_prompt = build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
                 matched_repos=[repo_name] if repo_name else None,
                 recent_outbound=recent_outbound,
+            )
+            skill_text = _load_builtin_skill("boundary-triage")
+            prompt = (
+                f"{base_prompt.rstrip()}\n\n## 6. Skill Standard Procedure (boundary-triage)\n{skill_text}\n"
+                if skill_text
+                else base_prompt
             )
             self._run_ephemeral_background_task(
                 prompt,
@@ -1949,12 +2034,23 @@ class HQDaemon:
             to_line = int(ev.payload.get("to_line", 0))
 
             recent_outbound = self._get_recent_outbound()
-            prompt = build_prompt(
+            base_prompt = build_prompt(
                 self.hq_dir,
                 self.config,
                 ev.payload,
                 recent_outbound=recent_outbound,
             )
+            skill_text = _load_builtin_skill("session-distill")
+            distill_parts = [base_prompt.rstrip()]
+            if skill_text:
+                distill_parts.append(f"## 6. Skill Standard Procedure (session-distill)\n{skill_text}")
+            distill_parts.append(
+                "## 输出格式约束（必须严格遵守）\n"
+                "- 仅总结 `Event Payload` 中提供的 `turns` 增量切片，不要直接修改 `notes/today.md`（由编排器统一追加）。\n"
+                "- 每条高信号条目使用 `- [DECISION]`、`- [CONTRACT_CHANGE]` 或 `- [WIP]` 开头。\n"
+                "- **无新增高信号条目时只输出单独一行 `NOOP`，不要写任何解释、核对过程或“已跳过写入”等说明。**"
+            )
+            prompt = "\n\n".join(distill_parts) + "\n"
             reply = self._run_ephemeral_background_task(
                 prompt,
                 effort=self.config.agent.light_effort,
@@ -2081,11 +2177,218 @@ class HQDaemon:
     # ------------------------------------------------------------------
     # Nightly 3-Stage Pipeline & Morning Digest
     # ------------------------------------------------------------------
+    def _collect_unconsolidated_archives(self, last_success_at: int) -> List[Tuple[str, str]]:
+        """Collect `notes/archive/*.md` files dated after `last_success_at` (or all if never succeeded)."""
+        arch_dir = self.hq_dir / "notes" / "archive"
+        if not arch_dir.is_dir():
+            return []
+        last_success_date = (
+            datetime.fromtimestamp(last_success_at).date()
+            if last_success_at > 0
+            else None
+        )
+        selected: List[Tuple[str, str]] = []
+        for arch_file in sorted(arch_dir.glob("*.md")):
+            if not arch_file.is_file():
+                continue
+            if last_success_date is not None:
+                include = False
+                try:
+                    arch_date = datetime.strptime(arch_file.stem, "%Y-%m-%d").date()
+                    include = arch_date > last_success_date
+                except ValueError:
+                    try:
+                        include = int(arch_file.stat().st_mtime) > last_success_at
+                    except OSError:
+                        include = False
+                if not include:
+                    continue
+            try:
+                content = arch_file.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if not content:
+                continue
+            selected.append((arch_file.name, content))
+        return selected
+
+    def _build_dream_prompt(self, now: int) -> Tuple[str, List[str]]:
+        """Build the Dreaming consolidation prompt with unconsolidated archives and inline skill."""
+        last_success_at = int(self.db.get_meta("last_dream_success_at", "0") or "0")
+        archives = self._collect_unconsolidated_archives(last_success_at)
+        included_names = [name for name, _ in archives]
+
+        base_prompt = build_prompt(
+            self.hq_dir,
+            self.config,
+            {
+                "task": "dream-consolidate",
+                "timestamp": now,
+                "last_dream_success_at": last_success_at,
+                "included_archives": included_names,
+            },
+        )
+        sections: List[str] = [base_prompt.rstrip()]
+
+        if archives:
+            archive_blocks = [
+                f"### notes/archive/{name}\n{body}" for name, body in archives
+            ]
+            sections.append(
+                "## 6. Unconsolidated Archive Notes (`notes/archive/`)\n"
+                "以下归档文件日期晚于上次成功 Dreaming（或此前尚未成功整理），请与 `notes/today.md` 一并核验晋升：\n\n"
+                + "\n\n".join(archive_blocks)
+            )
+        else:
+            sections.append(
+                "## 6. Unconsolidated Archive Notes (`notes/archive/`)\n(none)"
+            )
+
+        skill_text = _load_builtin_skill("dream-consolidate")
+        guide_lines: List[str] = [
+            "## 7. Dream Consolidate Standard Procedure & Completion Contract",
+        ]
+        if skill_text:
+            guide_lines.extend(
+                [
+                    "### Built-in Skill (`skills/dream-consolidate/SKILL.md`)",
+                    skill_text,
+                    "",
+                ]
+            )
+        guide_lines.extend(
+            [
+                "### 本轮执行分工与验收要求（必须严格遵守）",
+                "1. **你负责亲自完成 Phase 1~3（Orient / Gather / Consolidate）**：",
+                "   - 通读入口索引、`memory/decisions.md`、`memory/contracts/*.md`、`tasks/active-wip.md`、`memory/user-notes.md`，对照各已注册仓库的真实代码与 `git log` / `git show`，逐条核验 `notes/today.md` 与上方全部待整理归档文件。",
+                "   - 直接修改并落盘：`memory/decisions.md`（使用「规则 / 验证方式 / Why Not」三元组）、`memory/contracts/*.md`（使用 `<repo>:<relpath>` 逻辑路径）、`tasks/active-wip.md`（划掉已完成项、保留在途项），必要时更新 `memory/user-notes.md`。",
+                "   - 保持入口索引文件精简，不得超过 `index_max_lines` / `index_max_bytes` 预算。",
+                "2. **Phase 4 的归档与清零由编排器负责**：**严禁修改或清空 `notes/today.md`，也严禁修改或删除 `notes/archive/` 下的任何文件**。",
+                f"3. **落盘后自检**：运行 `herdr-bot guard --hq-dir \"{self.hq_dir}\"` 确认校验通过（若仅报 `notes/today.md` 超行可忽略，其余如索引超限或 `<repo>:<relpath>` 断链必须当场修复后复检）。",
+                "4. **完成标记（硬性要求）**：在最终回复的**最后一行**严格单独输出：",
+                "   - 完成晋升/更新时：`DREAM_DONE`",
+                "   - 经核验确认无需任何晋升改动时：`DREAM_DONE: no-op <简短原因>`",
+                "   （未输出 `DREAM_DONE` 标记将被编排器判定为整理失败并保留 `notes/today.md` 不归档。）",
+            ]
+        )
+        sections.append("\n".join(guide_lines))
+        return "\n\n".join(sections) + "\n", included_names
+
+    def run_dream(
+        self,
+        now: Optional[int] = None,
+        *,
+        archive: bool = True,
+        record_digest_on_error: bool = True,
+    ) -> DreamResult:
+        """Run Dreaming in an ephemeral pane, verify `DREAM_DONE` + memory guard, and optionally archive today.md."""
+        ts = int(now if now is not None else time.time())
+        prompt, included_archives = self._build_dream_prompt(ts)
+        try:
+            reply = self._run_ephemeral_background_task(
+                prompt,
+                effort=self.config.agent.default_effort,
+                now=ts,
+                tag="dream",
+            )
+        except Exception as exc:
+            msg = f"夜间记忆整理失败：{exc}"
+            if record_digest_on_error:
+                self.db.add_digest_item(
+                    level="alert",
+                    category="dream_error",
+                    message=msg,
+                    now=ts,
+                )
+            return DreamResult(
+                ok=False,
+                reply="",
+                archived=False,
+                guard_ok=False,
+                error=msg,
+                included_archives=included_archives,
+            )
+
+        if not _has_dream_done_marker(reply):
+            snippet = " ".join((reply or "").split())[:120]
+            detail = f"（回复摘要：{snippet}）" if snippet else "（返回为空）"
+            msg = f"夜间记忆整理未输出完成标记 DREAM_DONE，已保留 notes/today.md 未归档{detail}"
+            if record_digest_on_error:
+                self.db.add_digest_item(
+                    level="alert",
+                    category="dream_error",
+                    message=msg,
+                    now=ts,
+                )
+            return DreamResult(
+                ok=False,
+                reply=reply,
+                archived=False,
+                guard_ok=False,
+                error=msg,
+                included_archives=included_archives,
+            )
+
+        guard_res = run_memory_guard(
+            self.hq_dir,
+            config=self.config,
+            check_today_wal_lines=False,
+        )
+        if not guard_res.ok:
+            reason = "; ".join(guard_res.violations[:5])
+            msg = f"夜间记忆整理后 memory_guard 校验失败（已保留 notes/today.md 未归档）：{reason}"
+            if record_digest_on_error:
+                self.db.add_digest_item(
+                    level="alert",
+                    category="dream_error",
+                    message=msg,
+                    now=ts,
+                )
+            return DreamResult(
+                ok=False,
+                reply=reply,
+                archived=False,
+                guard_ok=False,
+                guard_violations=list(guard_res.violations),
+                error=msg,
+                included_archives=included_archives,
+            )
+
+        archived = False
+        if archive:
+            today_path = self.hq_dir / "notes" / "today.md"
+            if today_path.exists():
+                content = today_path.read_text(encoding="utf-8").strip()
+                if content:
+                    date_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                    arch_dir = self.hq_dir / "notes" / "archive"
+                    arch_dir.mkdir(parents=True, exist_ok=True)
+                    arch_file = arch_dir / f"{date_str}.md"
+                    prev = arch_file.read_text(encoding="utf-8") if arch_file.exists() else ""
+                    arch_file.write_text(
+                        (prev + "\n\n" + content).strip() + "\n", encoding="utf-8"
+                    )
+                today_path.write_text(
+                    "# Today WAL [UNVERIFIED / TODAY ONLY]\n\n", encoding="utf-8"
+                )
+                archived = True
+            self.db.set_meta("last_dream_at", str(ts), now=ts)
+            self.db.set_meta("sessions_since_dream", "0", now=ts)
+
+        self.db.set_meta("last_dream_success_at", str(ts), now=ts)
+        return DreamResult(
+            ok=True,
+            reply=reply,
+            archived=archived,
+            guard_ok=True,
+            included_archives=included_archives,
+        )
+
     def run_nightly_pipeline(self, now: Optional[int] = None) -> ArchiveReport:
         """
         Strict serial 3-stage nightly pipeline:
           Step 0: Force-distill all active/pinned/sealed sessions with unsummarized lines.
-          Step 1: Dreaming (Orient/Gather/Consolidate/Prune) & archive/clear notes/today.md.
+          Step 1: Dreaming (Orient/Gather/Consolidate) & verified archive/clear notes/today.md.
           Step 2: Archive eligible sealed sessions (never pinned or dirty).
         """
         ts = int(now if now is not None else time.time())
@@ -2114,51 +2417,14 @@ class HQDaemon:
                     (ev.id,),
                 )
 
-        # Step 1: Dreaming (isolated ephemeral background pane)
+        # Step 1: Dreaming (isolated ephemeral background pane + completion & guard verification)
         last_dream_at = int(self.db.get_meta("last_dream_at", "0") or "0")
         sessions_since = int(self.db.get_meta("sessions_since_dream", "0") or "0")
         interval_ok = (ts - last_dream_at) >= self.config.tuning.dream_min_interval_hours * 3600
         sessions_ok = sessions_since >= self.config.tuning.dream_min_sessions
 
         if self.config.tuning.dream_force_nightly or (interval_ok and sessions_ok):
-            prompt = build_prompt(
-                self.hq_dir,
-                self.config,
-                {"task": "dream-consolidate", "timestamp": ts},
-            )
-            try:
-                self._run_ephemeral_background_task(
-                    prompt,
-                    effort=self.config.agent.default_effort,
-                    now=ts,
-                    tag="dream",
-                )
-            except Exception as exc:
-                self.db.add_digest_item(
-                    level="alert",
-                    category="dream_error",
-                    message=f"夜间记忆整理失败：{exc}",
-                    now=ts,
-                )
-
-            # Archive today.md -> notes/archive/YYYY-MM-DD.md and reset today.md
-            today_path = self.hq_dir / "notes" / "today.md"
-            if today_path.exists():
-                content = today_path.read_text(encoding="utf-8").strip()
-                if content:
-                    date_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
-                    arch_dir = self.hq_dir / "notes" / "archive"
-                    arch_dir.mkdir(parents=True, exist_ok=True)
-                    arch_file = arch_dir / f"{date_str}.md"
-                    prev = arch_file.read_text(encoding="utf-8") if arch_file.exists() else ""
-                    arch_file.write_text(
-                        (prev + "\n\n" + content).strip() + "\n", encoding="utf-8"
-                    )
-                today_path.write_text(
-                    "# Today WAL [UNVERIFIED / TODAY ONLY]\n\n", encoding="utf-8"
-                )
-            self.db.set_meta("last_dream_at", str(ts), now=ts)
-            self.db.set_meta("sessions_since_dream", "0", now=ts)
+            self.run_dream(now=ts, archive=True, record_digest_on_error=True)
 
         # Step 2: Safe Archiver
         report = archive_eligible_sessions(
